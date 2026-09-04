@@ -247,6 +247,30 @@ pub struct StoredEvent {
     pub id: EventId,
     /// 状態機械に渡す形。
     pub event: FormationEvent,
+    /// DB に入っている生の payload。状態機械が読まない項目（Discord のスレッド ID・
+    /// メッセージ ID・VC 割当など）はここから読む。副作用の記録の正はこの列。
+    pub payload: Value,
+}
+
+/// formation の参加者 1 人分の編成（`formation_players` に `players` / `roles` を結合したもの）。
+///
+/// Discord アダプタが割り当て表を作り、インタラクションの押下者を照合するのに使う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterEntry {
+    /// プレイヤー ID。
+    pub player_id: PlayerId,
+    /// `players.discord_user_id`。
+    pub discord_user_id: i64,
+    /// チーム。
+    pub team: Team,
+    /// ロール（`roles.id`）。
+    pub role: String,
+    /// ロールの表示名（`roles.display_name`）。
+    pub role_display_name: String,
+    /// ロールの表示順（`roles.sort_order`）。
+    pub role_sort_order: i32,
+    /// マッチング時点の μ。
+    pub mu_at_match: f64,
 }
 
 /// 読めなかった行。捨てずに呼び出し側へ返す（ログとスタッフ通知に回す）。

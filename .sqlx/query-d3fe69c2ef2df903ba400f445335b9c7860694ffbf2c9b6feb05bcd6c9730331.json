@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select fp.player_id, p.discord_user_id, fp.team, fp.role, r.display_name as role_display_name, r.sort_order as role_sort_order, fp.mu_at_match from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "discord_user_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "discord_user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "team",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "team"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "role_display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "role_sort_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "mu_at_match",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "mu_at_match"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d3fe69c2ef2df903ba400f445335b9c7860694ffbf2c9b6feb05bcd6c9730331"
+}

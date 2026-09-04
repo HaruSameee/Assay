@@ -31,6 +31,6 @@ pub use codec::{ABANDON_REASON_KEY, DISCORD_THREAD_ID_KEY, ROOM_CODE_KEY, decode
 pub use error::RepositoryError;
 pub use model::{
     AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewFormationPlayer, NewReport,
-    Outcome, ReportId, StoredEvent, Team, UnfinishedFormation, UnreadableRow,
+    Outcome, ReportId, RosterEntry, StoredEvent, Team, UnfinishedFormation, UnreadableRow,
 };
 pub use repository::FormationRepository;

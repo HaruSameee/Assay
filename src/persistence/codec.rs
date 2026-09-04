@@ -72,6 +72,7 @@ pub(crate) fn decode_row(row: EventRow) -> Result<StoredEvent, UnreadableRow> {
             idempotency_key: row.idempotency_key,
             payload,
         },
+        payload: row.payload,
     })
 }
 

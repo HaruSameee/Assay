@@ -5,13 +5,13 @@ use std::collections::HashMap;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::lifecycle::{FormationEventKind, FormationId, Timestamp, apply};
+use crate::lifecycle::{FormationEventKind, FormationId, PlayerId, Timestamp, apply};
 
 use super::codec::{EventRow, decode_row};
 use super::error::RepositoryError;
 use super::model::{
-    AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewReport, ReportId, Team,
-    UnfinishedFormation,
+    AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewReport, ReportId, RosterEntry,
+    Team, UnfinishedFormation,
 };
 
 /// 終端状態を作る種別。[`FormationRepository::list_unfinished`] の SQL 側の絞り込みに使う。
@@ -81,6 +81,88 @@ impl FormationRepository {
         let created_at = fetch_created_at(&mut conn, formation_id).await?;
         let rows = fetch_rows(&mut conn, formation_id.0).await?;
         Ok(build_log(formation_id, created_at, rows))
+    }
+
+    /// formation の編成を読む（`formation_players` に `players` / `roles` を結合）。
+    ///
+    /// 並びはチーム、ロールの表示順、プレイヤー ID。ロックは取らない（編成は INSERT 後不変）。
+    pub async fn load_roster(
+        &self,
+        formation_id: FormationId,
+    ) -> Result<Vec<RosterEntry>, RepositoryError> {
+        let rows = sqlx::query!(
+            "select fp.player_id, p.discord_user_id, fp.team, fp.role, \
+                    r.display_name as role_display_name, r.sort_order as role_sort_order, \
+                    fp.mu_at_match \
+             from formation_players fp \
+             join players p on p.id = fp.player_id \
+             join roles r on r.id = fp.role \
+             where fp.formation_id = $1 \
+             order by fp.team, r.sort_order, fp.player_id",
+            formation_id.0
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let team = Team::from_i16(row.team).ok_or_else(|| {
+                    RepositoryError::InvalidFormation(format!(
+                        "formation {formation_id}: player {} has team {}",
+                        row.player_id, row.team
+                    ))
+                })?;
+                Ok(RosterEntry {
+                    player_id: PlayerId(row.player_id),
+                    discord_user_id: row.discord_user_id,
+                    team,
+                    role: row.role,
+                    role_display_name: row.role_display_name,
+                    role_sort_order: row.role_sort_order,
+                    mu_at_match: row.mu_at_match,
+                })
+            })
+            .collect()
+    }
+
+    /// 各プレイヤーが直近にホストを承諾した時刻（`host_accepted` の最新 `occurred_at`）。
+    ///
+    /// [`crate::lifecycle::FormationPlayer::last_hosted_at`] の導出元。一度も無ければ含まれない。
+    pub async fn last_hosted_at(
+        &self,
+        players: &[PlayerId],
+    ) -> Result<HashMap<PlayerId, Timestamp>, RepositoryError> {
+        let ids: Vec<Uuid> = players.iter().map(|player| player.0).collect();
+        let rows = sqlx::query!(
+            "select subject_player_id as \"player_id!\", max(occurred_at) as \"last_hosted_at!\" \
+             from formation_events \
+             where kind = $1 and subject_player_id = any($2) \
+             group by subject_player_id",
+            FormationEventKind::HostAccepted.as_str(),
+            &ids[..],
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (PlayerId(row.player_id), row.last_hosted_at))
+            .collect())
+    }
+
+    /// Discord のユーザー ID からプレイヤー ID を引く。見つからないものは結果に含まれない。
+    pub async fn find_players_by_discord_ids(
+        &self,
+        discord_user_ids: &[i64],
+    ) -> Result<HashMap<i64, PlayerId>, RepositoryError> {
+        let rows = sqlx::query!(
+            "select id, discord_user_id from players where discord_user_id = any($1)",
+            discord_user_ids,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.discord_user_id, PlayerId(row.id)))
+            .collect())
     }
 
     /// イベントを追記する。

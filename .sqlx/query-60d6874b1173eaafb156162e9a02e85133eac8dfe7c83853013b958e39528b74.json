@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select subject_player_id as \"player_id!\", max(occurred_at) as \"last_hosted_at!\" from formation_events where kind = $1 and subject_player_id = any($2) group by subject_player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_events",
+            "name": "subject_player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "last_hosted_at!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      true,
+      null
+    ]
+  },
+  "hash": "60d6874b1173eaafb156162e9a02e85133eac8dfe7c83853013b958e39528b74"
+}
