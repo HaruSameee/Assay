@@ -26,6 +26,15 @@ use uuid::Uuid;
 const APP_ROLE: &str = "unite_app_test";
 const APP_ROLE_PASSWORD: &str = "unite_app_test";
 
+/// マイグレーションが入れる 5 ロール（各チームに 1 人ずつ）。
+const ROLES: [&str; 5] = [
+    "top_carry",
+    "top_support",
+    "jungle",
+    "bot_carry",
+    "bot_tank",
+];
+
 /// テスト DB にアプリ用ロールで接続したプールと、それを使うリポジトリ。
 struct AppDb {
     pool: PgPool,
@@ -68,7 +77,7 @@ fn at(seq: i64) -> Timestamp {
 
 /// players 1〜10 の 5v5。`n` で作成時刻をずらす。
 fn formation(n: u128) -> NewFormation {
-    let roles = ["top", "jungle", "bottom"];
+    let roles = ROLES;
     NewFormation {
         id: fid(n),
         created_at: at(n as i64 * 60),
@@ -77,8 +86,8 @@ fn formation(n: u128) -> NewFormation {
         players: (1..=10)
             .map(|i| NewFormationPlayer {
                 player_id: pid(i),
-                team: if i <= 5 { Team::Zero } else { Team::One },
-                role: roles[(i as usize) % 3].to_owned(),
+                team: if i <= 5 { Team::Red } else { Team::Blue },
+                role: roles[(i as usize - 1) % 5].to_owned(),
                 role_was_flexed: false,
                 mu_at_match: 30.0 - i as f64,
                 sigma_at_match: 8.33,
@@ -191,7 +200,7 @@ async fn create_formation_rejects_anything_but_five_versus_five(owner: PgPool) {
     ));
 
     let mut lopsided = formation(2);
-    lopsided.players[5].team = Team::Zero;
+    lopsided.players[5].team = Team::Red;
     assert!(matches!(
         repo.create_formation(&lopsided).await,
         Err(RepositoryError::InvalidFormation(_))
@@ -658,5 +667,47 @@ async fn reports_are_accepted_only_while_the_formation_requires_them(owner: PgPo
         .await,
         Err(RepositoryError::ReportsNotAccepted { .. })
     ));
+    db.done().await;
+}
+
+#[sqlx::test(fixtures("reference", "app_role"))]
+async fn the_same_role_twice_in_one_team_is_rejected_by_the_database(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+
+    // red の 2 人目に、1 人目と同じロールを付ける（5v5 の人数チェックは通る）
+    let mut duplicated = formation(1);
+    duplicated.players[1].role = duplicated.players[0].role.clone();
+    assert_eq!(duplicated.players[0].team, duplicated.players[1].team);
+    let error = db.repo.create_formation(&duplicated).await.unwrap_err();
+    let RepositoryError::Database(error) = error else {
+        panic!("expected a database error, got {error}");
+    };
+    assert_eq!(
+        sqlstate(&error).as_deref(),
+        Some("23505"),
+        "unique violation"
+    );
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.constraint()),
+        Some("formation_players_formation_id_team_role_key")
+    );
+    // トランザクションごと巻き戻っているので、formations にも残っていない
+    assert!(db.repo.list_unfinished().await.unwrap().is_empty());
+
+    // 同じロールでもチームが違えば良い（red の top_carry と blue の top_carry）
+    db.repo.create_formation(&formation(2)).await.unwrap();
+    let roster = db.repo.load_roster(fid(2)).await.unwrap();
+    assert_eq!(roster.len(), 10);
+    assert_eq!(
+        roster
+            .iter()
+            .filter(|entry| entry.role == "top_carry")
+            .count(),
+        2
+    );
+    assert_eq!(roster[0].team, Team::Red);
+    assert_eq!(roster[0].role_display_name, "上キャリー");
     db.done().await;
 }

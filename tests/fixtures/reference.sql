@@ -1,8 +1,4 @@
--- テスト用の参照データ。roles は本番では初期データを持たない（正規値が未定）ので、テスト側で入れる。
-insert into roles (id, display_name, sort_order) values
-    ('top', 'top', 1),
-    ('jungle', 'jungle', 2),
-    ('bottom', 'bottom', 3);
+-- テスト用の参照データ。roles の 5 行はマイグレーションが入れる（本番と同じ）。ここでは players だけ。
 
 -- players 1〜10 が formation の参加者、11〜12 は非参加者
 insert into players (id, discord_user_id, created_at) values

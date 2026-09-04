@@ -7,7 +7,7 @@
       "Left": [
         "Uuid",
         "Uuid",
-        "Int2",
+        "Text",
         "Text",
         "Bool",
         "Float8",

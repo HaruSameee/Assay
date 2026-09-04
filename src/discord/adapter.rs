@@ -4,16 +4,29 @@
 //! 1. `matched` → VC を確保 → プライベートスレッド作成 → 10 人追加 → 割り当て表 →
 //!    `thread_created`（payload にスレッド ID・VC 割当・割り当て表のメッセージ ID）
 //! 2. `HostSelector` の候補を打診 → `host_assigned`（payload に打診メッセージ ID）
-//! 3. 「部屋を作る」→ `host_accepted` → モーダル → `code_posted`（payload にルーム ID・開示メッセージ ID）
+//! 3. 「部屋を作る」→ モーダル → `host_accepted` → モーダル送信 → 開示 → `code_posted`
+//!    （payload にルーム ID・開示メッセージ ID）
 //! 4. 「今回はパスする」→ `host_declined` → 次の候補（打診メッセージを編集）。尽きたら `abandoned`
-//! 5. スレッド作成が N 回失敗 → `abandoned`（`thread_creation_failed`）
+//!
+//! 失敗経路（すべて `abandoned` で解散し、理由と詳細を payload に残す。10 人を黙って拘束しない）:
+//! - 空いている VC が無い → `vc_pool_exhausted`
+//! - スレッド作成が N 回失敗 → `thread_creation_failed`
+//! - スレッドに追加できない参加者がいる → `member_add_failed`（payload に対象の player_id）
+//! - 割り当て表・打診・開示の投稿や編集が N 回失敗 → `discord_call_failed`（payload に操作名）
 //!
 //! 原則:
 //! - 副作用の記録が正。Discord に何かを作ったら、その ID を必ず `formation_events.payload` に入れる。
-//!   再起動後は [`DiscordRecord`] をログから導出して続きを操作する。Discord 側を検索し直さない。
-//! - 追記は [`FormationRepository::append_event`]（ロック → 検証 → INSERT）だけ。状態は書かない。
+//!   失敗も同じ payload に残す（stdout のログは記録ではない）。再起動後は [`DiscordRecord`] を
+//!   ログから導出して続きを操作する。Discord 側を検索し直さない。
+//! - 順序は「副作用 → 記録」。インタラクションでは、状態機械で事前に検証してから応答し、
+//!   応答の成否を含めて追記する。正式な検証は [`FormationRepository::append_event`]
+//!   （ロック → 検証 → INSERT）が行う。
 //! - インタラクション由来のイベントの冪等キーは、そのインタラクション ID。
 //! - 古いボタンは Discord 側で無効化しない。状態機械の検証で弾いて、押した本人にだけ知らせる。
+//!
+//! マッチメイカ側への制約（Phase 4 の範囲外、03 に書き留めること）:
+//! formation を確定させる前に VC プールの空きを確認する。座席が無いのに formation を作ると、
+//! ここで `vc_pool_exhausted` になり、キュー待ち時間を丸ごと捨てる。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -21,7 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use serenity::model::id::{ChannelId, GuildId, InteractionId, UserId};
+use serenity::model::id::{ChannelId, GuildId, InteractionId, MessageId, UserId};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -30,27 +43,23 @@ use crate::lifecycle::{
     FormationId, FormationPlayer, FormationState, HostAction, HostSelector, LifecycleConfig,
     PlayerId, apply, next_host_action,
 };
-use crate::persistence::{FormationRepository, NewEvent, RepositoryError, RosterEntry};
+use crate::persistence::{
+    FormationLog, FormationRepository, NewEvent, RepositoryError, RosterEntry,
+};
 
 use super::config::DiscordConfig;
 use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
-use super::gateway::{Gateway, GatewayError, InteractionRef, InteractionResponse};
-use super::payload::{self, DiscordRecord};
+use super::gateway::{Gateway, GatewayError, InteractionRef, InteractionResponse, OutgoingMessage};
+use super::payload::{self, DiscordFailure, DiscordRecord};
 use super::render;
 use super::vc_pool::VcPool;
 
-/// アダプタのエラー。
+/// アダプタのエラー。Discord の失敗はここには出てこない（payload に記録して `abandoned` にする）。
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     /// 永続化層。
     #[error(transparent)]
     Repository(#[from] RepositoryError),
-    /// Discord API。
-    #[error(transparent)]
-    Gateway(#[from] GatewayError),
-    /// 空いている VC の組が無い。formation は `matched` のまま（仕様未定: 質問として報告済み）。
-    #[error("formation {0}: no free voice channel pair")]
-    VcPoolExhausted(FormationId),
     /// ログの記録と現在状態が食い違っている（スレッド ID が無い、編成に居ない、など）。
     #[error("formation {0}: {1}")]
     Inconsistent(FormationId, String),
@@ -154,6 +163,7 @@ impl Adapter {
     /// - `awaiting_host` で候補未指名（辞退の直後に落ちた）→ 次の候補を打診
     ///
     /// 期限切れの判定や、応答待ちのままの候補への催促はしない（時間駆動は Phase 5）。
+    /// Phase 5 はこの関数を拡張する形で実装する。復帰の入口を 2 つ作らない。
     pub async fn resume_unfinished(&self) -> Result<(), AdapterError> {
         let unfinished = self.repo.list_unfinished().await?;
         info!(count = unfinished.len(), "resuming unfinished formations");
@@ -174,7 +184,8 @@ impl Adapter {
 
     /// `matched` の formation にスレッドを作り、割り当て表を投稿し、最初のホスト候補を打診する。
     ///
-    /// 既に `matched` でなければ何もしない（再送に安全）。
+    /// 既に `matched` でなければ何もしない（再送に安全）。Discord 側の失敗は `abandoned` として
+    /// 記録し、`Ok(())` を返す（呼び出し側が失敗として扱う必要は無い。ログを読めば分かる）。
     pub async fn start_formation(&self, id: FormationId) -> Result<(), AdapterError> {
         let log = self.repo.load_events(id).await?;
         let snapshot = log.snapshot();
@@ -194,75 +205,117 @@ impl Adapter {
         // VC の確保。占有状態は DB（未終了 formation の thread_created）から導出する。
         let unfinished = self.repo.list_unfinished().await?;
         let occupied = VcPool::occupied_labels(&unfinished);
-        let reservation = self
-            .vc_pool
-            .reserve(&occupied)
-            .ok_or(AdapterError::VcPoolExhausted(id))?;
+        let Some(reservation) = self.vc_pool.reserve(&occupied) else {
+            warn!(formation = %id, "no free voice channel pair; abandoning");
+            self.abandon(id, AbandonReason::VcPoolExhausted, &[])
+                .await?;
+            return Ok(());
+        };
         let vc = reservation.pair().clone();
 
         self.pace_thread_creation().await;
         let name = render::thread_name(id);
         let thread = match self
-            .retry("create_private_thread", || {
+            .retry("create_private_thread", None, || {
                 self.gateway
                     .create_private_thread(self.config.parent_channel_id, &name)
             })
             .await
         {
             Ok(thread) => thread,
-            Err(error) => {
-                error!(formation = %id, %error, "thread creation failed after retries; abandoning");
-                let event = NewEvent::abandoned(
-                    AbandonReason::ThreadCreationFailed,
-                    Utc::now(),
-                    "abandoned:thread_creation_failed",
-                );
-                self.repo.append_event(id, &event).await?;
+            Err(failure) => {
+                error!(formation = %id, error = %failure.error, "thread creation failed after retries; abandoning");
                 // reservation は drop されて VC は解放される
-                return Err(error.into());
+                self.abandon(id, AbandonReason::ThreadCreationFailed, &[failure])
+                    .await?;
+                return Ok(());
             }
         };
         info!(formation = %id, %thread, vc = %vc.label, "thread created");
 
+        // 10 人を追加する。失敗は全員分集めてから解散する（誰が追加できなかったかを全部残す）
+        let mut member_failures = Vec::new();
         for entry in &roster {
-            let Some(user) = render::user_of(entry) else {
-                warn!(formation = %id, player = %entry.player_id, "player has no valid discord user id");
-                continue;
-            };
-            if let Err(error) = self
-                .retry("add_thread_member", || {
-                    self.gateway.add_thread_member(thread, user)
-                })
-                .await
-            {
-                warn!(formation = %id, %user, %error, "could not add player to the thread");
+            let player = Some((entry.player_id, entry.discord_user_id));
+            match render::user_of(entry) {
+                Some(user) => {
+                    if let Err(failure) = self
+                        .retry("add_thread_member", player, || {
+                            self.gateway.add_thread_member(thread, user)
+                        })
+                        .await
+                    {
+                        member_failures.push(failure);
+                    }
+                }
+                None => member_failures.push(DiscordFailure {
+                    operation: "add_thread_member".into(),
+                    error: "player has no valid discord user id".into(),
+                    attempts: 0,
+                    player,
+                }),
             }
         }
 
-        let assignment = render::assignment(&roster, &vc, &self.config.room_checklist);
-        let assignment_message_id = match self
-            .retry("send assignment", || {
-                self.gateway.send_message(thread, &assignment)
-            })
-            .await
-        {
-            Ok(message_id) => Some(message_id),
-            Err(error) => {
-                warn!(formation = %id, %error, "could not post the assignment table");
-                None
+        // 割り当て表。全員入っているときだけ出す
+        let mut assignment_failure = None;
+        let mut assignment_message_id = None;
+        if member_failures.is_empty() {
+            let assignment = render::assignment(&roster, &vc, &self.config.room_checklist);
+            match self
+                .retry("send:assignment", None, || {
+                    self.gateway.send_message(thread, &assignment)
+                })
+                .await
+            {
+                Ok(message_id) => assignment_message_id = Some(message_id),
+                Err(failure) => assignment_failure = Some(failure),
             }
-        };
+        }
 
+        // 記録: スレッド ID と VC 割当は、解散するとしても残す（VC の占有状態の導出元でもある）
+        let mut failures = member_failures.clone();
+        failures.extend(assignment_failure.iter().cloned());
         let event = NewEvent::new(
             FormationEventKind::ThreadCreated,
             None,
             Utc::now(),
             format!("thread_created:{thread}"),
         )
-        .with_payload(payload::thread_created(thread, &vc, assignment_message_id));
+        .with_payload(payload::thread_created(
+            thread,
+            &vc,
+            assignment_message_id,
+            &failures,
+        ));
         let outcome = self.repo.append_event(id, &event).await?;
         log_anomalies(id, &outcome.anomalies);
         reservation.commit();
+
+        if !member_failures.is_empty() {
+            error!(formation = %id, count = member_failures.len(), "players could not be added to the thread; abandoning");
+            self.abandon_in_thread(
+                id,
+                thread,
+                None,
+                AbandonReason::MemberAddFailed,
+                member_failures,
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(failure) = assignment_failure {
+            error!(formation = %id, error = %failure.error, "assignment table could not be posted; abandoning");
+            self.abandon_in_thread(
+                id,
+                thread,
+                None,
+                AbandonReason::DiscordCallFailed,
+                vec![failure],
+            )
+            .await?;
+            return Ok(());
+        }
 
         self.nominate_next(id).await
     }
@@ -282,16 +335,35 @@ impl Adapter {
         let thread = record
             .thread_id
             .ok_or_else(|| AdapterError::Inconsistent(id, "no thread recorded".into()))?;
+        let prompt = record.host_prompt_message_id;
 
         let candidate_index = match action {
-            HostAction::Abandon => return self.abandon_exhausted(id, thread, &record).await,
+            HostAction::Abandon => {
+                return self
+                    .abandon_in_thread(
+                        id,
+                        thread,
+                        prompt,
+                        AbandonReason::HostCandidatesExhausted,
+                        Vec::new(),
+                    )
+                    .await;
+            }
             HostAction::Assign { candidate_index } => candidate_index,
         };
         let roster = self.repo.load_roster(id).await?;
         let candidates = self.candidates(id, &roster).await?;
         let Some(candidate) = candidates.get(candidate_index).copied() else {
             // 候補リストが上限より短い。HostAction の規約どおり解散と同じ扱い
-            return self.abandon_exhausted(id, thread, &record).await;
+            return self
+                .abandon_in_thread(
+                    id,
+                    thread,
+                    prompt,
+                    AbandonReason::HostCandidatesExhausted,
+                    Vec::new(),
+                )
+                .await;
         };
         let entry = roster
             .iter()
@@ -308,14 +380,23 @@ impl Adapter {
 
         let message =
             render::host_prompt(user, id, candidate, candidate_index + 1, candidates.len());
-        let prompt_message_id = match record.host_prompt_message_id {
-            Some(existing) => {
-                self.gateway
-                    .edit_message(thread, existing, &message)
-                    .await?;
-                existing
+        let prompt_message_id = match self
+            .post_or_edit(thread, prompt, "host_prompt", &message)
+            .await
+        {
+            Ok(message_id) => message_id,
+            Err(failure) => {
+                error!(formation = %id, error = %failure.error, "host prompt could not be posted; abandoning");
+                return self
+                    .abandon_in_thread(
+                        id,
+                        thread,
+                        prompt,
+                        AbandonReason::DiscordCallFailed,
+                        vec![failure],
+                    )
+                    .await;
             }
-            None => self.gateway.send_message(thread, &message).await?,
         };
         let event = NewEvent::new(
             FormationEventKind::HostAssigned,
@@ -372,7 +453,7 @@ impl Adapter {
         }
     }
 
-    /// 「部屋を作る」: `host_accepted` を追記してから、ルーム ID のモーダルを開く。
+    /// 「部屋を作る」: 検証 → モーダルを開く → 状態表示を「作成中」に → `host_accepted` を追記。
     async fn on_host_accept(
         &self,
         incoming: &IncomingInteraction,
@@ -384,35 +465,55 @@ impl Adapter {
         let Some((entry, _)) = self.presser_is(incoming, formation, player).await? else {
             return Ok(());
         };
+        let Some(log) = self
+            .prevalidate(
+                incoming,
+                formation,
+                FormationEventKind::HostAccepted,
+                player,
+                None,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let mut failures = Vec::new();
+        self.respond(
+            incoming,
+            "respond:modal",
+            InteractionResponse::Modal(render::code_modal(formation, player, None)),
+            &mut failures,
+        )
+        .await;
+        // 状態表示を「作成中」に。他の 9 人にも承諾が分かる
+        let record = DiscordRecord::from_log(&log);
+        if let (Some(thread), Some(prompt)) = (record.thread_id, record.host_prompt_message_id) {
+            let message = render::host_accepted(incoming.user, formation, player);
+            if let Err(failure) = self
+                .retry("edit:host_prompt", None, || {
+                    self.gateway.edit_message(thread, prompt, &message)
+                })
+                .await
+            {
+                failures.push(failure);
+            }
+        }
+
         let event = NewEvent::new(
             FormationEventKind::HostAccepted,
             Some(player),
             Utc::now(),
             incoming.id.to_string(),
         )
-        .with_payload(payload::host_response(entry.discord_user_id));
-        if !self.append_or_notify(incoming, formation, &event).await? {
-            return Ok(());
+        .with_payload(payload::host_response(entry.discord_user_id, &failures));
+        if self.record(formation, &event).await? {
+            info!(formation = %formation, %player, "host accepted");
         }
-        self.gateway
-            .respond(
-                &incoming.reference(),
-                InteractionResponse::Modal(render::code_modal(formation, player, None)),
-            )
-            .await?;
-
-        // 状態表示を「作成中」に。他の 9 人にも承諾が分かる
-        let log = self.repo.load_events(formation).await?;
-        let record = DiscordRecord::from_log(&log);
-        if let (Some(thread), Some(prompt)) = (record.thread_id, record.host_prompt_message_id) {
-            let message = render::host_accepted(incoming.user, formation, player);
-            self.gateway.edit_message(thread, prompt, &message).await?;
-        }
-        info!(formation = %formation, %player, "host accepted");
         Ok(())
     }
 
-    /// 「今回はパスする」: `host_declined` を追記して、次の候補を打診する。
+    /// 「今回はパスする」: 検証 → 受領 → `host_declined` を追記 → 次の候補を打診。
     async fn on_host_decline(
         &self,
         incoming: &IncomingInteraction,
@@ -424,20 +525,39 @@ impl Adapter {
         let Some((entry, _)) = self.presser_is(incoming, formation, player).await? else {
             return Ok(());
         };
+        if self
+            .prevalidate(
+                incoming,
+                formation,
+                FormationEventKind::HostDeclined,
+                player,
+                None,
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        // 打診メッセージは nominate_next が編集する（新しいメッセージは積まない）
+        let mut failures = Vec::new();
+        self.respond(
+            incoming,
+            "respond:acknowledge",
+            InteractionResponse::Acknowledge,
+            &mut failures,
+        )
+        .await;
         let event = NewEvent::new(
             FormationEventKind::HostDeclined,
             Some(player),
             Utc::now(),
             incoming.id.to_string(),
         )
-        .with_payload(payload::host_response(entry.discord_user_id));
-        if !self.append_or_notify(incoming, formation, &event).await? {
+        .with_payload(payload::host_response(entry.discord_user_id, &failures));
+        if !self.record(formation, &event).await? {
             return Ok(());
         }
-        // 打診メッセージは nominate_next が編集する（新しいメッセージは積まない）
-        self.gateway
-            .respond(&incoming.reference(), InteractionResponse::Acknowledge)
-            .await?;
         info!(formation = %formation, %player, "host declined");
         self.nominate_next(formation).await
     }
@@ -460,24 +580,27 @@ impl Adapter {
             FormationState::AwaitingCode { host, .. } => (*host, None),
             FormationState::InProgress { host, room_code } => (*host, Some(room_code.as_str())),
             _ => {
-                self.ephemeral(incoming, render::stale()).await?;
+                self.ephemeral(incoming, render::stale()).await;
                 return Ok(());
             }
         };
         if host != player {
-            self.ephemeral(incoming, render::not_the_host()).await?;
+            self.ephemeral(incoming, render::not_the_host()).await;
             return Ok(());
         }
-        self.gateway
-            .respond(
-                &incoming.reference(),
-                InteractionResponse::Modal(render::code_modal(formation, player, current)),
-            )
-            .await
-            .map_err(Into::into)
+        // 記録するイベントが無いので、この応答の失敗は payload に残らない（本人が押し直せば済む）
+        let mut failures = Vec::new();
+        self.respond(
+            incoming,
+            "respond:modal",
+            InteractionResponse::Modal(render::code_modal(formation, player, current)),
+            &mut failures,
+        )
+        .await;
+        Ok(())
     }
 
-    /// モーダル送信: 開示メッセージを投稿（または編集）してから `code_posted` を追記し、状態表示を更新する。
+    /// モーダル送信: 検証 → 開示メッセージを投稿（または編集）→ 状態表示を更新 → `code_posted` を追記。
     async fn on_code_submit(
         &self,
         incoming: &IncomingInteraction,
@@ -492,27 +615,21 @@ impl Adapter {
         };
         let room_code = input.map(|value| value.trim()).unwrap_or_default();
         if room_code.is_empty() {
-            self.ephemeral(incoming, render::code_invalid()).await?;
+            self.ephemeral(incoming, render::code_invalid()).await;
             return Ok(());
         }
-
-        // 開示メッセージを出す前に、この送信が受け付けられるか検証する（ロック無しの事前検証。
-        // 正式な検証は append_event が同じ apply で行う）
-        let log = self.repo.load_events(formation).await?;
-        let snapshot = log.snapshot();
-        log_anomalies(formation, &snapshot.anomalies);
-        let candidate = FormationEvent {
-            kind: FormationEventKind::CodePosted,
-            subject: Some(player),
-            occurred_at: Utc::now(),
-            idempotency_key: incoming.id.to_string(),
-            payload: EventPayload::RoomCode(room_code.to_owned()),
+        let Some(log) = self
+            .prevalidate(
+                incoming,
+                formation,
+                FormationEventKind::CodePosted,
+                player,
+                Some(room_code),
+            )
+            .await?
+        else {
+            return Ok(());
         };
-        if let Err(error) = apply(&snapshot.state, &candidate) {
-            info!(formation = %formation, %error, "room code submission rejected");
-            self.ephemeral(incoming, render::stale()).await?;
-            return Ok(());
-        }
         let record = DiscordRecord::from_log(&log);
         let thread = record
             .thread_id
@@ -525,73 +642,124 @@ impl Adapter {
             .filter_map(render::user_of)
             .collect();
         let reveal = render::code_reveal(incoming.user, &others, room_code, record.vc.as_ref());
-        let code_message_id = match record.code_message_id {
-            Some(existing) => {
-                self.gateway.edit_message(thread, existing, &reveal).await?;
-                existing
+        let code_message_id = match self
+            .post_or_edit(thread, record.code_message_id, "code_reveal", &reveal)
+            .await
+        {
+            Ok(message_id) => message_id,
+            Err(failure) => {
+                error!(formation = %formation, error = %failure.error, "room code could not be revealed; abandoning");
+                self.ephemeral(incoming, render::reveal_failed()).await;
+                return self
+                    .abandon_in_thread(
+                        formation,
+                        thread,
+                        record.host_prompt_message_id,
+                        AbandonReason::DiscordCallFailed,
+                        vec![failure],
+                    )
+                    .await;
             }
-            None => self.gateway.send_message(thread, &reveal).await?,
         };
+        let mut failures = Vec::new();
+        self.respond(
+            incoming,
+            "respond:update_status",
+            InteractionResponse::UpdateMessage(render::code_status(
+                incoming.user,
+                room_code,
+                formation,
+                player,
+            )),
+            &mut failures,
+        )
+        .await;
         let event = NewEvent::new(
             FormationEventKind::CodePosted,
             Some(player),
-            candidate.occurred_at,
-            candidate.idempotency_key.clone(),
+            Utc::now(),
+            incoming.id.to_string(),
         )
         .with_payload(payload::code_posted(
             room_code,
             code_message_id,
             entry.discord_user_id,
+            &failures,
         ));
-        if !self.append_or_notify(incoming, formation, &event).await? {
-            error!(
-                formation = %formation,
-                message = %code_message_id,
-                "code_posted was rejected after the reveal message was posted (race)"
-            );
-            return Ok(());
+        if self.record(formation, &event).await? {
+            info!(formation = %formation, %player, message = %code_message_id, "room code posted");
         }
-        self.gateway
-            .respond(
-                &incoming.reference(),
-                InteractionResponse::UpdateMessage(render::code_status(
-                    incoming.user,
-                    room_code,
-                    formation,
-                    player,
-                )),
-            )
-            .await?;
-        info!(formation = %formation, %player, message = %code_message_id, "room code posted");
         Ok(())
     }
 
-    /// 候補が尽きた: `abandoned` を追記し、打診メッセージを書き換え、VC を解放する。
-    async fn abandon_exhausted(
+    /// スレッドが無い段階での解散（VC 無し、スレッド作成失敗）。
+    async fn abandon(
+        &self,
+        id: FormationId,
+        reason: AbandonReason,
+        failures: &[DiscordFailure],
+    ) -> Result<(), AdapterError> {
+        let event = NewEvent::new(
+            FormationEventKind::Abandoned,
+            None,
+            Utc::now(),
+            format!("abandoned:{reason}"),
+        )
+        .with_payload(payload::abandoned(reason, failures));
+        let outcome = self.repo.append_event(id, &event).await?;
+        log_anomalies(id, &outcome.anomalies);
+        info!(formation = %id, %reason, "abandoned");
+        Ok(())
+    }
+
+    /// スレッドがある段階での解散。通知（打診メッセージがあれば編集、無ければ投稿）→ `abandoned` の順。
+    /// 通知の失敗も payload に残す。
+    async fn abandon_in_thread(
         &self,
         id: FormationId,
         thread: ChannelId,
-        record: &DiscordRecord,
+        prompt: Option<MessageId>,
+        reason: AbandonReason,
+        mut failures: Vec<DiscordFailure>,
     ) -> Result<(), AdapterError> {
-        let event = NewEvent::abandoned(
-            AbandonReason::HostCandidatesExhausted,
-            Utc::now(),
-            "abandoned:host_candidates_exhausted",
-        );
-        let outcome = self.repo.append_event(id, &event).await?;
-        log_anomalies(id, &outcome.anomalies);
-        info!(formation = %id, "host candidates exhausted; abandoned");
-        if let Some(vc) = &record.vc {
+        let notice = render::abandoned_notice(reason);
+        if let Err(failure) = self
+            .post_or_edit(thread, prompt, "abandoned_notice", &notice)
+            .await
+        {
+            failures.push(failure);
+        }
+        self.abandon(id, reason, &failures).await?;
+        let log = self.repo.load_events(id).await?;
+        if let Some(vc) = DiscordRecord::from_log(&log).vc {
             self.vc_pool.release(&vc.label);
         }
-        let message = render::host_exhausted();
-        match record.host_prompt_message_id {
-            Some(prompt) => self.gateway.edit_message(thread, prompt, &message).await?,
+        Ok(())
+    }
+
+    /// メッセージがあれば編集、無ければ投稿。どちらもリトライ付き。
+    async fn post_or_edit(
+        &self,
+        thread: ChannelId,
+        existing: Option<MessageId>,
+        what: &str,
+        message: &OutgoingMessage,
+    ) -> Result<MessageId, DiscordFailure> {
+        match existing {
+            Some(message_id) => {
+                self.retry(&format!("edit:{what}"), None, || {
+                    self.gateway.edit_message(thread, message_id, message)
+                })
+                .await?;
+                Ok(message_id)
+            }
             None => {
-                self.gateway.send_message(thread, &message).await?;
+                self.retry(&format!("send:{what}"), None, || {
+                    self.gateway.send_message(thread, message)
+                })
+                .await
             }
         }
-        Ok(())
     }
 
     /// 押した人が `player` 本人か。本人なら編成の行と編成全体を返す。
@@ -605,7 +773,7 @@ impl Adapter {
         let roster = match self.repo.load_roster(formation).await {
             Ok(roster) => roster,
             Err(RepositoryError::FormationNotFound(_)) => {
-                self.ephemeral(incoming, render::stale()).await?;
+                self.ephemeral(incoming, render::stale()).await;
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -615,25 +783,55 @@ impl Adapter {
             .find(|entry| entry.player_id == player)
             .cloned()
         else {
-            self.ephemeral(incoming, render::stale()).await?;
+            self.ephemeral(incoming, render::stale()).await;
             return Ok(None);
         };
         let addressee = render::user_of(&entry);
         if addressee != Some(incoming.user) {
             self.ephemeral(incoming, render::not_addressed_to_you(addressee))
-                .await?;
+                .await;
             return Ok(None);
         }
         Ok(Some((entry, roster)))
     }
 
-    /// 追記する。状態機械に拒否されたら（古いボタンなど）本人にだけ知らせて `false`。
-    async fn append_or_notify(
+    /// 応答する前の検証（ロック無し。正式な検証は `append_event` が同じ `apply` で行う）。
+    /// 通れば現在のログを返す。弾かれたら本人にだけ知らせて `None`。
+    async fn prevalidate(
         &self,
         incoming: &IncomingInteraction,
         formation: FormationId,
-        event: &NewEvent,
-    ) -> Result<bool, AdapterError> {
+        kind: FormationEventKind,
+        player: PlayerId,
+        room_code: Option<&str>,
+    ) -> Result<Option<FormationLog>, AdapterError> {
+        let log = self.repo.load_events(formation).await?;
+        let snapshot = log.snapshot();
+        log_anomalies(formation, &snapshot.anomalies);
+        let candidate = FormationEvent {
+            kind,
+            subject: Some(player),
+            occurred_at: Utc::now(),
+            idempotency_key: incoming.id.to_string(),
+            payload: room_code.map_or(EventPayload::Empty, |code| {
+                EventPayload::RoomCode(code.to_owned())
+            }),
+        };
+        // 同じインタラクションの再送は、状態がもう進んでいても受け付ける（append が no-op にする）
+        let already = log
+            .events
+            .iter()
+            .any(|stored| stored.event.idempotency_key == candidate.idempotency_key);
+        if !already && let Err(error) = apply(&snapshot.state, &candidate) {
+            info!(formation = %formation, %error, "interaction rejected by the state machine");
+            self.ephemeral(incoming, render::stale()).await;
+            return Ok(None);
+        }
+        Ok(Some(log))
+    }
+
+    /// 追記する。事前検証を通っているので、拒否されるのは競合だけ（エラーとして記録し `false`）。
+    async fn record(&self, formation: FormationId, event: &NewEvent) -> Result<bool, AdapterError> {
         match self.repo.append_event(formation, event).await {
             Ok(outcome) => {
                 log_anomalies(formation, &outcome.anomalies);
@@ -643,31 +841,48 @@ impl Adapter {
                 Ok(true)
             }
             Err(RepositoryError::Rejected(error)) => {
-                info!(formation = %formation, %error, "interaction rejected by the state machine");
-                self.ephemeral(incoming, render::stale()).await?;
+                error!(formation = %formation, %error, "event rejected after the side effect (race)");
                 Ok(false)
             }
             Err(RepositoryError::IdempotencyKeyReused { .. }) => {
                 warn!(formation = %formation, key = %event.idempotency_key, "idempotency key reused");
-                self.ephemeral(incoming, render::stale()).await?;
                 Ok(false)
             }
             Err(error) => Err(error.into()),
         }
     }
 
-    async fn ephemeral(
+    /// インタラクションに応答する。失敗は `failures` に積む（呼び出し側が payload に入れる）。
+    async fn respond(
         &self,
         incoming: &IncomingInteraction,
-        content: String,
-    ) -> Result<(), AdapterError> {
-        self.gateway
+        what: &str,
+        response: InteractionResponse,
+        failures: &mut Vec<DiscordFailure>,
+    ) {
+        if let Err(error) = self.gateway.respond(&incoming.reference(), response).await {
+            warn!(interaction = %incoming.id, what, %error, "interaction response failed");
+            failures.push(DiscordFailure {
+                operation: what.to_owned(),
+                error: error.0,
+                attempts: 1,
+                player: None,
+            });
+        }
+    }
+
+    /// 本人にだけ見える通知。記録するイベントが無いので、失敗はログに出すだけ。
+    async fn ephemeral(&self, incoming: &IncomingInteraction, content: String) {
+        if let Err(error) = self
+            .gateway
             .respond(
                 &incoming.reference(),
                 InteractionResponse::Ephemeral(content),
             )
             .await
-            .map_err(Into::into)
+        {
+            warn!(interaction = %incoming.id, %error, "ephemeral response failed");
+        }
     }
 
     /// `HostSelector` に渡す形を作って候補を得る。
@@ -705,7 +920,13 @@ impl Adapter {
     }
 
     /// Discord API 呼び出しを最大 N 回試す。間隔は試行回数に比例して延びる。
-    async fn retry<T, F, Fut>(&self, what: &str, mut operation: F) -> Result<T, GatewayError>
+    /// 使い切ったら最後のエラーを [`DiscordFailure`] にして返す（payload に入れる形）。
+    async fn retry<T, F, Fut>(
+        &self,
+        what: &str,
+        player: Option<(PlayerId, i64)>,
+        mut operation: F,
+    ) -> Result<T, DiscordFailure>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, GatewayError>>,
@@ -724,7 +945,12 @@ impl Adapter {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| GatewayError("no attempts".into())))
+        Err(DiscordFailure {
+            operation: what.to_owned(),
+            error: last_error.map_or_else(|| "no attempts".into(), |error| error.0),
+            attempts,
+            player,
+        })
     }
 }
 

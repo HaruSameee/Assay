@@ -59,7 +59,7 @@ impl FormationRepository {
                  values ($1, $2, $3, $4, $5, $6, $7)",
                 formation.id.0,
                 player.player_id.0,
-                player.team.as_i16(),
+                player.team.as_str(),
                 player.role,
                 player.role_was_flexed,
                 player.mu_at_match,
@@ -85,7 +85,7 @@ impl FormationRepository {
 
     /// formation の編成を読む（`formation_players` に `players` / `roles` を結合）。
     ///
-    /// 並びはチーム、ロールの表示順、プレイヤー ID。ロックは取らない（編成は INSERT 後不変）。
+    /// 並びはチーム（red が先）、ロールの表示順、プレイヤー ID。ロックは取らない（編成は INSERT 後不変）。
     pub async fn load_roster(
         &self,
         formation_id: FormationId,
@@ -98,17 +98,18 @@ impl FormationRepository {
              join players p on p.id = fp.player_id \
              join roles r on r.id = fp.role \
              where fp.formation_id = $1 \
-             order by fp.team, r.sort_order, fp.player_id",
-            formation_id.0
+             order by fp.team = $2 desc, r.sort_order, fp.player_id",
+            formation_id.0,
+            Team::ALL[0].as_str(),
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(|row| {
-                let team = Team::from_i16(row.team).ok_or_else(|| {
+                let team: Team = row.team.parse().map_err(|error| {
                     RepositoryError::InvalidFormation(format!(
-                        "formation {formation_id}: player {} has team {}",
-                        row.player_id, row.team
+                        "formation {formation_id}: player {}: {error}",
+                        row.player_id
                     ))
                 })?;
                 Ok(RosterEntry {
@@ -444,14 +445,14 @@ fn validate_formation(formation: &NewFormation) -> Result<(), RepositoryError> {
             "expected 10 players, got {total}"
         )));
     }
-    let team_zero = formation
+    let red = formation
         .players
         .iter()
-        .filter(|player| player.team == Team::Zero)
+        .filter(|player| player.team == Team::Red)
         .count();
-    if team_zero != 5 {
+    if red != 5 {
         return Err(RepositoryError::InvalidFormation(format!(
-            "expected 5 players per team, got {team_zero} in team 0"
+            "expected 5 players per team, got {red} in team red"
         )));
     }
     let mut ids: Vec<Uuid> = formation

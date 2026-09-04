@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select fp.player_id, p.discord_user_id, fp.team, fp.role, r.display_name as role_display_name, r.sort_order as role_sort_order, fp.mu_at_match from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
+  "query": "select fp.player_id, p.discord_user_id, fp.team, fp.role, r.display_name as role_display_name, r.sort_order as role_sort_order, fp.mu_at_match from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role where fp.formation_id = $1 order by fp.team = $2 desc, r.sort_order, fp.player_id",
   "describe": {
     "columns": [
       {
@@ -28,7 +28,7 @@
       {
         "ordinal": 2,
         "name": "team",
-        "type_info": "Int2",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "formation_players",
@@ -83,7 +83,8 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text"
       ]
     },
     "nullable": [
@@ -96,5 +97,5 @@
       false
     ]
   },
-  "hash": "d3fe69c2ef2df903ba400f445335b9c7860694ffbf2c9b6feb05bcd6c9730331"
+  "hash": "abda1a6c3138491625ef820a9a6d4d4e368a9b2d1048011078b09f5a34bf2ac8"
 }

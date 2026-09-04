@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 
 use crate::lifecycle::{
     AbandonReason, Anomaly, FormationEvent, FormationEventKind, FormationId, FormationState,
-    PlayerId, Snapshot, Timestamp, derive_snapshot_iter,
+    PlayerId, Snapshot, Timestamp, UnknownValue, derive_snapshot_iter,
 };
 
 use super::codec::{ABANDON_REASON_KEY, DISCORD_THREAD_ID_KEY, ROOM_CODE_KEY, decode_payload};
@@ -32,31 +32,45 @@ impl std::fmt::Display for ReportId {
     }
 }
 
-/// チーム（`formation_players.team`: 0 または 1）。
+/// チーム（`formation_players.team`: `red` または `blue`）。DB の値がそのまま名前。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Team {
-    /// team = 0
-    Zero,
-    /// team = 1
-    One,
+    /// team = 'red'
+    Red,
+    /// team = 'blue'
+    Blue,
 }
 
 impl Team {
-    /// DB の値。
-    pub fn as_i16(self) -> i16 {
+    /// 全チーム。
+    pub const ALL: [Self; 2] = [Self::Red, Self::Blue];
+
+    /// DB の値（表示名を兼ねる）。
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Zero => 0,
-            Self::One => 1,
+            Self::Red => "red",
+            Self::Blue => "blue",
         }
     }
+}
 
-    /// DB の値から。0 / 1 以外は `None`。
-    pub fn from_i16(value: i16) -> Option<Self> {
-        match value {
-            0 => Some(Self::Zero),
-            1 => Some(Self::One),
-            _ => None,
-        }
+impl std::fmt::Display for Team {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Team {
+    type Err = UnknownValue;
+
+    fn from_str(s: &str) -> Result<Self, UnknownValue> {
+        Self::ALL
+            .into_iter()
+            .find(|team| team.as_str() == s)
+            .ok_or_else(|| UnknownValue {
+                what: "team",
+                value: s.to_owned(),
+            })
     }
 }
 
@@ -70,11 +84,11 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// DB の値（`team_0` / `team_1` / `draw`）。
+    /// DB の値（`team_0` / `team_1` / `draw`。`team_0` = red、`team_1` = blue）。
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Win(Team::Zero) => "team_0",
-            Self::Win(Team::One) => "team_1",
+            Self::Win(Team::Red) => "team_0",
+            Self::Win(Team::Blue) => "team_1",
             Self::Draw => "draw",
         }
     }

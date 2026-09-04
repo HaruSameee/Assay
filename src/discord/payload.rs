@@ -1,13 +1,15 @@
-//! Discord 側の副作用を `formation_events.payload` に記録する形と、その読み出し。
+//! Discord 側の副作用と、その失敗を `formation_events.payload` に記録する形と、その読み出し。
 //!
 //! 副作用の記録が正: スレッド ID・メッセージ ID・VC 割当は必ずここに保存する。
 //! 再起動後は Discord 側を検索し直さず、ログから [`DiscordRecord`] を導出して続きを操作する。
+//! Discord 呼び出しの失敗も stdout ではなくここに残す（「なぜこの試合が流れたか」を後から説明できるように）。
 //! Discord の 64bit ID は JSON では文字列で持つ（`DISCORD_THREAD_ID_KEY` の慣例に合わせる）。
 
 use serde_json::{Map, Value, json};
 use serenity::model::id::{ChannelId, MessageId};
 
-use crate::persistence::{DISCORD_THREAD_ID_KEY, FormationLog, ROOM_CODE_KEY};
+use crate::lifecycle::{AbandonReason, PlayerId};
+use crate::persistence::{ABANDON_REASON_KEY, DISCORD_THREAD_ID_KEY, FormationLog, ROOM_CODE_KEY};
 
 use super::vc_pool::VcPair;
 
@@ -27,6 +29,48 @@ pub const HOST_PROMPT_MESSAGE_ID_KEY: &str = "host_prompt_message_id";
 pub const CODE_MESSAGE_ID_KEY: &str = "code_message_id";
 /// `host_*` / `code_posted`: 対象プレイヤーの Discord ユーザー ID（監査用。状態機械は読まない）。
 pub const DISCORD_USER_ID_KEY: &str = "discord_user_id";
+/// どのイベントにも付きうる: Discord 呼び出しの失敗の一覧（[`DiscordFailure`] の配列）。無ければ省略。
+pub const DISCORD_FAILURES_KEY: &str = "discord_failures";
+/// `abandoned`（`member_add_failed`）: スレッドに追加できなかった参加者の一覧。
+pub const FAILED_PLAYERS_KEY: &str = "players";
+/// [`DiscordFailure`] の中: 操作名。
+pub const OPERATION_KEY: &str = "operation";
+/// [`DiscordFailure`] の中: エラー文字列。
+pub const ERROR_KEY: &str = "error";
+/// [`DiscordFailure`] の中: 試行回数。
+pub const ATTEMPTS_KEY: &str = "attempts";
+/// [`DiscordFailure`] の中: 対象プレイヤー（あれば）。
+pub const PLAYER_ID_KEY: &str = "player_id";
+
+/// Discord 呼び出しの失敗。リトライを使い切った後の最後のエラー。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordFailure {
+    /// 操作名（`create_private_thread`、`add_thread_member`、`send:assignment` など）。
+    pub operation: String,
+    /// エラー文字列。
+    pub error: String,
+    /// 試行回数。
+    pub attempts: u32,
+    /// 対象プレイヤー（スレッドへの追加など、人に紐づく操作のとき）。
+    pub player: Option<(PlayerId, i64)>,
+}
+
+impl DiscordFailure {
+    fn to_json(&self) -> Value {
+        let mut map = Map::new();
+        map.insert(OPERATION_KEY.into(), Value::String(self.operation.clone()));
+        map.insert(ERROR_KEY.into(), Value::String(self.error.clone()));
+        map.insert(ATTEMPTS_KEY.into(), Value::from(self.attempts));
+        if let Some((player, discord_user_id)) = self.player {
+            map.insert(PLAYER_ID_KEY.into(), Value::String(player.to_string()));
+            map.insert(
+                DISCORD_USER_ID_KEY.into(),
+                Value::String(discord_user_id.to_string()),
+            );
+        }
+        Value::Object(map)
+    }
+}
 
 /// ログから導出した、Discord 側の現在の対応物。
 ///
@@ -97,6 +141,17 @@ fn id_string(id: u64) -> Value {
     Value::String(id.to_string())
 }
 
+/// 失敗があれば `discord_failures` を足す。無ければ何も足さない。
+fn with_failures(mut payload: Map<String, Value>, failures: &[DiscordFailure]) -> Value {
+    if !failures.is_empty() {
+        payload.insert(
+            DISCORD_FAILURES_KEY.into(),
+            Value::Array(failures.iter().map(DiscordFailure::to_json).collect()),
+        );
+    }
+    Value::Object(payload)
+}
+
 /// VC 割当を JSON にする。
 pub fn vc_to_json(pair: &VcPair) -> Value {
     json!({
@@ -124,6 +179,7 @@ pub fn thread_created(
     thread: ChannelId,
     vc: &VcPair,
     assignment_message_id: Option<MessageId>,
+    failures: &[DiscordFailure],
 ) -> Value {
     let mut map = Map::new();
     map.insert(DISCORD_THREAD_ID_KEY.into(), id_string(thread.get()));
@@ -132,7 +188,7 @@ pub fn thread_created(
         ASSIGNMENT_MESSAGE_ID_KEY.into(),
         assignment_message_id.map_or(Value::Null, |id| id_string(id.get())),
     );
-    Value::Object(map)
+    with_failures(map, failures)
 }
 
 /// `host_assigned` の payload。
@@ -144,17 +200,50 @@ pub fn host_assigned(prompt_message_id: MessageId, discord_user_id: i64) -> Valu
 }
 
 /// `host_accepted` / `host_declined` の payload。
-pub fn host_response(discord_user_id: i64) -> Value {
-    json!({ DISCORD_USER_ID_KEY: discord_user_id.to_string() })
+pub fn host_response(discord_user_id: i64, failures: &[DiscordFailure]) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        DISCORD_USER_ID_KEY.into(),
+        Value::String(discord_user_id.to_string()),
+    );
+    with_failures(map, failures)
 }
 
 /// `code_posted` の payload。状態機械が読む `room_code` を含む。
-pub fn code_posted(room_code: &str, code_message_id: MessageId, discord_user_id: i64) -> Value {
-    json!({
-        ROOM_CODE_KEY: room_code,
-        CODE_MESSAGE_ID_KEY: code_message_id.get().to_string(),
-        DISCORD_USER_ID_KEY: discord_user_id.to_string(),
-    })
+pub fn code_posted(
+    room_code: &str,
+    code_message_id: MessageId,
+    discord_user_id: i64,
+    failures: &[DiscordFailure],
+) -> Value {
+    let mut map = Map::new();
+    map.insert(ROOM_CODE_KEY.into(), Value::String(room_code.to_owned()));
+    map.insert(CODE_MESSAGE_ID_KEY.into(), id_string(code_message_id.get()));
+    map.insert(
+        DISCORD_USER_ID_KEY.into(),
+        Value::String(discord_user_id.to_string()),
+    );
+    with_failures(map, failures)
+}
+
+/// `abandoned` の payload。状態機械が読む `reason` に、失敗の一覧を添える。
+///
+/// `member_add_failed` では、対象プレイヤー付きの失敗を `players` にも並べる。
+pub fn abandoned(reason: AbandonReason, failures: &[DiscordFailure]) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        ABANDON_REASON_KEY.into(),
+        Value::String(reason.as_str().to_owned()),
+    );
+    if reason == AbandonReason::MemberAddFailed {
+        let players: Vec<Value> = failures
+            .iter()
+            .filter(|failure| failure.player.is_some())
+            .map(DiscordFailure::to_json)
+            .collect();
+        map.insert(FAILED_PLAYERS_KEY.into(), Value::Array(players));
+    }
+    with_failures(map, failures)
 }
 
 #[cfg(test)]
@@ -162,7 +251,9 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
-    use crate::lifecycle::{FormationEvent, FormationEventKind as K, FormationId, PlayerId};
+    use crate::lifecycle::{
+        EventPayload, FormationEvent, FormationEventKind as K, FormationId, PlayerId,
+    };
     use crate::persistence::{EventId, StoredEvent, decode_payload};
 
     use super::*;
@@ -198,20 +289,29 @@ mod tests {
         }
     }
 
+    fn failure(operation: &str, player: Option<(PlayerId, i64)>) -> DiscordFailure {
+        DiscordFailure {
+            operation: operation.into(),
+            error: "boom".into(),
+            attempts: 3,
+            player,
+        }
+    }
+
     #[test]
     fn record_is_derived_from_the_latest_thread_and_its_messages() {
         let events = vec![
             stored(
                 1,
                 K::ThreadCreated,
-                thread_created(ChannelId::new(100), &pair(), Some(MessageId::new(101))),
+                thread_created(ChannelId::new(100), &pair(), Some(MessageId::new(101)), &[]),
             ),
             stored(2, K::HostAssigned, host_assigned(MessageId::new(102), 1001)),
-            stored(3, K::HostAccepted, host_response(1001)),
+            stored(3, K::HostAccepted, host_response(1001, &[])),
             stored(
                 4,
                 K::CodePosted,
-                code_posted("1234", MessageId::new(103), 1001),
+                code_posted("1234", MessageId::new(103), 1001, &[]),
             ),
         ];
         let record = DiscordRecord::from_log(&log(events));
@@ -233,13 +333,13 @@ mod tests {
             stored(
                 1,
                 K::ThreadCreated,
-                thread_created(ChannelId::new(100), &pair(), None),
+                thread_created(ChannelId::new(100), &pair(), None, &[]),
             ),
             stored(2, K::HostAssigned, host_assigned(MessageId::new(102), 1001)),
             stored(
                 3,
                 K::ThreadCreated,
-                thread_created(ChannelId::new(200), &pair(), Some(MessageId::new(201))),
+                thread_created(ChannelId::new(200), &pair(), Some(MessageId::new(201)), &[]),
             ),
         ];
         let record = DiscordRecord::from_log(&log(events));
@@ -271,10 +371,44 @@ mod tests {
 
     #[test]
     fn code_posted_payload_keeps_the_room_code_readable_by_the_state_machine() {
-        let payload = code_posted("9999", MessageId::new(5), 1);
+        let payload = code_posted("9999", MessageId::new(5), 1, &[]);
         assert_eq!(
             decode_payload(K::CodePosted, &payload),
-            crate::lifecycle::EventPayload::RoomCode("9999".into())
+            EventPayload::RoomCode("9999".into())
+        );
+        assert!(payload.get(DISCORD_FAILURES_KEY).is_none());
+    }
+
+    #[test]
+    fn failures_are_recorded_and_the_reason_stays_readable() {
+        let player = PlayerId(Uuid::from_u128(7));
+        let failures = [
+            failure("add_thread_member", Some((player, 1007))),
+            failure("send:assignment", None),
+        ];
+        let payload = abandoned(AbandonReason::MemberAddFailed, &failures);
+        assert_eq!(
+            decode_payload(K::Abandoned, &payload),
+            EventPayload::Abandon(AbandonReason::MemberAddFailed)
+        );
+        assert_eq!(payload[DISCORD_FAILURES_KEY].as_array().unwrap().len(), 2);
+        let players = payload[FAILED_PLAYERS_KEY].as_array().unwrap();
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0][PLAYER_ID_KEY], player.to_string());
+        assert_eq!(players[0][DISCORD_USER_ID_KEY], "1007");
+        assert_eq!(players[0][ATTEMPTS_KEY], 3);
+
+        let payload = abandoned(AbandonReason::VcPoolExhausted, &[]);
+        assert_eq!(
+            decode_payload(K::Abandoned, &payload),
+            EventPayload::Abandon(AbandonReason::VcPoolExhausted)
+        );
+        assert!(payload.get(FAILED_PLAYERS_KEY).is_none());
+
+        let payload = host_response(1001, &failures[1..]);
+        assert_eq!(
+            payload[DISCORD_FAILURES_KEY][0][OPERATION_KEY],
+            "send:assignment"
         );
     }
 }

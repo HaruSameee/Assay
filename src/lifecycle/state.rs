@@ -185,9 +185,10 @@ impl FromStr for FormationEventKind {
     }
 }
 
-/// `abandoned` の理由。payload は `{"reason": "<as_str>"}`。
+/// `abandoned` の理由。payload は `{"reason": "<as_str>", ...}`。
 ///
-/// 個人の特定（誰が来なかったか）はしない。ホストは正確に言えず、間違ったデータが永久に残るだけなので。
+/// 人の推測（誰が来なかったか）は入れない。ホストは正確に言えず、間違ったデータが永久に残るだけなので。
+/// システム側の失敗で特定できる対象（スレッドに追加できなかった player_id）は入れる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AbandonReason {
     /// ホスト候補が全滅した（`awaiting_host`）。
@@ -196,14 +197,23 @@ pub enum AbandonReason {
     NotEnoughPlayers,
     /// Discord のスレッド作成がリトライしても失敗した（`matched`）。
     ThreadCreationFailed,
+    /// 空いている VC の組が無かった（`matched`）。10 人を拘束せずキューに戻す。
+    VcPoolExhausted,
+    /// スレッドに追加できなかった参加者がいる（`awaiting_host`）。payload に対象の player_id。
+    MemberAddFailed,
+    /// 上記以外の Discord 呼び出し（投稿・編集）がリトライしても失敗した。payload に操作名と理由。
+    DiscordCallFailed,
 }
 
 impl AbandonReason {
     /// 全理由。
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 6] = [
         Self::HostCandidatesExhausted,
         Self::NotEnoughPlayers,
         Self::ThreadCreationFailed,
+        Self::VcPoolExhausted,
+        Self::MemberAddFailed,
+        Self::DiscordCallFailed,
     ];
 
     /// payload の `reason` に入る文字列。
@@ -212,6 +222,9 @@ impl AbandonReason {
             Self::HostCandidatesExhausted => "host_candidates_exhausted",
             Self::NotEnoughPlayers => "not_enough_players",
             Self::ThreadCreationFailed => "thread_creation_failed",
+            Self::VcPoolExhausted => "vc_pool_exhausted",
+            Self::MemberAddFailed => "member_add_failed",
+            Self::DiscordCallFailed => "discord_call_failed",
         }
     }
 }

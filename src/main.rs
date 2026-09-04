@@ -22,6 +22,8 @@ use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::persistence::FormationRepository;
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
+/// `/internal/*` の Bearer トークン。未設定なら内部エンドポイントはマウントされない。
+const INTERNAL_API_TOKEN: &str = "INTERNAL_API_TOKEN";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -34,6 +36,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
     let listen_addr = env::var("HTTP_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.into());
+    let internal_token: Option<Arc<str>> = env::var(INTERNAL_API_TOKEN)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .map(Arc::from);
     let discord_config = DiscordConfig::from_env()?;
     let lifecycle = LifecycleConfig::default();
 
@@ -57,7 +64,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(%listen_addr, "http server listening");
-    let app = router(ApiState { adapter });
+    let app = router(ApiState {
+        adapter,
+        internal_token,
+    });
 
     let discord_task = tokio::spawn(async move { client.start().await });
     let http_task = tokio::spawn(async move { axum::serve(listener, app).await });

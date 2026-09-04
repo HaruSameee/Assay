@@ -1,6 +1,10 @@
 -- Phase 1: 試合ライフサイクルのスキーマ
 -- 出典: 04-試合ライフサイクル仕様 §6「スキーマ（追記専用）」＋ Phase 1 修正指示（2026-09-04）
 --       ＋ Phase 2 レビュー（2026-09-05: kind の CHECK、actor_player_id → subject_player_id）
+--       ＋ Phase 4 レビュー（2026-09-05: team を text の red/blue に、(formation_id, team, role) の unique、
+--         roles の正規値 5 行、abandoned の理由の追加）。
+--       本番 DB は未作成で適用先が開発 DB と CI だけだったため、ALTER を積まずにこのファイルを書き直した。
+--       本番にデプロイした後は、変更は必ず新しいマイグレーションで積むこと。
 --
 -- 不変条件（破らないこと）:
 --   1. formations / formation_players / formation_events / match_reports の4テーブルは追記専用。
@@ -41,7 +45,7 @@ comment on table players is
 
 -- ----------------------------------------------------------------------
 -- roles: ロールの lookup。識別子（不変・ログが参照する）と表示名（可変）を分ける。
--- 初期データは入れない。正規値が未定であり、プレースホルダを入れるとログから参照されて永久に残るため。
+-- 正規値は 5 ロールで確定（Phase 4 レビュー）。全環境で存在を保証するため、ここで入れる。
 -- ----------------------------------------------------------------------
 create table roles (
     id            text    primary key,
@@ -50,11 +54,18 @@ create table roles (
 );
 
 comment on table roles is
-    '可変の参照データ（追記専用ではない）。初期データは入れない。テストはフィクスチャで INSERT する。';
+    '可変の参照データ（追記専用ではない）。正規値の 5 ロールはマイグレーションで入れる。display_name / sort_order は変更してよい。';
 comment on column roles.id is
     '不変の識別子。英字スネークケース。formation_players.role から参照される';
 comment on column roles.display_name is
     'UI 表示専用。変更してよい';
+
+insert into roles (id, display_name, sort_order) values
+    ('top_carry',   '上キャリー', 1),
+    ('top_support', 'サポート',   2),
+    ('jungle',      '中央',       3),
+    ('bot_carry',   '下キャリー', 4),
+    ('bot_tank',    'タンク',     5);
 
 -- ----------------------------------------------------------------------
 -- formations: マッチメイカが10人を確定させた時点で1行。以後不変。
@@ -76,26 +87,29 @@ comment on column formations.predicted_win_prob is
     'マッチメイカが成立時に算出した予測勝率（凍結値）';
 
 -- ----------------------------------------------------------------------
--- formation_players: 編成。1 formation につき10行。
+-- formation_players: 編成。1 formation につき10行（各チーム 5 ロール × 1 人）。
+-- team は永久ログを SQL で直接見ても読めるよう、数値ではなく 'red' / 'blue' の文字列で持つ。
 -- ----------------------------------------------------------------------
 create table formation_players (
     formation_id     uuid             not null references formations (id),
     player_id        uuid             not null references players (id),
-    team             smallint         not null check (team in (0, 1)),
+    team             text             not null check (team in ('red', 'blue')),
     role             text             not null references roles (id),
     role_was_flexed  boolean          not null,
     mu_at_match      double precision not null,
     sigma_at_match   double precision not null,
-    primary key (formation_id, player_id)
+    primary key (formation_id, player_id),
+    -- 同じチームに同じロールが 2 人いる編成は存在しない。追記専用なので、書いてから直せない
+    unique (formation_id, team, role)
 );
 
 create index formation_players_player_id_idx
     on formation_players (player_id);
 
 comment on table formation_players is
-    '追記専用: UPDATE / DELETE 禁止（reject_mutation トリガーで拒否）。マッチング時点の編成と μ・σ の凍結値。';
+    '追記専用: UPDATE / DELETE 禁止（reject_mutation トリガーで拒否）。マッチング時点の編成と μ・σ の凍結値。(formation_id, team, role) は一意。';
 comment on column formation_players.team is
-    '0 または 1';
+    'red または blue';
 comment on column formation_players.role is
     'roles.id への参照（不変の識別子）';
 comment on column formation_players.role_was_flexed is
@@ -143,9 +157,9 @@ comment on column formation_events.kind is
 comment on column formation_events.subject_player_id is
     'このイベントが対象とするプレイヤー（行為者ではない）。システム起因の host_assigned / host_timeout でも対象者を入れる。行為者と対象が異なり、行為者を記録する必要が出た場合は payload に入れる（列は増やさない）';
 comment on column formation_events.payload is
-    'イベントの生データ。thread_created: {"discord_thread_id": "..."} / code_posted: {"room_code": "..."} / abandoned: {"reason": "host_candidates_exhausted" | "not_enough_players" | "thread_creation_failed"}。個人の特定（誰が来なかったか等）は入れない';
+    'イベントの生データ。thread_created: {"discord_thread_id": "...", "vc": {...}} / code_posted: {"room_code": "..."} / abandoned: {"reason": "host_candidates_exhausted" | "not_enough_players" | "thread_creation_failed" | "vc_pool_exhausted" | "member_add_failed" | "discord_call_failed"}。Discord 側の副作用（メッセージ ID）と、その失敗（"discord_failures": [{"operation": "...", "error": "..."}]）もここに残す。誰が来なかったかの推測は入れない（システム側の失敗で特定できる player_id は入れる）';
 comment on column formation_events.idempotency_key is
-    'アプリが供給する冪等キー。(formation_id, idempotency_key) の unique で、Discord API の再送による同一イベントの二重追記を防ぐ。Phase 4 で Discord のインタラクション ID を使う想定';
+    'アプリが供給する冪等キー。(formation_id, idempotency_key) の unique で、Discord API の再送による同一イベントの二重追記を防ぐ。Phase 4 では Discord のインタラクション ID を使う';
 
 -- ----------------------------------------------------------------------
 -- match_reports: 結果報告。1人1行、追記のみ。取り消しは打ち消しレコード（supersedes_id）。
@@ -175,7 +189,7 @@ create unique index match_reports_supersedes_uniq
 comment on table match_reports is
     '追記専用: UPDATE / DELETE 禁止（reject_mutation トリガーで拒否）。報告の取り消し・訂正は supersedes_id を持つ新しい行で表現する。他人の報告内容は本人の報告前に返さない（API レベルでブラインド）。報告者は複合 FK により当該試合の参加者に限られる。';
 comment on column match_reports.outcome is
-    '報告者が主張する結果。team_0 / team_1 / draw。引き分けを NULL で表現しない（未報告と区別できなくなる）';
+    '報告者が主張する結果。team_0 / team_1 / draw（team_0 = red、team_1 = blue）。引き分けを NULL で表現しない（未報告と区別できなくなる）';
 comment on column match_reports.raw_result is
     '報告された生データ（スクリーンショット URL を含む）。パースに失敗しても必ず保存する';
 comment on column match_reports.supersedes_id is

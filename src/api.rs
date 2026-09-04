@@ -3,36 +3,46 @@
 //! Phase 4 で必要なのは、`matched` の formation を作ってアダプタに渡す入口だけ
 //! （マッチメイキング本体は無いので、手動テスト用の内部エンドポイントとして置く）。
 //! 報告の受付（Phase 6）はここには無い。
+//!
+//! `/internal/formations` は認証なしで formation を作れてしまうので、
+//! `INTERNAL_API_TOKEN` が設定されているときだけマウントし、`Authorization: Bearer <token>` を要求する。
+//! 未設定なら到達不能（404）。公開前のチェックリスト（9/12）で、本番ではトークンを設定しないか、
+//! リバースプロキシで `/internal/` を外から遮断すること。
 
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::discord::{Adapter, team_from_name};
+use crate::discord::Adapter;
 use crate::lifecycle::FormationId;
-use crate::persistence::{NewFormation, NewFormationPlayer, RepositoryError};
+use crate::persistence::{NewFormation, NewFormationPlayer, RepositoryError, Team};
 
 /// ルーターが共有する状態。
 #[derive(Clone)]
 pub struct ApiState {
     /// Discord アダプタ（永続化層もここから使う）。
     pub adapter: Arc<Adapter>,
+    /// `/internal/*` の Bearer トークン。`None` なら内部エンドポイントをマウントしない。
+    pub internal_token: Option<Arc<str>>,
 }
 
 /// ルーターを組み立てる。
 pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/internal/formations", post(create_formation))
-        .with_state(state)
+    let mut router = Router::new().route("/healthz", get(healthz));
+    if state.internal_token.is_some() {
+        router = router.route("/internal/formations", post(create_formation));
+    } else {
+        warn!("INTERNAL_API_TOKEN is not set; /internal/formations is not mounted");
+    }
+    router.with_state(state)
 }
 
 async fn healthz() -> &'static str {
@@ -42,7 +52,7 @@ async fn healthz() -> &'static str {
 /// `POST /internal/formations` の入力。マッチメイカが確定した 10 人。
 #[derive(Debug, Deserialize)]
 pub struct CreateFormationRequest {
-    /// 参加者 10 人（各チーム 5 人）。
+    /// 参加者 10 人（各チーム 5 人、ロールはチーム内で重複しない）。
     pub players: Vec<PlayerSpec>,
     /// マッチング時点のパラメータ版数（凍結値）。無ければ 0。
     #[serde(default)]
@@ -99,6 +109,8 @@ struct ErrorBody {
 /// API のエラー。
 #[derive(Debug)]
 pub enum ApiError {
+    /// 認証なし、またはトークン不一致。
+    Unauthorized,
     /// 入力が不正。
     BadRequest(String),
     /// 内部エラー（詳細はログ）。
@@ -108,6 +120,7 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_owned()),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -130,10 +143,40 @@ impl From<RepositoryError> for ApiError {
     }
 }
 
+/// 長さに依存しない比較（トークンの照合用）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for (x, y) in a.iter().zip(b.iter().chain(std::iter::repeat(&0))) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn authorize(headers: &HeaderMap, expected: &str) -> Result<(), ApiError> {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .ok_or(ApiError::Unauthorized)?;
+    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
 async fn create_formation(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<CreateFormationRequest>,
 ) -> Result<(StatusCode, Json<CreateFormationResponse>), ApiError> {
+    let expected = state
+        .internal_token
+        .as_deref()
+        .ok_or(ApiError::Unauthorized)?;
+    authorize(&headers, expected)?;
+
     let repo = state.adapter.repository();
     let discord_ids: Vec<i64> = request
         .players
@@ -155,9 +198,10 @@ async fn create_formation(
 
     let mut players = Vec::with_capacity(request.players.len());
     for spec in &request.players {
-        let team = team_from_name(&spec.team).ok_or_else(|| {
-            ApiError::BadRequest(format!("team must be red or blue, got {:?}", spec.team))
-        })?;
+        let team: Team = spec
+            .team
+            .parse()
+            .map_err(|error| ApiError::BadRequest(format!("team: {error}")))?;
         players.push(NewFormationPlayer {
             player_id: known[&spec.discord_user_id],
             team,
@@ -175,12 +219,12 @@ async fn create_formation(
         players,
     };
     repo.create_formation(&formation).await.map_err(|error| {
-        // 存在しないロールなどの FK 違反は入力の問題として返す
+        // 存在しないロール（FK）や同一チーム同一ロール（unique）は入力の問題として返す
         match &error {
             RepositoryError::Database(sqlx::Error::Database(db))
-                if db.is_foreign_key_violation() =>
+                if db.is_foreign_key_violation() || db.is_unique_violation() =>
             {
-                ApiError::BadRequest(format!("unknown reference: {}", db.message()))
+                ApiError::BadRequest(format!("invalid formation: {}", db.message()))
             }
             _ => ApiError::from(error),
         }

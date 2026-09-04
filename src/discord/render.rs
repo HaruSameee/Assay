@@ -1,11 +1,11 @@
 //! スレッドに出す文言。純粋関数。
 //!
-//! スレッドに出してよいのは、割り当て表・集合場所（VC）・部屋設定・ルーム ID・ホスト打診だけ。
-//! 勝敗に関する語は一切出さない（`tests` で検査する）。
+//! スレッドに出してよいのは、割り当て表・集合場所（VC）・部屋設定・ルーム ID・ホスト打診・
+//! 解散の通知だけ。勝敗に関する語は一切出さない（`tests` で検査する）。
 
 use serenity::model::id::UserId;
 
-use crate::lifecycle::{FormationId, PlayerId};
+use crate::lifecycle::{AbandonReason, FormationId, PlayerId};
 use crate::persistence::{RosterEntry, Team};
 
 use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
@@ -15,46 +15,29 @@ use super::vc_pool::VcPair;
 /// ルーム ID の最大長（モーダルの入力制限）。
 pub const ROOM_CODE_MAX_LENGTH: u16 = 32;
 
-/// チームの表示名（`formation_players.team` は 0 / 1）。
-pub fn team_name(team: Team) -> &'static str {
-    match team {
-        Team::Zero => "red",
-        Team::One => "blue",
-    }
-}
-
-/// 表示名からチームへ。`red` / `blue` 以外は `None`。
-pub fn team_from_name(name: &str) -> Option<Team> {
-    match name {
-        "red" => Some(Team::Zero),
-        "blue" => Some(Team::One),
-        _ => None,
-    }
-}
-
 fn team_emoji(team: Team) -> &'static str {
     match team {
-        Team::Zero => "🔴",
-        Team::One => "🔵",
+        Team::Red => "🔴",
+        Team::Blue => "🔵",
     }
 }
 
 /// VC の名前（`VC-<label>-<team>`）。
 pub fn vc_channel_name(pair: &VcPair, team: Team) -> String {
-    format!("VC-{}-{}", pair.label, team_name(team))
+    format!("VC-{}-{}", pair.label, team)
 }
 
 fn vc_channel_of(pair: &VcPair, team: Team) -> u64 {
     match team {
-        Team::Zero => pair.red.get(),
-        Team::One => pair.blue.get(),
+        Team::Red => pair.red.get(),
+        Team::Blue => pair.blue.get(),
     }
 }
 
 fn vc_line(pair: &VcPair, team: Team) -> String {
     format!(
         "{} は {}（<#{}>）に集合",
-        team_name(team),
+        team,
         vc_channel_name(pair, team),
         vc_channel_of(pair, team)
     )
@@ -75,11 +58,11 @@ fn mention(user: UserId) -> String {
 pub fn assignment(roster: &[RosterEntry], vc: &VcPair, checklist: &[String]) -> OutgoingMessage {
     let mut content = String::from("## 割り当て表\n");
     let mut mention_users = Vec::with_capacity(roster.len());
-    for team in [Team::Zero, Team::One] {
+    for team in Team::ALL {
         content.push_str(&format!(
             "{} **{}** — {}\n",
             team_emoji(team),
-            team_name(team),
+            team,
             vc_line(vc, team)
         ));
         let mut members: Vec<&RosterEntry> =
@@ -207,8 +190,8 @@ pub fn code_reveal(
     if let Some(vc) = vc {
         content.push_str(&format!(
             "{}、{}してください。",
-            vc_line(vc, Team::Zero),
-            vc_line(vc, Team::One)
+            vc_line(vc, Team::Red),
+            vc_line(vc, Team::Blue)
         ));
     }
     OutgoingMessage {
@@ -218,10 +201,18 @@ pub fn code_reveal(
     }
 }
 
-/// ホスト候補が尽きた。
-pub fn host_exhausted() -> OutgoingMessage {
+/// 解散の通知。理由は運用上の事実だけを書く（人の推測はしない）。
+pub fn abandoned_notice(reason: AbandonReason) -> OutgoingMessage {
+    let why = match reason {
+        AbandonReason::HostCandidatesExhausted => "ホストが決まらなかったため",
+        AbandonReason::NotEnoughPlayers => "部屋に人が揃わなかったため",
+        AbandonReason::ThreadCreationFailed => "スレッドを作成できなかったため",
+        AbandonReason::VcPoolExhausted => "空いている VC が無かったため",
+        AbandonReason::MemberAddFailed => "参加者をこのスレッドに追加できなかったため",
+        AbandonReason::DiscordCallFailed => "Discord への投稿ができなかったため",
+    };
     OutgoingMessage {
-        content: "ホストが決まらなかったため、この試合は解散になりました。".into(),
+        content: format!("{why}、この試合は解散になりました。キューに戻ります。"),
         buttons: Vec::new(),
         mention_users: Vec::new(),
     }
@@ -267,6 +258,11 @@ pub fn code_invalid() -> String {
     "ルーム ID が空です。もう一度入力してください。".into()
 }
 
+/// ルーム ID の開示に失敗した（本人にだけ表示）。
+pub fn reveal_failed() -> String {
+    "ルーム ID をスレッドに投稿できませんでした。この試合は解散になります。".into()
+}
+
 /// 編成の Discord ユーザー。0 以下は無効（`None`）。
 pub fn user_of(entry: &RosterEntry) -> Option<UserId> {
     u64::try_from(entry.discord_user_id)
@@ -282,6 +278,7 @@ mod tests {
     use super::*;
 
     /// 勝敗を示す語。スレッドに出る文言にこれらが含まれてはならない。
+    /// Phase 6 で報告の文言が増えたら、このリストも見直すこと。
     const FORBIDDEN: [&str; 14] = [
         "勝",
         "負",
@@ -304,7 +301,7 @@ mod tests {
             .map(|n| RosterEntry {
                 player_id: PlayerId(Uuid::from_u128(n)),
                 discord_user_id: 1000 + n as i64,
-                team: if n <= 5 { Team::Zero } else { Team::One },
+                team: if n <= 5 { Team::Red } else { Team::Blue },
                 role: format!("role{}", n % 5),
                 role_display_name: format!("ロール{}", n % 5),
                 role_sort_order: (n % 5) as i32,
@@ -327,15 +324,15 @@ mod tests {
         let host = UserId::new(1001);
         let others: Vec<UserId> = (1002..=1010).map(UserId::new).collect();
         let checklist = vec!["設定 A".to_owned(), "設定 B".to_owned()];
-        let messages = [
+        let mut messages = vec![
             assignment(&roster(), &vc(), &checklist),
             host_prompt(host, formation, player, 1, 3),
             host_accepted(host, formation, player),
             code_status(host, "1234", formation, player),
             code_reveal(host, &others, "1234", Some(&vc())),
             code_reveal(host, &others, "1234", None),
-            host_exhausted(),
         ];
+        messages.extend(AbandonReason::ALL.into_iter().map(abandoned_notice));
         let mut texts: Vec<String> = messages
             .iter()
             .flat_map(|message| {
@@ -351,6 +348,7 @@ mod tests {
         texts.push(stale());
         texts.push(not_the_host());
         texts.push(code_invalid());
+        texts.push(reveal_failed());
         texts.push(thread_name(formation));
         texts
     }
@@ -438,10 +436,11 @@ mod tests {
     }
 
     #[test]
-    fn team_names_round_trip() {
-        for team in [Team::Zero, Team::One] {
-            assert_eq!(team_from_name(team_name(team)), Some(team));
-        }
-        assert_eq!(team_from_name("green"), None);
+    fn team_values_are_the_database_strings() {
+        assert_eq!(Team::Red.as_str(), "red");
+        assert_eq!(Team::Blue.as_str(), "blue");
+        assert_eq!("red".parse::<Team>(), Ok(Team::Red));
+        assert!("0".parse::<Team>().is_err());
+        assert_eq!(vc_channel_name(&vc(), Team::Blue), "VC-01-blue");
     }
 }

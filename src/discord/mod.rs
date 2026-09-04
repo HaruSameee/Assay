@@ -1,11 +1,15 @@
 //! Discord アダプタ（Phase 4）。axum と同じバイナリの中で動き、DB の接続プールを共有する。
 //!
 //! 扱うのはイベントで駆動されるものだけ（スレッド作成、ホスト打診、ボタン、モーダル）。
-//! 時間で駆動されるもの（タイムアウト、候補の繰り上げ）は Phase 5。報告の受付は Phase 6。
+//! 時間で駆動されるもの（タイムアウト、候補の繰り上げ）は Phase 5 で、[`Adapter::resume_unfinished`]
+//! を拡張する形で実装する（復帰の入口を 2 つ作らない）。報告の受付は Phase 6。
 //!
 //! 不変条件（このモジュールで守るもの）:
-//! - Discord に作ったもの（スレッド・メッセージ・VC 割当）の ID は必ず `formation_events.payload` に
-//!   記録する。再起動後は Discord 側を検索し直さず、ログから続きを操作する（[`payload::DiscordRecord`]）。
+//! - Discord に作ったもの（スレッド・メッセージ・VC 割当）の ID と、Discord 呼び出しの失敗は必ず
+//!   `formation_events.payload` に記録する。再起動後は Discord 側を検索し直さず、ログから続きを
+//!   操作する（[`payload::DiscordRecord`]）。
+//! - 先に進めない失敗（VC 無し、スレッド作成失敗、参加者の追加失敗、投稿失敗）は `abandoned` で解散し、
+//!   理由と詳細を payload に残す。10 人を黙って拘束しない。
 //! - インタラクション由来のイベントの冪等キーは Discord のインタラクション ID。
 //! - VC チャンネルは読むだけ。作らない、消さない、権限を変更しない（[`gateway::Gateway`] に
 //!   そのような操作は無い）。
@@ -30,7 +34,6 @@ pub use adapter::{Adapter, AdapterError, IncomingInteraction, IncomingKind};
 pub use config::{ConfigError, DiscordConfig};
 pub use gateway::{Gateway, GatewayError, SerenityGateway};
 pub use handler::Handler;
-pub use render::{team_from_name, team_name};
 pub use vc_pool::{VcPair, VcPool};
 
 /// ゲートウェイクライアントを組み立てる。
