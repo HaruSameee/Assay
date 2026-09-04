@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into formation_players (formation_id, player_id, team, role, role_was_flexed, mu_at_match, sigma_at_match) values ($1, $2, $3, $4, $5, $6, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int2",
+        "Text",
+        "Bool",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6dab3060ba4606a6d7b1197f2260955757af7aa1fd3a4f9a0c9a16b6af10ebff"
+}

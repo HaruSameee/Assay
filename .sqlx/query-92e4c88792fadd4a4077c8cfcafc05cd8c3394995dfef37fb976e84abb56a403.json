@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into formations (id, created_at, matchmaking_params_version, predicted_win_prob) values ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Int4",
+        "Float4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "92e4c88792fadd4a4077c8cfcafc05cd8c3394995dfef37fb976e84abb56a403"
+}

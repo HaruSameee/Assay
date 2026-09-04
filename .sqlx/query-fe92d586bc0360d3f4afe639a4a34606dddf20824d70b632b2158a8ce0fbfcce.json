@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select created_at from formations where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "formations",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fe92d586bc0360d3f4afe639a4a34606dddf20824d70b632b2158a8ce0fbfcce"
+}

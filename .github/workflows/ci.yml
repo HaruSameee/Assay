@@ -1,0 +1,49 @@
+# CI: fmt / clippy / テスト、および .sqlx（オフラインクエリデータ）の陳腐化検出。
+# PostgreSQL 17 をサービスとして立て、マイグレーションを当ててから
+# `cargo sqlx prepare --check` で .sqlx がコード中の query! と一致することを確認する。
+# DB を使うテスト（#[sqlx::test]）はテストごとに DB とアプリ用ロールを作るので、
+# DATABASE_URL のロールは superuser（postgres イメージの POSTGRES_USER）にしておく。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: unite
+          POSTGRES_PASSWORD: unite_dev
+          POSTGRES_DB: unite_matchsystem
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U unite -d unite_matchsystem"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://unite:unite_dev@localhost:5432/unite_matchsystem
+      SQLX_OFFLINE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+      - name: Apply migrations
+        run: sqlx migrate run
+      - name: Format
+        run: cargo fmt --check
+      - name: Offline query data is current
+        run: cargo sqlx prepare --check -- --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test

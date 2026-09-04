@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into formation_events (formation_id, occurred_at, kind, subject_player_id, payload, idempotency_key) values ($1, $2, 'host_accepted', $3, '{}', 'bogus')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c9a6e980b94fa3001075fd0100714b64c11f72f35f32c7620f487709ab0bf66c"
+}

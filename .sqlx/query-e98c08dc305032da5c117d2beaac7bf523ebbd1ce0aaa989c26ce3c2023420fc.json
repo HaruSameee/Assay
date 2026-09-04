@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select payload from formation_events where formation_id = $1 and kind = 'thread_created'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "formation_events",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e98c08dc305032da5c117d2beaac7bf523ebbd1ce0aaa989c26ce3c2023420fc"
+}
