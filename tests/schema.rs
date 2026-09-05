@@ -261,14 +261,15 @@ async fn rating_adjustments_are_append_only_and_recompute_from_display_scale(own
     .fetch_one(&app)
     .await
     .unwrap();
-    sqlx::query!(
+    let reversal = sqlx::query!(
         "insert into rating_adjustments \
          (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key, reverts_id) \
-         values ($1, -180.0, 60.0, 'retracted result', 'staff:tester', now(), 'rating-test-2', $2)",
+         values ($1, -180.0, 60.0, 'retracted result', 'staff:tester', now(), 'rating-test-2', $2) \
+         returning id",
         player.0,
         adjustment.id,
     )
-    .execute(&app)
+    .fetch_one(&app)
     .await
     .unwrap();
     sqlx::query!(
@@ -327,6 +328,44 @@ async fn rating_adjustments_are_append_only_and_recompute_from_display_scale(own
     .unwrap_err();
     assert_eq!(
         invalid_reversal
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("23514")
+    );
+
+    let duplicate_reversal = sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key, reverts_id) \
+         values ($1, -180.0, 60.0, 'duplicate reversal', 'staff:tester', now(), 'rating-test-duplicate-reversal', $2)",
+        player.0,
+        adjustment.id,
+    )
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate_reversal
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("23505")
+    );
+
+    let reversal_of_reversal = sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key, reverts_id) \
+         values ($1, 180.0, -60.0, 'reversal of reversal', 'staff:tester', now(), 'rating-test-reversal-of-reversal', $2)",
+        player.0,
+        reversal.id,
+    )
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        reversal_of_reversal
             .as_database_error()
             .unwrap()
             .code()
