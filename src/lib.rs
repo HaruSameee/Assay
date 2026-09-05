@@ -1,14 +1,9 @@
-//! unite-matchsystem
-//!
-//! - `lifecycle`: 試合ライフサイクルの状態機械（Phase 2、純粋関数）。
-//! - `persistence`: それを sqlx / PostgreSQL に載せる永続化層（Phase 3）。
-//! - `discord`: Discord アダプタ（Phase 4、イベント駆動の部分のみ）。
-//! - `registration`: 登録・認証トラック（Discord OAuth・セッション・登録フォーム・キューゲート）。
-//! - `api`: HTTP API（axum）。Discord アダプタと同じプロセスで動く。
+//! 単純ランクマッチシステム「Assay」（Pokémon UNITE 用）— lifecycle / persistence / discord / registration / api。
 #![forbid(unsafe_code)]
 
 pub mod api;
 pub mod discord;
 pub mod lifecycle;
 pub mod persistence;
+pub mod rating;
 pub mod registration;

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into rating_adjustments (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) values ($1, 180.0, -60.0, 'tournament result', 'staff:tester', now(), 'rating-test-1') returning id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rating_adjustments",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bb4ba9f19de683b653f56551b977adafcb5ff77dce1037b2875439841f7cd67a"
+}

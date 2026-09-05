@@ -3,7 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use unite_matchsystem::lifecycle::{AbandonReason, FormationEventKind};
+use unite_matchsystem::lifecycle::{AbandonReason, FormationEventKind, PlayerId};
+use unite_matchsystem::rating::RatingAdjustmentRepository;
 
 const PRIVILEGES: &str = include_str!("../ops/app_privileges.sql");
 const AUDIT: &str = include_str!("../ops/check_app_role.sql");
@@ -240,6 +241,114 @@ async fn the_audit_fails_loudly_when_the_app_role_is_absent(owner: sqlx::PgPool)
         Some("42704"),
         "{error}"
     );
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn rating_adjustments_are_append_only_and_recompute_from_display_scale(owner: sqlx::PgPool) {
+    let app = app_pool(&owner).await;
+    let player = PlayerId(uuid::Uuid::from_u128(1));
+
+    let adjustment = sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+         values ($1, 180.0, -60.0, 'tournament result', 'staff:tester', now(), 'rating-test-1') \
+         returning id",
+        player.0,
+    )
+    .fetch_one(&app)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key, reverts_id) \
+         values ($1, -180.0, 60.0, 'retracted result', 'staff:tester', now(), 'rating-test-2', $2)",
+        player.0,
+        adjustment.id,
+    )
+    .execute(&app)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+         values ($1, 60.0, -30.0, 'verified result', 'staff:tester', now(), 'rating-test-3')",
+        player.0,
+    )
+    .execute(&app)
+    .await
+    .unwrap();
+
+    // 同じ idempotency_key だけが no-op になる。異なるキーの記録を状態で潰さない。
+    let duplicate = sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+         values ($1, 180.0, -60.0, 'tournament result', 'staff:tester', now(), 'rating-test-1') \
+         on conflict (idempotency_key) do nothing",
+        player.0,
+    )
+    .execute(&app)
+    .await
+    .unwrap();
+    assert_eq!(duplicate.rows_affected(), 0);
+
+    let ratings = RatingAdjustmentRepository::new(app.clone());
+    let first = ratings.initial_rating(player).await.unwrap();
+    let second = ratings.initial_rating(player).await.unwrap();
+    assert_eq!(first, second, "recompute input must be repeatable");
+    assert_eq!(first.mu, 26.0);
+    assert_eq!(first.sigma, 47.0 / 6.0);
+
+    let blank_reason = sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+         values ($1, 1.0, 1.0, '   ', 'staff:tester', now(), 'rating-test-blank-reason')",
+        player.0,
+    )
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        blank_reason.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+
+    let invalid_reversal = sqlx::query!(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key, reverts_id) \
+         values ($1, -179.0, 60.0, 'invalid reversal', 'staff:tester', now(), 'rating-test-invalid', $2)",
+        player.0,
+        adjustment.id,
+    )
+    .execute(&app)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        invalid_reversal
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("23514")
+    );
+
+    for sql in [
+        "update rating_adjustments set id = id",
+        "delete from rating_adjustments",
+    ] {
+        for (pool, expected) in [(&app, "42501"), (&owner, "0A000")] {
+            let error = sqlx::query(sql).execute(pool).await.unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some(expected),
+                "{sql}"
+            );
+        }
+    }
+    assert!(violations(&app).await.is_empty());
+    app.close().await;
 }
 
 /// `migrations/*.up.sql` を（パス, 内容）で返す。

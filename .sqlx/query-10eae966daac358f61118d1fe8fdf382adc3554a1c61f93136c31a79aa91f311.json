@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into rating_adjustments (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) values ($1, 60.0, -30.0, 'verified result', 'staff:tester', now(), 'rating-test-3')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "10eae966daac358f61118d1fe8fdf382adc3554a1c61f93136c31a79aa91f311"
+}
