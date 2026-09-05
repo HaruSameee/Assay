@@ -1,13 +1,8 @@
-//! HTTP API（axum）。Discord アダプタと同じプロセスで動き、DB の接続プールを共有する。
+//! HTTP API（axum）。
 //!
-//! Phase 4 で必要なのは、`matched` の formation を作ってアダプタに渡す入口だけ
-//! （マッチメイキング本体は無いので、手動テスト用の内部エンドポイントとして置く）。
-//! 報告の受付（Phase 6）はここには無い。
-//!
-//! `/internal/formations` は認証なしで formation を作れてしまうので、
-//! `INTERNAL_API_TOKEN` が設定されているときだけマウントし、`Authorization: Bearer <token>` を要求する。
-//! 未設定なら到達不能（404）。公開前のチェックリスト（9/12）で、本番ではトークンを設定しないか、
-//! リバースプロキシで `/internal/` を外から遮断すること。
+//! セキュリティ: `/internal/formations` は `INTERNAL_API_TOKEN` が設定されているときだけ
+//! マウントし、`Authorization: Bearer <token>` を要求する。本番ではトークンを設定しないか、
+//! リバースプロキシで `/internal/` を外から遮断する。
 
 use std::sync::Arc;
 
@@ -25,16 +20,12 @@ use crate::discord::Adapter;
 use crate::lifecycle::FormationId;
 use crate::persistence::{NewFormation, NewFormationPlayer, RepositoryError, Team};
 
-/// ルーターが共有する状態。
 #[derive(Clone)]
 pub struct ApiState {
-    /// Discord アダプタ（永続化層もここから使う）。
     pub adapter: Arc<Adapter>,
-    /// `/internal/*` の Bearer トークン。`None` なら内部エンドポイントをマウントしない。
     pub internal_token: Option<Arc<str>>,
 }
 
-/// ルーターを組み立てる。
 pub fn router(state: ApiState) -> Router {
     let mut router = Router::new().route("/healthz", get(healthz));
     if state.internal_token.is_some() {
@@ -49,15 +40,14 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `POST /internal/formations` の入力。マッチメイカが確定した 10 人。
 #[derive(Debug, Deserialize)]
 pub struct CreateFormationRequest {
-    /// 参加者 10 人（各チーム 5 人、ロールはチーム内で重複しない）。
+    /// 参加者 10 人（各チーム 5 人、ロールはチーム内で重複しない）
     pub players: Vec<PlayerSpec>,
-    /// マッチング時点のパラメータ版数（凍結値）。無ければ 0。
+    /// マッチング時点のパラメータ版数（凍結）。無ければ 0。
     #[serde(default)]
     pub matchmaking_params_version: i32,
-    /// 予測勝率（凍結値）。無ければ 0.5。
+    /// 予測勝率（凍結）。無ければ 0.5。
     #[serde(default = "default_win_prob")]
     pub predicted_win_prob: f32,
 }
@@ -66,14 +56,13 @@ fn default_win_prob() -> f32 {
     0.5
 }
 
-/// 参加者 1 人分。
 #[derive(Debug, Deserialize)]
 pub struct PlayerSpec {
-    /// `players.discord_user_id`（登録済みであること）。
+    /// `players.discord_user_id`
     pub discord_user_id: i64,
-    /// `red` / `blue`。
+    /// `red` / `blue`
     pub team: String,
-    /// `roles.id`。
+    /// `roles.id`
     pub role: String,
     /// フレックスで埋められたか。無ければ false。
     #[serde(default)]
@@ -94,10 +83,9 @@ fn default_sigma() -> f64 {
     25.0 / 3.0
 }
 
-/// `POST /internal/formations` の出力。
 #[derive(Debug, Serialize)]
 pub struct CreateFormationResponse {
-    /// 作られた formation。VC の割当と投稿はバックグラウンドで進む。
+    /// VC の割当・投稿はバックグラウンドで進む（202）。
     pub formation_id: Uuid,
 }
 
@@ -106,14 +94,10 @@ struct ErrorBody {
     error: String,
 }
 
-/// API のエラー。
 #[derive(Debug)]
 pub enum ApiError {
-    /// 認証なし、またはトークン不一致。
     Unauthorized,
-    /// 入力が不正。
     BadRequest(String),
-    /// 内部エラー（詳細はログ）。
     Internal,
 }
 
@@ -143,7 +127,7 @@ impl From<RepositoryError> for ApiError {
     }
 }
 
-/// 長さに依存しない比較（トークンの照合用）。
+/// 長さに依存しない比較（トークンの照合にタイミング攻撃を使わせないため）。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u8;
     for (x, y) in a.iter().zip(b.iter().chain(std::iter::repeat(&0))) {

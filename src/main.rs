@@ -1,13 +1,4 @@
-//! バイナリ: axum サーバと Discord クライアントを同じプロセスで並行に動かす。
-//!
-//! 起動順:
-//! 1. `.env` と環境変数から設定を読む
-//! 2. DB プールを作る（アプリ用ロールで繋ぐ想定。追記専用テーブルの UPDATE / DELETE 権限は無い）
-//! 3. Discord クライアントを組み立て、その `Http` を共有してアダプタを作る。
-//!    VC プール（`vc1-red` … `vc<N>-blue`）を名前から解決し、欠落・重複なら起動を失敗させる
-//! 4. `tokio::spawn` で Discord クライアントと axum サーバを並行に動かす
-//!
-//! どちらかが終了（または Ctrl-C）したらプロセスを終える。
+//! axum サーバ + Discord クライアントを単一プロセスで動かす。どちらかが終了したらプロセス全体を終了させる。
 
 use std::env;
 use std::error::Error;
@@ -28,7 +19,6 @@ use unite_matchsystem::registration::{
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
-/// `/internal/*` の Bearer トークン。未設定なら内部エンドポイントはマウントされない。
 const INTERNAL_API_TOKEN: &str = "INTERNAL_API_TOKEN";
 const MIGRATOR_DATABASE_URL: &str = "MIGRATOR_DATABASE_URL";
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -69,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let handler = Arc::new(Handler::default());
     let mut client = build_client(&discord_config.token, handler.clone()).await?;
     let gateway = Arc::new(SerenityGateway::new(client.http.clone()));
-    // 設定は名前、ログは ID。ここで解決できなければ起動しない
+    // VC プールは設定が名前・ログが ID で持つ。解決できなければ起動しない
     let vc_pool = resolve_vc_pool(
         &*gateway,
         discord_config.guild_id,
@@ -86,7 +76,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ));
     handler.attach(adapter.clone());
 
-    // 登録・認証。設定が欠けていたら起動しない（本番で「ログインだけ無い」状態を作らない）
+    // 認証設定が欠けていたら起動しない（本番で「ログインだけ無い」状態を作らない）
     let auth = AuthState::new(
         auth_config.clone(),
         Arc::new(HttpOAuthClient::new(&auth_config)?),
