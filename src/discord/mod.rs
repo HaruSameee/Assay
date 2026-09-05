@@ -79,8 +79,9 @@ pub async fn resolve_vc_pool(
 /// インテントは `GUILDS` だけ。インタラクションはインテントに関係なく届く。
 /// 返ったクライアントの `http` を [`SerenityGateway`] に渡してアダプタを作り、
 /// [`Handler::attach`] で差し込んでから `start` する。
-pub async fn build_client(token: &str, handler: Arc<Handler>) -> Result<Client, serenity::Error> {
+pub async fn build_client(token: &str, handler: Arc<Handler>) -> Result<Client, Box<serenity::Error>> {
     Client::builder(token, GatewayIntents::GUILDS)
         .event_handler_arc(handler)
         .await
+        .map_err(Box::new)
 }
