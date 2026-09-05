@@ -30,6 +30,8 @@ use unite_matchsystem::registration::{
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 /// `/internal/*` の Bearer トークン。未設定なら内部エンドポイントはマウントされない。
 const INTERNAL_API_TOKEN: &str = "INTERNAL_API_TOKEN";
+const MIGRATOR_DATABASE_URL: &str = "MIGRATOR_DATABASE_URL";
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -39,6 +41,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    match env::args().nth(1).as_deref() {
+        Some("migrate") => return migrate().await,
+        Some(command) => return Err(format!("unknown command: {command}").into()),
+        None => {}
+    }
 
     let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
     let listen_addr = env::var("HTTP_LISTEN_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.into());
@@ -52,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let lifecycle = LifecycleConfig::default();
 
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(10)
         .connect(&database_url)
         .await?;
     let repo = FormationRepository::new(pool.clone());
@@ -114,5 +122,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
+    Ok(())
+}
+
+/// assay_migrator 接続だけで全マイグレーションを適用する。通常起動で呼ばないこと。
+async fn migrate() -> Result<(), Box<dyn Error>> {
+    let database_url =
+        env::var(MIGRATOR_DATABASE_URL).map_err(|_| "MIGRATOR_DATABASE_URL is not set")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    MIGRATOR.run(&pool).await?;
     Ok(())
 }

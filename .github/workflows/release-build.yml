@@ -51,5 +51,13 @@ jobs:
           path: |
             target/release/unite-matchsystem
             target/release/unite-matchsystem.sha256
+            ops/app_role.sql
+            ops/app_privileges.sql
+            ops/check_app_role.sql
+            ops/verify_app_role.sql
+            ops/app.env.example
+            ops/assay.service
+            ops/Caddyfile
+            ops/deploy.md
           if-no-files-found: error
           retention-days: 14

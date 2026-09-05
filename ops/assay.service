@@ -1,0 +1,22 @@
+[Unit]
+Description=Assay match system
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=assay
+Group=assay
+WorkingDirectory=/opt/assay
+EnvironmentFile=/etc/assay/app-database.env
+EnvironmentFile=/etc/assay/app.env
+ExecStart=/opt/assay/bin/unite-matchsystem
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
