@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update players set trainer_name = $2, registered_at = coalesce(registered_at, $3) where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a0023dbf751dbf317d866154a1fe340efa1201fe860de4d707f0d9b24b41110f"
+}

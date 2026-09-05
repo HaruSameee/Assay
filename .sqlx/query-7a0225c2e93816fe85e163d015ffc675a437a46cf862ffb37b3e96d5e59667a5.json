@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into players (id, discord_user_id, created_at) values ($1, $2, $3) on conflict (discord_user_id) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7a0225c2e93816fe85e163d015ffc675a437a46cf862ffb37b3e96d5e59667a5"
+}

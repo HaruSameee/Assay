@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select rank from player_declarations where player_id = $1 order by id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rank",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_declarations",
+            "name": "rank"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7e4163f0b009983287c2675033578711df845121ff97bfbd33ba82b5e06b251e"
+}

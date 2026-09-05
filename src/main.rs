@@ -23,6 +23,9 @@ use unite_matchsystem::discord::{
 };
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::persistence::FormationRepository;
+use unite_matchsystem::registration::{
+    AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, router as registration_router,
+};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 /// `/internal/*` の Bearer トークン。未設定なら内部エンドポイントはマウントされない。
@@ -45,13 +48,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .filter(|token| !token.is_empty())
         .map(Arc::from);
     let discord_config = DiscordConfig::from_env()?;
+    let auth_config = AuthConfig::from_env()?;
     let lifecycle = LifecycleConfig::default();
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&database_url)
         .await?;
-    let repo = FormationRepository::new(pool);
+    let repo = FormationRepository::new(pool.clone());
+    let auth_pool = pool;
 
     let handler = Arc::new(Handler::default());
     let mut client = build_client(&discord_config.token, handler.clone()).await?;
@@ -73,12 +78,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ));
     handler.attach(adapter.clone());
 
+    // 登録・認証。設定が欠けていたら起動しない（本番で「ログインだけ無い」状態を作らない）
+    let auth = AuthState::new(
+        auth_config.clone(),
+        Arc::new(HttpOAuthClient::new(&auth_config)?),
+        RegistrationRepository::new(auth_pool),
+    );
+    info!(
+        redirect_uri = %auth_config.redirect_uri,
+        cookie_domain = %auth_config.cookie_domain,
+        "registration routes mounted"
+    );
+
     let listener = TcpListener::bind(&listen_addr).await?;
     info!(%listen_addr, "http server listening");
     let app = router(ApiState {
         adapter,
         internal_token,
-    });
+    })
+    .merge(registration_router(auth));
 
     let discord_task = tokio::spawn(async move { client.start().await });
     let http_task = tokio::spawn(async move { axum::serve(listener, app).await });

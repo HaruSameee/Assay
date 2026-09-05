@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update players set status = $2 where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a6e9d76e9ecfa2d68eb6b92e8de80370c302956891aabe137fa6fbcd426faada"
+}

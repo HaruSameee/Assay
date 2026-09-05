@@ -65,4 +65,4 @@ jobs:
           cargo test --lib --bin unite-matchsystem --test lifecycle
           cargo test --doc
       - name: Isolated database tests (bootstrap only uses admin)
-        run: DATABASE_URL="$TEST_ADMIN_DATABASE_URL" cargo test --test persistence --test discord --test schema
+        run: DATABASE_URL="$TEST_ADMIN_DATABASE_URL" cargo test --test persistence --test discord --test schema --test registration

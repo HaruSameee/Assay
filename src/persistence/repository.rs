@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::lifecycle::{FormationEventKind, FormationId, PlayerId, Timestamp, apply};
+use crate::lifecycle::{
+    FormationEventKind, FormationId, FormationState, PlayerId, Timestamp, apply,
+};
 
 use super::codec::{EventRow, decode_row};
 use super::error::RepositoryError;
@@ -184,6 +186,68 @@ impl FormationRepository {
         Ok(rows
             .into_iter()
             .map(|row| (row.discord_user_id, PlayerId(row.id)))
+            .collect())
+    }
+
+    /// このプレイヤーが参加していて、**本人がまだ報告していない** formation と、その導出状態。
+    ///
+    /// キューの報告ゲート（[`crate::registration::gate`]）の入力。解除条件は「自分が報告したこと」
+    /// なので、見るのは**自分の報告の有無だけ**。`match_reports` の参照を `player_id = $1` に
+    /// 限っており、他人の報告の内容も件数も読まない（報告のブラインド）。
+    ///
+    /// `voided` / `abandoned` を持つ formation は SQL 側で落とす（試合が成立しておらず報告義務が
+    /// 生じない）。残りは状態を導出して呼び出し側が [`FormationState::requires_reports`] で絞る。
+    pub async fn formations_without_report_from(
+        &self,
+        player: PlayerId,
+    ) -> Result<Vec<(FormationId, FormationState)>, RepositoryError> {
+        let never_reported: Vec<String> =
+            [FormationEventKind::Voided, FormationEventKind::Abandoned]
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect();
+        let candidates = sqlx::query!(
+            "select f.id, f.created_at from formation_players fp \
+             join formations f on f.id = fp.formation_id \
+             where fp.player_id = $1 \
+               and not exists ( \
+                   select 1 from match_reports mr \
+                   where mr.formation_id = f.id and mr.player_id = $1 \
+               ) \
+               and not exists ( \
+                   select 1 from formation_events e \
+                   where e.formation_id = f.id and e.kind = any($2) \
+               ) \
+             order by f.created_at, f.id",
+            player.0,
+            &never_reported[..],
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<Uuid> = candidates.iter().map(|candidate| candidate.id).collect();
+        let rows = sqlx::query_as!(
+            EventRow,
+            "select id, formation_id, occurred_at, kind, subject_player_id, payload, idempotency_key \
+             from formation_events where formation_id = any($1) order by formation_id, id",
+            &ids[..],
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut grouped: HashMap<Uuid, Vec<EventRow>> = HashMap::new();
+        for row in rows {
+            grouped.entry(row.formation_id).or_default().push(row);
+        }
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| {
+                let rows = grouped.remove(&candidate.id).unwrap_or_default();
+                let log = build_log(FormationId(candidate.id), candidate.created_at, rows);
+                (FormationId(candidate.id), log.snapshot().state)
+            })
             .collect())
     }
 
