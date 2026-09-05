@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select role, priority from queue_entry_roles where entry_id = $1 order by priority",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "queue_entry_roles",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "priority",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "queue_entry_roles",
+            "name": "priority"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "5da71afe6eb8a7f8e0b61505a34c041c6ff62b7bc1794b13c02340ff36a56361"
+}

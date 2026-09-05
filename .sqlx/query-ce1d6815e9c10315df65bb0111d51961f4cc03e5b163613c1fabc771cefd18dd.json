@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into queue_entry_roles (entry_id, role, priority) select $1, role, priority from unnest($2::text[], $3::smallint[]) as w (role, priority)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "Int2Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ce1d6815e9c10315df65bb0111d51961f4cc03e5b163613c1fabc771cefd18dd"
+}

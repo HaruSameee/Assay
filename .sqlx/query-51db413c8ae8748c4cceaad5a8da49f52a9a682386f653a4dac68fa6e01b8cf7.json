@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from queue_entry_roles where entry_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "51db413c8ae8748c4cceaad5a8da49f52a9a682386f653a4dac68fa6e01b8cf7"
+}
