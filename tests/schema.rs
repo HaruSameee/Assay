@@ -160,6 +160,88 @@ async fn policy_is_idempotent_and_clears_legacy_defaults(owner: sqlx::PgPool) {
     app.close().await;
 }
 
+/// 監査が**空振りしていない**ことの確認。
+///
+/// 権限監査は「違反 0 行」で成功と判定する。対象集合が空でも 0 行になるので、
+/// 全アプリテーブルが実際に検査対象に入っていることを、テーブルごとに壊して確かめる。
+/// 新しいテーブルが増えたら自動的にこのテストの対象にもなる（一覧を書き足さなくてよい）。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_audit_inspects_every_application_table(owner: sqlx::PgPool) {
+    let app = app_pool(&owner).await;
+    assert_eq!(
+        violations(&app).await,
+        Vec::<String>::new(),
+        "clean baseline"
+    );
+
+    let tables: Vec<String> = sqlx::query_scalar(
+        "select c.relname::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+         where n.nspname = 'public' and c.relkind in ('r', 'p') \
+             and c.relname <> '_sqlx_migrations' \
+         order by c.relname",
+    )
+    .fetch_all(&owner)
+    .await
+    .unwrap();
+    // 対象集合が空でないこと自体も確かめる（空なら監査は何も見ていない）
+    assert!(
+        tables.len() >= 6,
+        "the audit must cover the application tables: {tables:?}"
+    );
+
+    for table in &tables {
+        // 可変テーブルと追記専用テーブルでは、壊す向きが逆になる
+        let mutable = matches!(table.as_str(), "players" | "roles");
+        let break_it = if mutable {
+            // 可変テーブルに保護トリガーが付いた（＝誤って追記専用にした）
+            format!(
+                "create trigger audit_probe before update or delete on {table} \
+                 for each statement execute function forbid_update_delete()"
+            )
+        } else {
+            // 追記専用テーブルに UPDATE 権限が付いた
+            format!("grant update on {table} to assay_app")
+        };
+        let mut tx = owner.begin().await.unwrap();
+        // テスト内で組み立てた固定文字列（外部入力ではない）
+        sqlx::raw_sql(sqlx::AssertSqlSafe(break_it.clone()))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let failures: Vec<String> = sqlx::query_scalar(AUDIT).fetch_all(&mut *tx).await.unwrap();
+        assert_eq!(
+            failures,
+            std::slice::from_ref(table),
+            "the audit must flag {table} after: {break_it}"
+        );
+        tx.rollback().await.unwrap();
+    }
+    app.close().await;
+}
+
+/// アプリ用ロールが存在しない環境で、監査が **pass ではなくエラー**で落ちること。
+///
+/// `has_table_privilege` は存在しないロール名に対して `undefined_object` (42704) を投げる。
+/// ここが「false を返して違反 0 行」だと、ロールを作り忘れた環境で監査が緑になってしまう。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_audit_fails_loudly_when_the_app_role_is_absent(owner: sqlx::PgPool) {
+    // 実在するロールを消すと並行するテストを巻き込むので、監査 SQL の参照先を差し替える
+    let absent = AUDIT.replace("assay_app", "assay_app_absent");
+    assert!(
+        absent.contains("assay_app_absent") && !absent.contains("'assay_app'"),
+        "every reference to the role must be redirected"
+    );
+    let result: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(sqlx::AssertSqlSafe(absent))
+        .fetch_all(&owner)
+        .await;
+    let error = result.expect_err("the audit must not succeed without the role");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("42704"),
+        "{error}"
+    );
+}
+
 /// `migrations/*.up.sql` を（パス, 内容）で返す。
 fn up_migrations() -> Vec<(PathBuf, String)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

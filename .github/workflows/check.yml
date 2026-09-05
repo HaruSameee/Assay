@@ -1,0 +1,107 @@
+# check: fmt / clippy / .sqlx の陳腐化 / オフラインビルド / テスト。
+#
+# このワークフローの目的のひとつは、**本番と同じロール構成を CI で再現する**こと
+# （00-現在地 §5「テストのアプリ操作はアプリ用ロールで走らせる」）。
+# postgres スーパーユーザーでテストを走らせると、権限の配線ミスが本番でしか出ない。
+#
+#   * assay_migrator … マイグレーションと ops/app_role.sql を流す。テーブルの所有者
+#   * assay_app      … アプリケーション。既定は SELECT / INSERT のみ
+#
+# スーパーユーザー（POSTGRES_USER）を使うのは 2 か所だけ:
+#   1. ops/ci_roles.sql でロールを作り、所有権を assay_migrator に移すとき
+#   2. #[sqlx::test] がテストごとの隔離 DB を作るとき（CREATE DATABASE が要る）
+# 2 の中でも、各テストは `assay_app` に接続し直してからリポジトリを操作する
+# （tests/*.rs の AppDb::connect）。権限とトリガーの配線は tests/schema.rs が
+# 両方向に検査し、ops/check_app_role.sql の監査が 0 行であることも確認する。
+#
+# Discord には接続しない。シークレットは使わない（DB はサービスコンテナ内の localhost のみ）。
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ci_admin
+          POSTGRES_PASSWORD: ci_admin
+          POSTGRES_DB: assay_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_admin -d assay_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # アプリ用。通常の DATABASE_URL はこれ（追記専用テーブルの UPDATE / DELETE を持たない）
+      DATABASE_URL: postgres://assay_app:assay_app_test@localhost:5432/assay_ci
+      # マイグレーションと権限設定用
+      MIGRATOR_DATABASE_URL: postgres://assay_migrator:assay_migrator_ci@localhost:5432/assay_ci
+      # 隔離 DB の作成にだけ使う管理用接続（CREATE DATABASE が要るため）
+      TEST_ADMIN_DATABASE_URL: postgres://ci_admin:ci_admin@localhost:5432/assay_ci
+      # assay_app のパスワードは tests/fixtures/app_role.sql と tests/*.rs に合わせる
+      CI_APP_PASSWORD: assay_app_test
+      CI_MIGRATOR_PASSWORD: assay_migrator_ci
+      SQLX_OFFLINE: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+
+      - name: Provision the production-shaped roles
+        run: |
+          psql "$TEST_ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 \
+            -v migrator_password="$CI_MIGRATOR_PASSWORD" \
+            -v app_password="$CI_APP_PASSWORD" \
+            -f ops/ci_roles.sql
+
+      - name: Migrate and apply privileges as the migrator
+        run: |
+          DATABASE_URL="$MIGRATOR_DATABASE_URL" sqlx migrate run
+          psql "$MIGRATOR_DATABASE_URL" -v ON_ERROR_STOP=1 -f ops/app_role.sql
+
+      - name: Verify the app role from the app connection
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f ops/verify_app_role.sql
+          violations=$(psql "$DATABASE_URL" -XAt -v ON_ERROR_STOP=1 -f ops/check_app_role.sql)
+          test -z "$violations" || { printf 'privilege audit found violations:\n%s\n' "$violations"; exit 1; }
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Offline query data is current
+        run: cargo sqlx prepare --check -- --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Offline build
+        run: SQLX_OFFLINE=true cargo check --all-targets
+
+      - name: Test (application role)
+        run: |
+          cargo test --lib --bins --test lifecycle
+          cargo test --doc
+
+      # #[sqlx::test] は隔離 DB を作るので、この 1 ステップだけ管理用接続を使う。
+      # テスト本体は assay_app に接続し直してリポジトリを操作する。
+      - name: Test (isolated databases; admin connection only bootstraps them)
+        run: |
+          DATABASE_URL="$TEST_ADMIN_DATABASE_URL" \
+            cargo test --test persistence --test discord --test schema --test registration

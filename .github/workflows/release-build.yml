@@ -1,0 +1,55 @@
+# release-build: リリースビルドを CI で作り、成果物として置く。
+#
+# VPS は 2 コアで Rust のビルドが遅いので、本番にはここで作ったバイナリを配る
+# （06-運用ランブック §2）。副産物として VPS に Rust ツールチェーンが要らなくなり、
+# 本番の表面積が減る。
+#
+# DB には接続しない。`SQLX_OFFLINE=true` で .sqlx のオフラインデータを使う
+# （データが古ければ check ワークフローの `cargo sqlx prepare --check` が落ちる）。
+# Discord にも接続しない。シークレットは使わない。
+#
+# **デプロイはここでは行わない。** 転送・マイグレーション・systemd の再起動は
+# 06-運用ランブック §2 の手順どおり手で行う。
+name: release-build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # VPS の glibc より新しい環境でビルドすると本番で動かない。
+    # 22.04（glibc 2.35）に固定して、より新しい本番でも動くようにしておく。
+    runs-on: ubuntu-22.04
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # 配布先で動くかの判断材料。バイナリ自体は起動しない（DB と Discord に繋ぎに行くため）
+      - name: Record what was built
+        run: |
+          ldd --version | head -1
+          ldd target/release/unite-matchsystem
+          sha256sum target/release/unite-matchsystem | tee target/release/unite-matchsystem.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unite-matchsystem-${{ github.sha }}
+          path: |
+            target/release/unite-matchsystem
+            target/release/unite-matchsystem.sha256
+          if-no-files-found: error
+          retention-days: 14
