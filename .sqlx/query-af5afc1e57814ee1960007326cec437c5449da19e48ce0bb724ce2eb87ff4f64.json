@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select distinct on (assigned.formation_id) assigned.payload->'vc'->>'label' as \"label?\" from formation_events assigned where assigned.kind = $1 and not exists ( select 1 from formation_events released where released.formation_id = assigned.formation_id and released.kind = any($2) ) order by assigned.formation_id, assigned.id desc",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "label?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "af5afc1e57814ee1960007326cec437c5449da19e48ce0bb724ce2eb87ff4f64"
+}

@@ -3,6 +3,7 @@
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
@@ -75,6 +76,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Box::new(DefaultHostSelector::from_config(&lifecycle)),
     ));
     handler.attach(adapter.clone());
+    let timeout_adapter = adapter.clone();
 
     // 認証設定が欠けていたら起動しない（本番で「ログインだけ無い」状態を作らない）
     let auth = AuthState::new(
@@ -96,21 +98,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .merge(registration_router(auth));
 
-    let discord_task = tokio::spawn(async move { client.start().await });
-    let http_task = tokio::spawn(async move { axum::serve(listener, app).await });
+    let mut discord_task = tokio::spawn(async move { client.start().await });
+    let mut http_task = tokio::spawn(async move { axum::serve(listener, app).await });
+    // 期限の正は DB のイベント時刻。これは状態を持たない起床契機であり、起動時と同じ
+    // `resume_unfinished` を呼ぶだけにして二重のリカバリ経路を作らない。
+    let mut timeout_scan = tokio::time::interval(Duration::from_secs(5));
 
-    tokio::select! {
-        result = discord_task => match result {
-            Ok(Ok(())) => info!("discord client stopped"),
-            Ok(Err(error)) => error!(%error, "discord client failed"),
-            Err(error) => error!(%error, "discord task panicked"),
-        },
-        result = http_task => match result {
-            Ok(Ok(())) => info!("http server stopped"),
-            Ok(Err(error)) => error!(%error, "http server failed"),
-            Err(error) => error!(%error, "http task panicked"),
-        },
-        _ = tokio::signal::ctrl_c() => info!("shutting down"),
+    loop {
+        tokio::select! {
+            result = &mut discord_task => {
+                match result {
+                    Ok(Ok(())) => info!("discord client stopped"),
+                    Ok(Err(error)) => error!(%error, "discord client failed"),
+                    Err(error) => error!(%error, "discord task panicked"),
+                }
+                break;
+            }
+            result = &mut http_task => {
+                match result {
+                    Ok(Ok(())) => info!("http server stopped"),
+                    Ok(Err(error)) => error!(%error, "http server failed"),
+                    Err(error) => error!(%error, "http server panicked"),
+                }
+                break;
+            }
+            _ = timeout_scan.tick() => {
+                if let Err(error) = timeout_adapter.resume_unfinished().await {
+                    error!(%error, "timeout recovery scan failed");
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutting down");
+                break;
+            }
+        }
     }
     Ok(())
 }

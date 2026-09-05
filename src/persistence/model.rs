@@ -147,6 +147,20 @@ pub struct NewEvent {
     pub payload: Value,
 }
 
+/// DB 上で確保する VC の組。
+///
+/// Discord の型を永続化層へ持ち込まないため、チャンネル ID は snowflake の数値で表す。
+/// `vc_assigned` の payload には文字列として保存する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcAssignment {
+    /// プール内で一意なラベル。
+    pub label: String,
+    /// red 側 VC のチャンネル ID。
+    pub red_channel_id: u64,
+    /// blue 側 VC のチャンネル ID。
+    pub blue_channel_id: u64,
+}
+
 impl NewEvent {
     /// payload が空のイベント。
     pub fn new(

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use serenity::async_trait;
 use serenity::model::id::{ChannelId, GuildId, InteractionId, MessageId, UserId};
 use sqlx::PgPool;
@@ -31,6 +31,7 @@ use unite_matchsystem::discord::gateway::{
 use unite_matchsystem::discord::payload::{
     ASSIGNMENT_MESSAGE_IDS_KEY, ATTEMPTS_KEY, CODE_MESSAGE_IDS_KEY, DISCORD_FAILURES_KEY,
     DiscordRecord, HOST_PROMPT_CHANNEL_ID_KEY, HOST_PROMPT_MESSAGE_ID_KEY, OPERATION_KEY,
+    TIMEOUT_REASON_KEY,
 };
 use unite_matchsystem::discord::{
     DiscordConfig, ResolveError, VcPair, VcPoolSetupError, resolve_vc_pool,
@@ -41,7 +42,8 @@ use unite_matchsystem::lifecycle::{
 };
 use unite_matchsystem::persistence::{
     ABANDON_REASON_KEY, FormationLog, FormationRepository, NewEvent, NewFormation,
-    NewFormationPlayer, ROOM_CODE_KEY, Team, VC_KEY,
+    NewFormationPlayer, NewReport, Outcome, ROOM_CODE_KEY, Team, VC_KEY, VcAssignment,
+    VcAssignmentOutcome,
 };
 use uuid::Uuid;
 
@@ -270,6 +272,15 @@ fn config() -> DiscordConfig {
 
 fn adapter(db: &AppDb, gateway: Arc<FakeGateway>, vc_pairs: u64) -> Adapter {
     let lifecycle = LifecycleConfig::default();
+    adapter_with_lifecycle(db, gateway, vc_pairs, lifecycle)
+}
+
+fn adapter_with_lifecycle(
+    db: &AppDb,
+    gateway: Arc<FakeGateway>,
+    vc_pairs: u64,
+    lifecycle: LifecycleConfig,
+) -> Adapter {
     Adapter::new(
         db.repo.clone(),
         gateway,
@@ -397,8 +408,20 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     assert_eq!(vc.red, ChannelId::new(101));
     assert_eq!(vc.blue, ChannelId::new(102));
     let (log, _, record) = load(&db, fid(1)).await;
-    assert_eq!(kinds(&log), vec![K::VcAssigned, K::HostAssigned]);
-    let vc_payload = &log.events[0].payload;
+    assert_eq!(
+        kinds(&log),
+        vec![K::VcAssigned, K::VcAssigned, K::HostAssigned]
+    );
+    // 最初の vc_assigned はプールロックと同じトランザクションで記録する予約。Discord の副作用を
+    // 実行する前なのでメッセージ ID はまだ無い。
+    let reserved_vc_payload = &log.events[0].payload;
+    assert_eq!(reserved_vc_payload[VC_KEY]["label"], "1");
+    assert!(
+        reserved_vc_payload
+            .get(ASSIGNMENT_MESSAGE_IDS_KEY)
+            .is_none()
+    );
+    let vc_payload = &log.events[1].payload;
     assert_eq!(vc_payload[VC_KEY]["label"], "1");
     assert_eq!(vc_payload[VC_KEY]["red_channel_id"], "101");
     assert_eq!(vc_payload[VC_KEY]["blue_channel_id"], "102");
@@ -439,7 +462,7 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         1,
         "no prompt on the blue side"
     );
-    let host_assigned = &log.events[1].payload;
+    let host_assigned = &log.events[2].payload;
     assert_eq!(host_assigned[HOST_PROMPT_CHANNEL_ID_KEY], "101");
     assert_eq!(
         host_assigned[HOST_PROMPT_MESSAGE_ID_KEY],
@@ -465,7 +488,7 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
             tried: 1
         }
     );
-    assert_eq!(log.events[2].event.idempotency_key, "9001");
+    assert_eq!(log.events[3].event.idempotency_key, "9001");
     assert!(matches!(
         fake.last_response(),
         InteractionResponse::Modal(_)
@@ -491,7 +514,7 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
             room_code: "1234".into()
         }
     );
-    let code_event = &log.events[3];
+    let code_event = &log.events[4];
     assert_eq!(code_event.event.kind, K::CodePosted);
     assert_eq!(code_event.event.idempotency_key, "9002");
     assert_eq!(
@@ -562,6 +585,7 @@ async fn declining_three_times_abandons_and_edits_the_same_prompt(owner: PgPool)
     assert_eq!(
         kinds(&log),
         vec![
+            K::VcAssigned,
             K::VcAssigned,
             K::HostAssigned,
             K::HostDeclined,
@@ -717,6 +741,7 @@ async fn second_room_code_replaces_the_first_in_both_reveal_messages(owner: PgPo
         kinds(&log),
         vec![
             K::VcAssigned,
+            K::VcAssigned,
             K::HostAssigned,
             K::HostAccepted,
             K::CodePosted,
@@ -754,7 +779,7 @@ async fn stale_and_foreign_presses_are_rejected_without_writing(owner: PgPool) {
         InteractionResponse::Ephemeral(_)
     ));
     let (log, _, _) = load(&db, fid(1)).await;
-    assert_eq!(log.events.len(), 2);
+    assert_eq!(log.events.len(), 3);
 
     // 候補 1 が辞退 → 候補 2 へ。古い（候補 1 の）ボタンはもう無効
     adapter
@@ -777,7 +802,7 @@ async fn stale_and_foreign_presses_are_rejected_without_writing(owner: PgPool) {
             tried: 2
         }
     );
-    assert_eq!(log.events.len(), 4);
+    assert_eq!(log.events.len(), 5);
 
     // 同じインタラクション ID の再送は 1 行だけ（モーダルは再度開く）
     let (accept2, _) = prompt_buttons(&fake, channel, prompt);
@@ -797,7 +822,7 @@ async fn stale_and_foreign_presses_are_rejected_without_writing(owner: PgPool) {
             tried: 2
         }
     );
-    assert_eq!(log.events.len(), 5);
+    assert_eq!(log.events.len(), 6);
     assert!(matches!(
         fake.last_response(),
         InteractionResponse::Modal(_)
@@ -814,7 +839,7 @@ async fn stale_and_foreign_presses_are_rejected_without_writing(owner: PgPool) {
         .await
         .unwrap();
     let (log, _, record) = load(&db, fid(1)).await;
-    assert_eq!(log.events.len(), 5);
+    assert_eq!(log.events.len(), 6);
     assert!(record.code_message_ids.is_empty());
 
     // 別ギルドや知らない custom_id は無視する
@@ -902,6 +927,243 @@ async fn a_restarted_process_continues_from_the_log(owner: PgPool) {
         }
     );
     assert_eq!(record3.vc.unwrap().label, "3", "1 and 2 are still occupied");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// Phase 5: 時間駆動の再開
+// ----------------------------------------------------------------------
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn booting_with_an_expired_third_host_candidate_abandons_the_formation(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let lifecycle = LifecycleConfig {
+        host_accept_timeout: Duration::from_secs(1),
+        ..LifecycleConfig::default()
+    };
+    let adapter = adapter_with_lifecycle(&db, fake, 1, lifecycle);
+    let old = Utc::now() - TimeDelta::seconds(10);
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, old, "vc"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), old, "host-1"),
+        NewEvent::new(K::HostTimeout, Some(pid(1)), old, "timeout-1"),
+        NewEvent::new(K::HostAssigned, Some(pid(2)), old, "host-2"),
+        NewEvent::new(K::HostTimeout, Some(pid(2)), old, "timeout-2"),
+        NewEvent::new(K::HostAssigned, Some(pid(3)), old, "host-3"),
+    ] {
+        db.repo.append_event(fid(1), &event).await.unwrap();
+    }
+
+    adapter.resume_unfinished().await.unwrap();
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Abandoned);
+    assert_eq!(abandon_reason(&log), AbandonReason::HostCandidatesExhausted);
+    let timeout = log
+        .events
+        .iter()
+        .find(|event| {
+            event.event.kind == K::HostTimeout
+                && event.payload[TIMEOUT_REASON_KEY] == "host_no_response"
+        })
+        .expect("the expired third candidate is recorded");
+    assert_eq!(timeout.event.subject, Some(pid(3)));
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn expired_code_post_moves_to_the_next_host_candidate(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let lifecycle = LifecycleConfig {
+        code_post_timeout: Duration::from_secs(1),
+        ..LifecycleConfig::default()
+    };
+    let adapter = adapter_with_lifecycle(&db, fake, 1, lifecycle);
+    let old = Utc::now() - TimeDelta::seconds(10);
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, old, "vc"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), old, "host-1"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), old, "accepted-1"),
+    ] {
+        db.repo.append_event(fid(1), &event).await.unwrap();
+    }
+
+    adapter.resume_unfinished().await.unwrap();
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(
+        state,
+        S::AwaitingHost {
+            pending: Some(pid(2)),
+            tried: 2,
+        }
+    );
+    assert!(log.events.iter().any(|event| {
+        event.event.kind == K::HostTimeout
+            && event.event.subject == Some(pid(1))
+            && event.payload[TIMEOUT_REASON_KEY] == "room_code_not_posted"
+    }));
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn booting_with_no_reports_past_the_deadline_voids_the_formation(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let lifecycle = LifecycleConfig {
+        no_report_timeout: Duration::from_secs(1),
+        ..LifecycleConfig::default()
+    };
+    let adapter = adapter_with_lifecycle(&db, fake, 1, lifecycle);
+    let old = Utc::now() - TimeDelta::seconds(10);
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, old, "vc"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), old, "host"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), old, "accepted"),
+        NewEvent::code_posted(pid(1), "1234", old, "code"),
+    ] {
+        db.repo.append_event(fid(1), &event).await.unwrap();
+    }
+
+    adapter.resume_unfinished().await.unwrap();
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Voided);
+    assert_eq!(log.events.last().unwrap().event.kind, K::Voided);
+    assert_eq!(
+        log.events.last().unwrap().payload[TIMEOUT_REASON_KEY],
+        "no_reports"
+    );
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn an_elapsed_report_window_is_left_for_phase_six_to_evaluate(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let lifecycle = LifecycleConfig {
+        no_report_timeout: Duration::from_secs(1),
+        report_window: Duration::from_secs(1),
+        ..LifecycleConfig::default()
+    };
+    let adapter = adapter_with_lifecycle(&db, fake, 1, lifecycle);
+    let old = Utc::now() - TimeDelta::seconds(10);
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, old, "vc"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), old, "host"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), old, "accepted"),
+        NewEvent::code_posted(pid(1), "1234", old, "code"),
+    ] {
+        db.repo.append_event(fid(1), &event).await.unwrap();
+    }
+    db.repo
+        .append_report(&NewReport {
+            formation_id: fid(1),
+            player_id: pid(1),
+            reported_at: old,
+            outcome: Outcome::Win(Team::Red),
+            raw_result: serde_json::json!({ "source": "test" }),
+            supersedes_id: None,
+        })
+        .await
+        .unwrap();
+
+    adapter.resume_unfinished().await.unwrap();
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert!(matches!(state, S::InProgress { .. }));
+    assert!(log.events.iter().all(|event| event.event.kind != K::Voided));
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn recorded_vc_assignment_survives_a_restart_without_double_allocating(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let available = vec![VcAssignment {
+        label: "1".into(),
+        red_channel_id: 101,
+        blue_channel_id: 102,
+    }];
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    assert!(matches!(
+        db.repo
+            .assign_available_vc(fid(1), &available, Utc::now())
+            .await
+            .unwrap(),
+        VcAssignmentOutcome::Assigned { .. }
+    ));
+
+    // ここがプロセス停止点に相当する。新しい Adapter はメモリ予約を持たないが、DB にある
+    // vc_assigned を占有として扱うため、別 formation に同じ組を割り当てない。
+    let restarted = adapter(&db, fake, 1);
+    db.repo.create_formation(&formation(2)).await.unwrap();
+    restarted.start_formation(fid(2)).await.unwrap();
+    let (second_log, second_state, _) = load(&db, fid(2)).await;
+    assert_eq!(second_state, S::Abandoned);
+    assert_eq!(abandon_reason(&second_log), AbandonReason::VcPoolExhausted);
+
+    restarted.resume_unfinished().await.unwrap();
+    let (_, first_state, first_record) = load(&db, fid(1)).await;
+    assert_eq!(
+        first_state,
+        S::AwaitingHost {
+            pending: Some(pid(1)),
+            tried: 1,
+        }
+    );
+    assert_eq!(first_record.vc.unwrap().label, "1");
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_disputed_formation_releases_its_voice_channel_pair(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let available = vec![VcAssignment {
+        label: "1".into(),
+        red_channel_id: 101,
+        blue_channel_id: 102,
+    }];
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    db.repo
+        .assign_available_vc(fid(1), &available, Utc::now())
+        .await
+        .unwrap();
+    for event in [
+        NewEvent::new(K::HostAssigned, Some(pid(1)), Utc::now(), "host"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), Utc::now(), "accepted"),
+        NewEvent::code_posted(pid(1), "1234", Utc::now(), "code"),
+        NewEvent::new(K::Disputed, None, Utc::now(), "disputed"),
+    ] {
+        db.repo.append_event(fid(1), &event).await.unwrap();
+    }
+
+    let adapter = adapter(&db, fake, 1);
+    db.repo.create_formation(&formation(2)).await.unwrap();
+    adapter.start_formation(fid(2)).await.unwrap();
+    let (_, _, record) = load(&db, fid(2)).await;
+    assert_eq!(record.vc.unwrap().label, "1");
     db.done().await;
 }
 
@@ -1019,12 +1281,15 @@ async fn a_failed_post_abandons_the_formation_with_the_operation_recorded(owner:
     adapter.start_formation(fid(1)).await.unwrap();
     let (log, state, record) = load(&db, fid(1)).await;
     assert_eq!(state, S::Abandoned);
-    assert_eq!(kinds(&log), vec![K::VcAssigned, K::Abandoned]);
+    assert_eq!(
+        kinds(&log),
+        vec![K::VcAssigned, K::VcAssigned, K::Abandoned]
+    );
     assert_eq!(abandon_reason(&log), AbandonReason::DiscordCallFailed);
     // vc_assigned: VC 割当は残り、割り当て表の失敗（両側）も残る
     assert_eq!(record.vc.unwrap().label, "1");
     assert!(record.assignment_message_ids.is_empty());
-    let vc_failures = log.events[0].payload[DISCORD_FAILURES_KEY]
+    let vc_failures = log.events[1].payload[DISCORD_FAILURES_KEY]
         .as_array()
         .unwrap()
         .clone();
@@ -1039,7 +1304,7 @@ async fn a_failed_post_abandons_the_formation_with_the_operation_recorded(owner:
     assert_eq!(vc_failures[0][ATTEMPTS_KEY], 3);
     assert_eq!(vc_failures[0]["error"], "simulated send failure");
     // 解散の通知も投稿できなかったので、それも残る
-    let abandon_failures = log.events[1].payload[DISCORD_FAILURES_KEY]
+    let abandon_failures = log.events[2].payload[DISCORD_FAILURES_KEY]
         .as_array()
         .unwrap()
         .clone();
@@ -1086,7 +1351,7 @@ async fn failed_interaction_responses_are_recorded_in_the_event(owner: PgPool) {
             tried: 1
         }
     );
-    let failures = log.events[2].payload[DISCORD_FAILURES_KEY]
+    let failures = log.events[3].payload[DISCORD_FAILURES_KEY]
         .as_array()
         .unwrap();
     assert_eq!(failures.len(), 1);
@@ -1102,7 +1367,7 @@ async fn failed_interaction_responses_are_recorded_in_the_event(owner: PgPool) {
         .unwrap();
     let (log, state, _) = load(&db, fid(1)).await;
     assert!(matches!(state, S::InProgress { .. }));
-    assert!(log.events[3].payload.get(DISCORD_FAILURES_KEY).is_none());
+    assert!(log.events[4].payload.get(DISCORD_FAILURES_KEY).is_none());
     db.done().await;
 }
 

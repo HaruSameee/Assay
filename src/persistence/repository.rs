@@ -13,7 +13,7 @@ use super::codec::{EventRow, decode_row};
 use super::error::RepositoryError;
 use super::model::{
     AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewReport, ReportId, RosterEntry,
-    Team, UnfinishedFormation,
+    Team, UnfinishedFormation, VcAssignment,
 };
 
 /// 終端状態を作る種別。[`FormationRepository::list_unfinished`] の SQL 側の絞り込みに使う。
@@ -23,8 +23,45 @@ const TERMINAL_KINDS: [FormationEventKind; 3] = [
     FormationEventKind::Abandoned,
 ];
 
+/// VC を解放する種別。`disputed` はスタッフ裁定待ちとしては未終了だが、VC の組を占有し続ける
+/// 理由は無いのでプールからは解放する。
+const VC_RELEASE_KINDS: [FormationEventKind; 4] = [
+    FormationEventKind::Confirmed,
+    FormationEventKind::Disputed,
+    FormationEventKind::Voided,
+    FormationEventKind::Abandoned,
+];
+
+/// 全 VC プールを直列化する固定の advisory-lock key。
+///
+/// formation 単位のロックだけでは、異なる formation が同じ空き組を同時に選べる。割当候補の
+/// 選択と `vc_assigned` の INSERT は必ずこのロックを取った同一トランザクションで行う。
+const VC_POOL_LOCK_KEY: i64 = 0x4153_5341_595F_5643;
+
 /// 訂正チェーンの分岐を防ぐ部分 unique インデックス名（マイグレーションと一致させる）。
 const SUPERSEDES_UNIQUE_INDEX: &str = "match_reports_supersedes_uniq";
+
+/// プール全体のロック下での VC 割当結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VcAssignmentOutcome {
+    /// `matched` に VC を記録した。
+    Assigned {
+        /// 記録した組。
+        assignment: VcAssignment,
+        /// 追記結果。
+        outcome: AppendOutcome,
+    },
+    /// 空きが無かったため `abandoned(vc_pool_exhausted)` を記録した。
+    Exhausted {
+        /// 追記結果。
+        outcome: AppendOutcome,
+    },
+    /// プールロックを待つ間に別の処理がこの formation を進めた。
+    AlreadyAdvanced {
+        /// 現在状態。
+        state: FormationState,
+    },
+}
 
 /// formation とそのイベント・報告の永続化。
 #[derive(Debug, Clone)]
@@ -151,18 +188,24 @@ impl FormationRepository {
             .collect())
     }
 
-    /// VC の組（`vc_assigned` payload の `vc.label`）ごとの最終使用時刻。
+    /// VC の組（`vc_assigned` payload の `vc.label`）ごとの最終解放時刻。
     ///
-    /// その組を使った formation のイベントのうち最新の `occurred_at`。VC プールの LRU 割当の入力。
-    /// 一度も使われていない組は含まれない。
+    /// その組を使った formation を解放したイベントのうち最新の `occurred_at`。VC プールの LRU 割当の
+    /// 入力。一度も使われていない組は含まれない。
     pub async fn vc_last_used(&self) -> Result<HashMap<String, Timestamp>, RepositoryError> {
+        let released: Vec<String> = VC_RELEASE_KINDS
+            .iter()
+            .map(|kind| kind.as_str().to_owned())
+            .collect();
         let rows = sqlx::query!(
-            "select v.payload->'vc'->>'label' as \"label!\", max(e.occurred_at) as \"last_used!\" \
+            "select v.payload->'vc'->>'label' as \"label!\", max(released.occurred_at) as \"last_used!\" \
              from formation_events v \
-             join formation_events e on e.formation_id = v.formation_id \
-             where v.kind = $1 and v.payload->'vc'->>'label' is not null \
+             join formation_events released on released.formation_id = v.formation_id \
+             where v.kind = $1 and released.kind = any($2) \
+               and v.payload->'vc'->>'label' is not null \
              group by 1",
             FormationEventKind::VcAssigned.as_str(),
+            &released[..],
         )
         .fetch_all(&self.pool)
         .await?;
@@ -170,6 +213,66 @@ impl FormationRepository {
             .into_iter()
             .map(|row| (row.label, row.last_used))
             .collect())
+    }
+
+    /// プール全体を直列化して、空き VC を LRU で選び同じトランザクションに `vc_assigned` を追記する。
+    ///
+    /// Discord への投稿はこの後に行う。ここで先に割当だけを永続化するので、直後にプロセスが落ちても
+    /// 再起動後の別 formation が同じ組を選ぶことはない。
+    pub async fn assign_available_vc(
+        &self,
+        formation_id: FormationId,
+        candidates: &[VcAssignment],
+        occurred_at: Timestamp,
+    ) -> Result<VcAssignmentOutcome, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        lock_vc_pool(&mut tx).await?;
+        let log = lock_and_load(&mut tx, formation_id).await?;
+        let snapshot = log.snapshot();
+        if snapshot.state != FormationState::Matched {
+            tx.commit().await?;
+            return Ok(VcAssignmentOutcome::AlreadyAdvanced {
+                state: snapshot.state,
+            });
+        }
+
+        let occupied = occupied_vc_labels(&mut tx).await?;
+        let last_used = vc_last_released(&mut tx).await?;
+        let selected = candidates
+            .iter()
+            .filter(|candidate| !occupied.contains(&candidate.label))
+            // `None < Some`; never-used pairs first, then least recently released. Ties retain config order.
+            .min_by_key(|candidate| last_used.get(&candidate.label).copied())
+            .cloned();
+
+        let outcome = match selected {
+            Some(assignment) => {
+                let event = NewEvent::vc_assigned(
+                    &assignment.label,
+                    assignment.red_channel_id,
+                    assignment.blue_channel_id,
+                    occurred_at,
+                    format!("vc_assigned:{}", assignment.label),
+                );
+                let outcome = append_locked(&mut tx, formation_id, &event, log).await?;
+                tx.commit().await?;
+                VcAssignmentOutcome::Assigned {
+                    assignment,
+                    outcome,
+                }
+            }
+            None => {
+                let event = NewEvent::abandoned(
+                    crate::lifecycle::AbandonReason::VcPoolExhausted,
+                    occurred_at,
+                    "abandoned:vc_pool_exhausted",
+                );
+                let outcome = append_locked(&mut tx, formation_id, &event, log).await?;
+                tx.commit().await?;
+                VcAssignmentOutcome::Exhausted { outcome }
+            }
+        };
+        Ok(outcome)
     }
 
     /// Discord のユーザー ID からプレイヤー ID を引く。見つからないものは結果に含まれない。
@@ -266,64 +369,9 @@ impl FormationRepository {
     ) -> Result<AppendOutcome, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let log = lock_and_load(&mut tx, formation_id).await?;
-        let candidate = event.to_core();
-
-        if let Some(existing) = log
-            .events
-            .iter()
-            .find(|stored| stored.event.idempotency_key == candidate.idempotency_key)
-        {
-            let same = existing.event.kind == candidate.kind
-                && existing.event.subject == candidate.subject
-                && existing.event.payload == candidate.payload;
-            if !same {
-                return Err(RepositoryError::IdempotencyKeyReused {
-                    formation_id,
-                    idempotency_key: candidate.idempotency_key,
-                });
-            }
-            let snapshot = log.snapshot();
-            tx.rollback().await?;
-            return Ok(AppendOutcome {
-                event_id: existing.id,
-                state: snapshot.state,
-                already_recorded: true,
-                anomalies: snapshot.anomalies,
-            });
-        }
-        if log
-            .unreadable
-            .iter()
-            .any(|row| row.idempotency_key == candidate.idempotency_key)
-        {
-            return Err(RepositoryError::IdempotencyKeyReused {
-                formation_id,
-                idempotency_key: candidate.idempotency_key,
-            });
-        }
-
-        let snapshot = log.snapshot();
-        let next = apply(&snapshot.state, &candidate)?;
-        let inserted = sqlx::query!(
-            "insert into formation_events \
-             (formation_id, occurred_at, kind, subject_player_id, payload, idempotency_key) \
-             values ($1, $2, $3, $4, $5, $6) returning id",
-            formation_id.0,
-            event.occurred_at,
-            event.kind.as_str(),
-            event.subject.map(|player| player.0),
-            event.payload,
-            event.idempotency_key,
-        )
-        .fetch_one(&mut *tx)
-        .await?;
+        let outcome = append_locked(&mut tx, formation_id, event, log).await?;
         tx.commit().await?;
-        Ok(AppendOutcome {
-            event_id: EventId(inserted.id),
-            state: next,
-            already_recorded: false,
-            anomalies: snapshot.anomalies,
-        })
+        Ok(outcome)
     }
 
     /// 未終了の formation を `created_at` 順に返す（起動時のリカバリ用）。
@@ -428,6 +476,143 @@ impl FormationRepository {
         tx.commit().await?;
         Ok(ReportId(inserted.id))
     }
+
+    /// Phase 5 の期限判定専用。報告内容・報告者・件数を返さず、HTTP 層には公開しない。
+    pub(crate) async fn first_report_at(
+        &self,
+        formation_id: FormationId,
+    ) -> Result<Option<Timestamp>, RepositoryError> {
+        let row = sqlx::query!(
+            "select min(reported_at) as \"first_report_at?\" from match_reports where formation_id = $1",
+            formation_id.0,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.first_report_at)
+    }
+}
+
+/// `append_event` とプール割当が共用する、ロック取得済みトランザクション内の追記。
+async fn append_locked(
+    conn: &mut PgConnection,
+    formation_id: FormationId,
+    event: &NewEvent,
+    log: FormationLog,
+) -> Result<AppendOutcome, RepositoryError> {
+    let candidate = event.to_core();
+    if let Some(existing) = log
+        .events
+        .iter()
+        .find(|stored| stored.event.idempotency_key == candidate.idempotency_key)
+    {
+        let same = existing.event.kind == candidate.kind
+            && existing.event.subject == candidate.subject
+            && existing.event.payload == candidate.payload;
+        if !same {
+            return Err(RepositoryError::IdempotencyKeyReused {
+                formation_id,
+                idempotency_key: candidate.idempotency_key,
+            });
+        }
+        let snapshot = log.snapshot();
+        return Ok(AppendOutcome {
+            event_id: existing.id,
+            state: snapshot.state,
+            already_recorded: true,
+            anomalies: snapshot.anomalies,
+        });
+    }
+    if log
+        .unreadable
+        .iter()
+        .any(|row| row.idempotency_key == candidate.idempotency_key)
+    {
+        return Err(RepositoryError::IdempotencyKeyReused {
+            formation_id,
+            idempotency_key: candidate.idempotency_key,
+        });
+    }
+
+    let snapshot = log.snapshot();
+    let next = apply(&snapshot.state, &candidate)?;
+    let inserted = sqlx::query!(
+        "insert into formation_events \
+         (formation_id, occurred_at, kind, subject_player_id, payload, idempotency_key) \
+         values ($1, $2, $3, $4, $5, $6) returning id",
+        formation_id.0,
+        event.occurred_at,
+        event.kind.as_str(),
+        event.subject.map(|player| player.0),
+        event.payload,
+        event.idempotency_key,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(AppendOutcome {
+        event_id: EventId(inserted.id),
+        state: next,
+        already_recorded: false,
+        anomalies: snapshot.anomalies,
+    })
+}
+
+/// プール共有資源を直列化する。formation ロックより先に取り、ロック順を一意にする。
+async fn lock_vc_pool(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query!("select pg_advisory_xact_lock($1)", VC_POOL_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+async fn occupied_vc_labels(
+    conn: &mut PgConnection,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let released: Vec<String> = VC_RELEASE_KINDS
+        .iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect();
+    let rows = sqlx::query!(
+        "select distinct on (assigned.formation_id) \
+                assigned.payload->'vc'->>'label' as \"label?\" \
+         from formation_events assigned \
+         where assigned.kind = $1 \
+           and not exists ( \
+               select 1 from formation_events released \
+               where released.formation_id = assigned.formation_id and released.kind = any($2) \
+           ) \
+         order by assigned.formation_id, assigned.id desc",
+        FormationEventKind::VcAssigned.as_str(),
+        &released[..],
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().filter_map(|row| row.label).collect())
+}
+
+async fn vc_last_released(
+    conn: &mut PgConnection,
+) -> Result<HashMap<String, Timestamp>, sqlx::Error> {
+    let released: Vec<String> = VC_RELEASE_KINDS
+        .iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect();
+    let rows = sqlx::query!(
+        "select assigned.payload->'vc'->>'label' as \"label!\", \
+                max(released.occurred_at) as \"last_used!\" \
+         from formation_events assigned \
+         join formation_events released on released.formation_id = assigned.formation_id \
+         where assigned.kind = $1 and released.kind = any($2) \
+           and assigned.payload->'vc'->>'label' is not null \
+         group by 1",
+        FormationEventKind::VcAssigned.as_str(),
+        &released[..],
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.label, row.last_used))
+        .collect())
 }
 
 /// formation 単位の直列化。トランザクション終了時に自動解放されるアドバイザリロック。

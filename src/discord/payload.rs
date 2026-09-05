@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 use serenity::model::id::{ChannelId, MessageId};
 
-use crate::lifecycle::AbandonReason;
+use crate::lifecycle::{AbandonReason, Timestamp};
 use crate::persistence::{
     ABANDON_REASON_KEY, FormationLog, ROOM_CODE_KEY, Team, VC_BLUE_CHANNEL_ID_KEY, VC_KEY,
     VC_LABEL_KEY, VC_RED_CHANNEL_ID_KEY,
@@ -36,6 +36,10 @@ pub const OPERATION_KEY: &str = "operation";
 pub const ERROR_KEY: &str = "error";
 /// [`DiscordFailure`] の中: 試行回数。
 pub const ATTEMPTS_KEY: &str = "attempts";
+/// 時間駆動の遷移で使う理由。`abandoned` と同じキー名だが、種別ごとに語彙は異なる。
+pub const TIMEOUT_REASON_KEY: &str = "reason";
+/// 期限判定に使ったイベント由来の時刻。監査用に RFC 3339 文字列で残す。
+pub const DEADLINE_AT_KEY: &str = "deadline_at";
 
 /// Discord 呼び出しの失敗。リトライを使い切った後の最後のエラー。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +261,14 @@ pub fn abandoned(reason: AbandonReason, failures: &[DiscordFailure]) -> Value {
         Value::String(reason.as_str().to_owned()),
     );
     with_failures(map, failures)
+}
+
+/// 時間駆動の遷移の payload。状態機械はこの値を読まないが、なぜ遷移したかを後から集計できる。
+pub fn timeout(reason: &str, deadline_at: Timestamp) -> Value {
+    json!({
+        TIMEOUT_REASON_KEY: reason,
+        DEADLINE_AT_KEY: deadline_at.to_rfc3339(),
+    })
 }
 
 #[cfg(test)]

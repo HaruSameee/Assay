@@ -35,5 +35,6 @@ pub use error::RepositoryError;
 pub use model::{
     AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewFormationPlayer, NewReport,
     Outcome, ReportId, RosterEntry, StoredEvent, Team, UnfinishedFormation, UnreadableRow,
+    VcAssignment,
 };
-pub use repository::FormationRepository;
+pub use repository::{FormationRepository, VcAssignmentOutcome};

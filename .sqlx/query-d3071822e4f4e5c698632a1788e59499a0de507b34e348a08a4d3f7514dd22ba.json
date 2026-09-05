@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select min(reported_at) as \"first_report_at?\" from match_reports where formation_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "first_report_at?",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d3071822e4f4e5c698632a1788e59499a0de507b34e348a08a4d3f7514dd22ba"
+}

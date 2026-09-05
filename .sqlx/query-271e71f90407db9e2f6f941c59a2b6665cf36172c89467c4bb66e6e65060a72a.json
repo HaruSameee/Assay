@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select v.payload->'vc'->>'label' as \"label!\", max(e.occurred_at) as \"last_used!\" from formation_events v join formation_events e on e.formation_id = v.formation_id where v.kind = $1 and v.payload->'vc'->>'label' is not null group by 1",
+  "query": "select v.payload->'vc'->>'label' as \"label!\", max(released.occurred_at) as \"last_used!\" from formation_events v join formation_events released on released.formation_id = v.formation_id where v.kind = $1 and released.kind = any($2) and v.payload->'vc'->>'label' is not null group by 1",
   "describe": {
     "columns": [
       {
@@ -18,7 +18,8 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Text",
+        "TextArray"
       ]
     },
     "nullable": [
@@ -26,5 +27,5 @@
       null
     ]
   },
-  "hash": "668e4304f86f7d243d5f70b623da2ab6752ee6112d3eed4e60391232c98dfcf1"
+  "hash": "271e71f90407db9e2f6f941c59a2b6665cf36172c89467c4bb66e6e65060a72a"
 }

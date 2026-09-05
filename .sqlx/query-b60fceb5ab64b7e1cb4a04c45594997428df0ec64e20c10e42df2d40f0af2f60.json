@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select assigned.payload->'vc'->>'label' as \"label!\", max(released.occurred_at) as \"last_used!\" from formation_events assigned join formation_events released on released.formation_id = assigned.formation_id where assigned.kind = $1 and released.kind = any($2) and assigned.payload->'vc'->>'label' is not null group by 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "label!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_used!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "b60fceb5ab64b7e1cb4a04c45594997428df0ec64e20c10e42df2d40f0af2f60"
+}

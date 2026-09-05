@@ -1,4 +1,4 @@
-//! Discord アダプタ本体。イベント駆動の部分だけ（時間駆動は Phase 5）。
+//! Discord アダプタ本体。Discord 操作と、イベント時刻から導出する Phase 5 のタイムアウトを扱う。
 //!
 //! 流れ:
 //! 1. `matched` → VC の組を LRU で確保 → 割り当て表を red / blue 両方の VC チャットに投稿 →
@@ -20,7 +20,9 @@
 //!   ログから導出して続きを操作する。Discord 側を検索し直さない。
 //! - VC チャットのメッセージは消さない（VC は使い回すが、過去のルーム ID は試合終了で無効）。
 //!   すべての投稿に見出し（VC ラベル・時刻・試合 ID）を付ける。
-//! - 順序は「副作用 → 記録」。インタラクションでは、状態機械で事前に検証してから応答し、
+//! - インタラクションでは「副作用 → 記録」。VC 割当だけはクラッシュ後の二重利用を防ぐため、
+//!   プール全体の DB ロックと同一トランザクションで先に記録してから副作用を行う。
+//!   状態機械で事前に検証してから応答し、
 //!   応答の成否を含めて追記する。正式な検証は [`FormationRepository::append_event`]
 //!   （ロック → 検証 → INSERT）が行う。
 //! - インタラクション由来のイベントの冪等キーは、そのインタラクション ID。
@@ -39,12 +41,13 @@ use serenity::model::id::{ChannelId, GuildId, InteractionId, MessageId, UserId};
 use tracing::{debug, error, info, warn};
 
 use crate::lifecycle::{
-    AbandonReason, Anomaly, EventPayload, Formation, FormationEvent, FormationEventKind,
+    AbandonReason, Anomaly, Deadline, EventPayload, Formation, FormationEvent, FormationEventKind,
     FormationId, FormationPlayer, FormationState, HostAction, HostSelector, LifecycleConfig,
-    PlayerId, apply, next_host_action,
+    PlayerId, apply, next_deadline, next_host_action,
 };
 use crate::persistence::{
     FormationLog, FormationRepository, NewEvent, RepositoryError, RosterEntry, Team,
+    UnfinishedFormation, VcAssignment, VcAssignmentOutcome,
 };
 
 use super::config::DiscordConfig;
@@ -122,6 +125,9 @@ pub struct Adapter {
     lifecycle: LifecycleConfig,
     selector: Box<dyn HostSelector + Send + Sync>,
     vc_pool: VcPool,
+    /// Ready 時と定期走査が同じ副作用を二重送信しないためのプロセス内直列化。
+    /// 期限や VC 占有の正はここに持たず、DB のイベント列と advisory lock にある。
+    resume_lock: tokio::sync::Mutex<()>,
 }
 
 impl Adapter {
@@ -141,6 +147,7 @@ impl Adapter {
             lifecycle,
             selector,
             vc_pool: VcPool::new(vc_pool),
+            resume_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -154,24 +161,18 @@ impl Adapter {
         &self.vc_pool
     }
 
-    /// 起動時: 未終了の formation のうち、イベント駆動で続きができるものを進める。
+    /// 起動時と定期走査時に、未終了の formation をイベント時刻から再開する唯一の入口。
     ///
-    /// - `matched`（VC 未割当）→ VC の確保から
-    /// - `awaiting_host` で候補未指名（辞退の直後に落ちた）→ 次の候補を打診
-    ///
-    /// 期限切れの判定や、応答待ちのままの候補への催促はしない（時間駆動は Phase 5）。
-    /// Phase 5 はこの関数を拡張する形で実装する。復帰の入口を 2 つ作らない。
+    /// プロセス内のタイマー状態は持たない。期限切れならまず追記イベントを記録し、その結果の状態を
+    /// 同じ関数で再度読む。したがって再起動直後に期限切れが多数あっても、通常の遷移と同じ経路になる。
     pub async fn resume_unfinished(&self) -> Result<(), AdapterError> {
+        let _scan = self.resume_lock.lock().await;
         let unfinished = self.repo.list_unfinished().await?;
         info!(count = unfinished.len(), "resuming unfinished formations");
+        let now = Utc::now();
         for formation in unfinished {
             let id = formation.log.formation_id;
-            log_anomalies(id, &formation.snapshot.anomalies);
-            let result = match &formation.snapshot.state {
-                FormationState::Matched => self.start_formation(id).await,
-                FormationState::AwaitingHost { pending: None, .. } => self.nominate_next(id).await,
-                _ => Ok(()),
-            };
+            let result = self.resume_one(formation, now).await;
             if let Err(error) = result {
                 error!(formation = %id, %error, "failed to resume formation");
             }
@@ -184,13 +185,184 @@ impl Adapter {
     /// 既に `matched` でなければ何もしない（再送に安全）。Discord 側の失敗は `abandoned` として
     /// 記録し、`Ok(())` を返す（呼び出し側が失敗として扱う必要は無い。ログを読めば分かる）。
     pub async fn start_formation(&self, id: FormationId) -> Result<(), AdapterError> {
-        let log = self.repo.load_events(id).await?;
+        let _operation = self.resume_lock.lock().await;
+        self.start_formation_locked(id).await
+    }
+
+    /// `resume_lock` を保持した呼び出し元専用の開始処理。
+    async fn start_formation_locked(&self, id: FormationId) -> Result<(), AdapterError> {
+        let assignments: Vec<VcAssignment> = self
+            .vc_pool
+            .pairs()
+            .iter()
+            .map(|pair| VcAssignment {
+                label: pair.label.clone(),
+                red_channel_id: pair.red.get(),
+                blue_channel_id: pair.blue.get(),
+            })
+            .collect();
+        match self
+            .repo
+            .assign_available_vc(id, &assignments, Utc::now())
+            .await?
+        {
+            VcAssignmentOutcome::Assigned {
+                assignment,
+                outcome,
+            } => {
+                log_anomalies(id, &outcome.anomalies);
+                info!(
+                    formation = %id,
+                    vc = %assignment.label,
+                    red = assignment.red_channel_id,
+                    blue = assignment.blue_channel_id,
+                    "voice channels assigned"
+                );
+                let log = self.repo.load_events(id).await?;
+                self.resume_vc_assignment(id, &log).await
+            }
+            VcAssignmentOutcome::Exhausted { outcome } => {
+                log_anomalies(id, &outcome.anomalies);
+                warn!(formation = %id, "no free voice channel pair; abandoned");
+                Ok(())
+            }
+            VcAssignmentOutcome::AlreadyAdvanced { state } => {
+                debug!(formation = %id, %state, "already started");
+                if matches!(state, FormationState::AwaitingHost { pending: None, .. }) {
+                    let log = self.repo.load_events(id).await?;
+                    self.resume_vc_assignment(id, &log).await
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    async fn resume_one(
+        &self,
+        mut formation: UnfinishedFormation,
+        now: crate::lifecycle::Timestamp,
+    ) -> Result<(), AdapterError> {
+        loop {
+            let id = formation.log.formation_id;
+            log_anomalies(id, &formation.snapshot.anomalies);
+            let first_report_at =
+                if matches!(formation.snapshot.state, FormationState::InProgress { .. }) {
+                    self.repo.first_report_at(id).await?
+                } else {
+                    None
+                };
+            if let Some((deadline, deadline_at)) = next_deadline(
+                &formation.snapshot.state,
+                formation.log.since(&formation.snapshot),
+                first_report_at,
+                &self.lifecycle,
+            ) && deadline_at <= now
+            {
+                if self
+                    .expire(id, &formation.snapshot.state, deadline, deadline_at, now)
+                    .await?
+                {
+                    let log = self.repo.load_events(id).await?;
+                    let snapshot = log.snapshot();
+                    formation = UnfinishedFormation { log, snapshot };
+                    continue;
+                }
+                return Ok(());
+            }
+
+            return match &formation.snapshot.state {
+                FormationState::Matched => self.start_formation_locked(id).await,
+                FormationState::AwaitingHost { pending: None, .. } => {
+                    self.resume_vc_assignment(id, &formation.log).await
+                }
+                _ => Ok(()),
+            };
+        }
+    }
+
+    /// `vc_assigned` を記録済みの formation で、割り当て表と最初の打診を完了する。
+    async fn resume_vc_assignment(
+        &self,
+        id: FormationId,
+        log: &FormationLog,
+    ) -> Result<(), AdapterError> {
         let snapshot = log.snapshot();
-        log_anomalies(id, &snapshot.anomalies);
-        if snapshot.state != FormationState::Matched {
-            debug!(formation = %id, state = %snapshot.state, "already started");
+        if !matches!(
+            snapshot.state,
+            FormationState::AwaitingHost { pending: None, .. }
+        ) {
             return Ok(());
         }
+        let record = DiscordRecord::from_log(log);
+        if record.assignment_message_ids.len() != Team::ALL.len()
+            && !self.publish_assignment(id, log, &record).await?
+        {
+            return Ok(());
+        }
+        self.nominate_next(id).await
+    }
+
+    /// 期限切れをイベントとして記録する。報告内容の評価（`ReportWindow`）は Phase 6 の責務。
+    async fn expire(
+        &self,
+        id: FormationId,
+        state: &FormationState,
+        deadline: Deadline,
+        deadline_at: crate::lifecycle::Timestamp,
+        now: crate::lifecycle::Timestamp,
+    ) -> Result<bool, AdapterError> {
+        let (kind, subject, reason) = match (deadline, state) {
+            (
+                Deadline::HostAccept,
+                FormationState::AwaitingHost {
+                    pending: Some(host),
+                    ..
+                },
+            ) => (
+                FormationEventKind::HostTimeout,
+                Some(*host),
+                "host_no_response",
+            ),
+            (Deadline::CodePost, FormationState::AwaitingCode { host, .. }) => (
+                FormationEventKind::HostTimeout,
+                Some(*host),
+                "room_code_not_posted",
+            ),
+            (Deadline::NoReports, FormationState::InProgress { .. }) => {
+                (FormationEventKind::Voided, None, "no_reports")
+            }
+            (Deadline::ReportWindow, FormationState::InProgress { .. }) => {
+                debug!(formation = %id, %deadline_at, "report window elapsed; awaiting Phase 6 evaluation");
+                return Ok(false);
+            }
+            _ => return Ok(false),
+        };
+        let event = NewEvent::new(
+            kind,
+            subject,
+            now,
+            format!("timeout:{reason}:{}", deadline_at.timestamp_micros()),
+        )
+        .with_payload(payload::timeout(reason, deadline_at));
+        let recorded = self.record(id, &event).await?;
+        if recorded {
+            info!(formation = %id, %reason, %deadline_at, "formation timeout advanced");
+        }
+        Ok(recorded)
+    }
+
+    /// VC 割当を記録済みで、割り当て表の投稿だけが未完了の formation を再開する。
+    async fn publish_assignment(
+        &self,
+        id: FormationId,
+        log: &FormationLog,
+        record: &DiscordRecord,
+    ) -> Result<bool, AdapterError> {
+        let vc = record
+            .vc
+            .as_ref()
+            .ok_or_else(|| AdapterError::Inconsistent(id, "no voice channels recorded".into()))?;
         let roster = self.repo.load_roster(id).await?;
         if roster.len() != 10 {
             return Err(AdapterError::Inconsistent(
@@ -198,51 +370,61 @@ impl Adapter {
                 format!("roster has {} players", roster.len()),
             ));
         }
-
-        // VC の確保。占有状態と最終使用時刻は DB（vc_assigned の payload）から導出する
-        let unfinished = self.repo.list_unfinished().await?;
-        let occupied = VcPool::occupied_labels(&unfinished);
-        let last_used = self.repo.vc_last_used().await?;
-        let Some(reservation) = self.vc_pool.reserve(&occupied, &last_used) else {
-            warn!(formation = %id, "no free voice channel pair; abandoning");
-            self.abandon(id, AbandonReason::VcPoolExhausted, &[])
-                .await?;
-            return Ok(());
-        };
-        let vc = reservation.pair().clone();
-        info!(formation = %id, vc = %vc.label, red = %vc.red, blue = %vc.blue, "voice channels assigned");
-
-        // 割り当て表を両方の VC チャットに投稿する（副作用 → 記録）
-        let heading = render::heading(&vc, log.created_at, id);
-        let assignment = render::assignment(
+        let heading = render::heading(vc, log.created_at, id);
+        let message = render::assignment(
             &heading,
             &roster,
-            &vc,
+            vc,
             &self.config.room_map,
             &self.config.room_checklist,
         );
-        let (assignment_ids, mut failures) =
-            self.post_to_both(&vc, "assignment", &assignment).await;
+        let mut ids = HashMap::new();
+        let mut failures = Vec::new();
+        for team in Team::ALL {
+            match self
+                .post_or_edit(
+                    vc.channel(team),
+                    record.assignment_message_ids.get(&team).copied(),
+                    &format!("assignment:{team}"),
+                    &message,
+                )
+                .await
+            {
+                Ok(message_id) => {
+                    ids.insert(team, message_id);
+                }
+                Err(failure) => failures.push(failure),
+            }
+        }
         let event = NewEvent::new(
             FormationEventKind::VcAssigned,
             None,
             Utc::now(),
-            format!("vc_assigned:{}", vc.label),
+            format!(
+                "vc_assigned_messages:{}:{}",
+                vc.label,
+                Utc::now().timestamp_micros()
+            ),
         )
-        .with_payload(payload::vc_assigned(&vc, &assignment_ids, &failures));
-        let outcome = self.repo.append_event(id, &event).await?;
-        log_anomalies(id, &outcome.anomalies);
-        reservation.commit();
-
-        if !failures.is_empty() {
-            error!(formation = %id, count = failures.len(), "assignment table could not be posted; abandoning");
-            failures.clear();
-            let record = DiscordRecord::from_log(&self.repo.load_events(id).await?);
-            self.abandon_in_vc(id, &vc, &record, AbandonReason::DiscordCallFailed, failures)
-                .await?;
-            return Ok(());
+        .with_payload(payload::vc_assigned(vc, &ids, &failures));
+        if !self.record(id, &event).await? {
+            return Ok(false);
         }
-        self.nominate_next(id).await
+        if failures.is_empty() {
+            return Ok(true);
+        }
+        error!(formation = %id, count = failures.len(), "assignment table could not be posted; abandoning");
+        let updated = self.repo.load_events(id).await?;
+        let updated_record = DiscordRecord::from_log(&updated);
+        self.abandon_in_vc(
+            id,
+            vc,
+            &updated_record,
+            AbandonReason::DiscordCallFailed,
+            Vec::new(),
+        )
+        .await?;
+        Ok(false)
     }
 
     /// 候補未指名の `awaiting_host` で、次の候補を打診する（または候補が尽きて解散する）。
@@ -713,33 +895,7 @@ impl Adapter {
             }
         }
         self.abandon(id, reason, &failures).await?;
-        self.vc_pool.release(&vc.label);
         Ok(())
-    }
-
-    /// 両方の VC チャットに投稿する。成功した側の ID と、失敗の一覧を返す。
-    async fn post_to_both(
-        &self,
-        vc: &VcPair,
-        what: &str,
-        message: &OutgoingMessage,
-    ) -> (HashMap<Team, MessageId>, Vec<DiscordFailure>) {
-        let mut ids = HashMap::new();
-        let mut failures = Vec::new();
-        for team in Team::ALL {
-            match self
-                .retry(&format!("send:{what}:{team}"), || {
-                    self.gateway.send_message(vc.channel(team), message)
-                })
-                .await
-            {
-                Ok(message_id) => {
-                    ids.insert(team, message_id);
-                }
-                Err(failure) => failures.push(failure),
-            }
-        }
-        (ids, failures)
     }
 
     /// メッセージがあれば編集、無ければ投稿。どちらもリトライ付き。

@@ -18,7 +18,7 @@ pub struct LifecycleConfig {
     pub code_post_timeout: Duration,
     /// `in_progress`: 報告ゼロのまま待つ時間。過ぎたら `voided`（報告ゲートは立てない）。
     pub no_report_timeout: Duration,
-    /// `in_progress`: 最初の報告からの受付時間。過ぎたら到着分に確定ルールを適用する。
+    /// `in_progress`: 最初の報告からの受付時間。期限後の確定・係争評価は Phase 6 が行う。
     pub report_window: Duration,
     /// 打診するホスト候補の上限。尽きたら `abandoned`。
     pub max_host_candidates: u32,
@@ -46,7 +46,7 @@ pub enum Deadline {
     CodePost,
     /// 報告ゼロの期限。過ぎたら `voided` を積む。
     NoReports,
-    /// 報告受付の期限。過ぎたら到着分に確定ルールを適用し `confirmed` / `disputed` を積む。
+    /// 報告受付の期限。過ぎた後の確定・係争評価は Phase 6 が行う。
     ReportWindow,
 }
 
