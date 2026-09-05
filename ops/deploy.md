@@ -15,7 +15,7 @@ or copy the contents of /etc/assay/*.env.
 2. Install Caddy before installing its configuration:
 
         apt-get update
-        apt-get install -y caddy
+        apt-get install -y awscli caddy
 
 3. Install the artifact's ops/assay.service as
    /etc/systemd/system/assay.service, then run:
@@ -36,7 +36,17 @@ or copy the contents of /etc/assay/*.env.
         sha256sum -c unite-matchsystem.sha256
         install -o root -g root -m 0755 unite-matchsystem /opt/assay/bin/unite-matchsystem
         install -o root -g root -m 0644 ops/app_role.sql ops/app_privileges.sql \
-          ops/check_app_role.sql ops/verify_app_role.sql ops/app.env.example /opt/assay/ops/
+          ops/check_app_role.sql ops/verify_app_role.sql ops/app.env.example \
+          ops/r2-backup.env.example ops/restore.md /opt/assay/ops/
+        install -o root -g root -m 0750 ops/assay-backup ops/assay-restore-rehearsal \
+          /usr/local/sbin/
+        install -o root -g root -m 0644 ops/assay-backup.cron /etc/cron.d/assay-backup
+        install -o root -g root -m 0644 ops/assay-backup.logrotate /etc/logrotate.d/assay-backup
+        install -o root -g root -m 0600 ops/r2-backup.env.example /etc/assay/r2-backup.env.example
+        install -d -o root -g root -m 0700 /var/lib/assay-backup/restore-rehearsals
+        touch /var/log/assay-backup.log
+        chown root:root /var/log/assay-backup.log
+        chmod 0600 /var/log/assay-backup.log
 
 2. Apply migrations only through the embedded migration command with the
    migrator credential. The command does not start Discord or the HTTP server:

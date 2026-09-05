@@ -1,0 +1,8 @@
+# Host timezone is UTC. These schedules are fixed JST converted to UTC.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Friday, Saturday, Sunday 21:00 JST through the following 01:00 JST.
+0 12-16 * * 5,6,0 root /usr/local/sbin/assay-backup hourly >> /var/log/assay-backup.log 2>&1
+# Monday 02:15 JST: weekly complete snapshot after the Sunday session.
+15 17 * * 0 root /usr/local/sbin/assay-backup weekly >> /var/log/assay-backup.log 2>&1

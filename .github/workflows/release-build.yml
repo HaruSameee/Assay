@@ -59,5 +59,11 @@ jobs:
             ops/assay.service
             ops/Caddyfile
             ops/deploy.md
+            ops/assay-backup
+            ops/assay-restore-rehearsal
+            ops/assay-backup.cron
+            ops/assay-backup.logrotate
+            ops/r2-backup.env.example
+            ops/restore.md
           if-no-files-found: error
           retention-days: 14

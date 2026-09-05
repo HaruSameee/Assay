@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Create one complete Assay PostgreSQL snapshot and upload it to Cloudflare R2.
+# This script is run by root from /etc/cron.d/assay-backup.
+set -euo pipefail
+umask 077
+
+readonly R2_CONFIG=/etc/assay/r2-backup.env
+readonly DB_CONFIG=/etc/assay/migrator-database.env
+readonly WORK_ROOT=/var/lib/assay-backup
+
+if [[ ${1:-} != hourly && ${1:-} != weekly ]]; then
+    echo "usage: $0 {hourly|weekly}" >&2
+    exit 64
+fi
+readonly KIND=$1
+
+require_value() {
+    local name=$1
+    if [[ -z ${!name:-} ]]; then
+        echo "$name is not set" >&2
+        exit 78
+    fi
+}
+
+load_config() {
+    set -a
+    # shellcheck source=/dev/null
+    . "$1"
+    set +a
+}
+
+load_config "$R2_CONFIG"
+for name in R2_ENDPOINT R2_BUCKET R2_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION; do
+    require_value "$name"
+done
+
+load_config "$DB_CONFIG"
+require_value MIGRATOR_DATABASE_URL
+
+readonly SNAPSHOT="$(date -u +%Y%m%dT%H%M%SZ)-$KIND"
+readonly PREFIX="${R2_PREFIX%/}/"
+install -d -o root -g root -m 0700 "$WORK_ROOT"
+readonly WORKDIR="$(mktemp -d "$WORK_ROOT/.backup.XXXXXX")"
+readonly SNAPSHOT_DIR="$WORKDIR/$SNAPSHOT"
+
+cleanup() {
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+mkdir -p "$SNAPSHOT_DIR"
+
+pg_dump --dbname="$MIGRATOR_DATABASE_URL" --format=custom \
+    --file="$SNAPSHOT_DIR/assay.dump"
+runuser -u postgres -- pg_dumpall --roles-only > "$SNAPSHOT_DIR/roles.sql"
+(
+    cd "$SNAPSHOT_DIR"
+    sha256sum assay.dump roles.sql > SHA256SUMS
+)
+
+export AWS_EC2_METADATA_DISABLED=true
+aws --endpoint-url "$R2_ENDPOINT" s3 cp "$SNAPSHOT_DIR/" \
+    "s3://$R2_BUCKET/$PREFIX$SNAPSHOT/" --recursive --only-show-errors
+
+for object in assay.dump roles.sql SHA256SUMS; do
+    aws --endpoint-url "$R2_ENDPOINT" s3api head-object \
+        --bucket "$R2_BUCKET" --key "$PREFIX$SNAPSHOT/$object" > /dev/null
+done
+
+logger -t assay-backup "completed kind=$KIND snapshot=$SNAPSHOT"
+printf '%s\n' "$SNAPSHOT"

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Restore a complete R2 snapshot into a disposable PostgreSQL 17 cluster.
+# The source cluster and its roles are never modified.
+set -euo pipefail
+umask 077
+
+readonly R2_CONFIG=/etc/assay/r2-backup.env
+readonly OPS_DIR=/opt/assay/ops
+readonly WORK_ROOT=/var/lib/assay-backup/restore-rehearsals
+readonly PG_BIN=/usr/lib/postgresql/17/bin
+readonly PORT=55432
+readonly SOCKET_DIR=/var/run/postgresql
+
+if [[ $# -ne 1 || ! $1 =~ ^[0-9]{8}T[0-9]{6}Z-(hourly|weekly)$ ]]; then
+    echo "usage: $0 <YYYYMMDDTHHMMSSZ-hourly|weekly>" >&2
+    exit 64
+fi
+readonly SNAPSHOT=$1
+
+require_value() {
+    local name=$1
+    if [[ -z ${!name:-} ]]; then
+        echo "$name is not set" >&2
+        exit 78
+    fi
+}
+
+set -a
+# shellcheck source=/dev/null
+. "$R2_CONFIG"
+set +a
+for name in R2_ENDPOINT R2_BUCKET R2_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION; do
+    require_value "$name"
+done
+for file in app_role.sql app_privileges.sql check_app_role.sql verify_app_role.sql; do
+    test -r "$OPS_DIR/$file"
+done
+
+if ss -ltn "( sport = :$PORT )" | grep -q LISTEN; then
+    echo "PostgreSQL rehearsal port $PORT is already in use" >&2
+    exit 69
+fi
+
+readonly PREFIX="${R2_PREFIX%/}/"
+install -d -o root -g root -m 0700 "$WORK_ROOT"
+readonly WORKDIR="$(mktemp -d "$WORK_ROOT/.restore.XXXXXX")"
+readonly DATA_DIR="$WORKDIR/data"
+readonly LOG_FILE="$WORKDIR/postgresql.log"
+started=false
+
+cleanup() {
+    local status=$?
+    if [[ $started == true ]]; then
+        runuser -u postgres -- "$PG_BIN/pg_ctl" -D "$DATA_DIR" stop -m fast > /dev/null 2>&1 || true
+    fi
+    rm -rf "$WORKDIR"
+    exit "$status"
+}
+trap cleanup EXIT
+
+export AWS_EC2_METADATA_DISABLED=true
+aws --endpoint-url "$R2_ENDPOINT" s3 cp \
+    "s3://$R2_BUCKET/$PREFIX$SNAPSHOT/" "$WORKDIR/" --recursive --only-show-errors
+for file in assay.dump roles.sql SHA256SUMS; do
+    test -f "$WORKDIR/$file"
+done
+(
+    cd "$WORKDIR"
+    sha256sum -c SHA256SUMS
+)
+
+install -d -o postgres -g postgres -m 0700 "$DATA_DIR"
+runuser -u postgres -- "$PG_BIN/initdb" -D "$DATA_DIR" \
+    --username=restore_admin --auth-local=trust --auth-host=scram-sha-256 > /dev/null
+printf "port = %s\nlisten_addresses = ''\nunix_socket_directories = '%s'\n" \
+    "$PORT" "$SOCKET_DIR" >> "$DATA_DIR/postgresql.conf"
+runuser -u postgres -- "$PG_BIN/pg_ctl" -D "$DATA_DIR" -l "$LOG_FILE" start > /dev/null
+started=true
+
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" \
+    -U restore_admin -d postgres -f "$WORKDIR/roles.sql" > /dev/null
+runuser -u postgres -- "$PG_BIN/createdb" -h "$SOCKET_DIR" -p "$PORT" \
+    -U restore_admin -O assay_migrator assay
+runuser -u postgres -- "$PG_BIN/pg_restore" --exit-on-error -h "$SOCKET_DIR" -p "$PORT" \
+    -U restore_admin -d assay "$WORKDIR/assay.dump" > /dev/null
+
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" \
+    -U assay_migrator -d assay -f "$OPS_DIR/app_role.sql" > /dev/null
+violations="$(runuser -u postgres -- psql -XAt -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" \
+    -U assay_app -d assay -f "$OPS_DIR/check_app_role.sql")"
+test -z "$violations"
+runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 -h "$SOCKET_DIR" -p "$PORT" \
+    -U assay_app -d assay -f "$OPS_DIR/verify_app_role.sql" > /dev/null
+
+logger -t assay-restore-rehearsal "completed snapshot=$SNAPSHOT"
+printf 'restore-audit=passed\n'
+printf 'append-only-update=42501\n'
