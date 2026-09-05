@@ -96,6 +96,11 @@ async fn new_tables_fail_closed_and_audit_detects_both_missing_defenses(owner: s
         .await
         .unwrap();
     assert_eq!(count, 1);
+    let sequence_value: i64 = sqlx::query_scalar("select last_value from future_log_id_seq")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(sequence_value, 1);
     for sql in ["update future_log set id = id", "delete from future_log"] {
         let error = sqlx::query(sql).execute(&app).await.unwrap_err();
         assert_eq!(
@@ -131,6 +136,12 @@ async fn new_tables_fail_closed_and_audit_detects_both_missing_defenses(owner: s
         assert_eq!(failures, ["future_log"]);
         tx.rollback().await.unwrap();
     }
+    let mut tx = owner.begin().await.unwrap();
+    sqlx::raw_sql("create trigger roles_accidental_guard before update or delete on roles for each statement execute function forbid_update_delete()")
+        .execute(&mut *tx).await.unwrap();
+    let failures: Vec<String> = sqlx::query_scalar(AUDIT).fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(failures, ["roles"]);
+    tx.rollback().await.unwrap();
     app.close().await;
 }
 

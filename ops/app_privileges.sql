@@ -22,7 +22,10 @@ grant usage on schema public to assay_app;
 -- Remove old grants too, so rerunning this also repairs the old default policy.
 revoke all on all tables in schema public from public, assay_app;
 grant select, insert on all tables in schema public to assay_app;
-grant update, delete on players, roles to assay_app;
+-- players: mutable reference data; Discord profile information can change.
+grant update, delete on players to assay_app;
+-- roles: mutable display names and presentation order; identifiers stay stable.
+grant update, delete on roles to assay_app;
 revoke all on all sequences in schema public from public, assay_app;
 grant usage, select on all sequences in schema public to assay_app;
 
