@@ -5,6 +5,150 @@ use std::path::{Path, PathBuf};
 
 use unite_matchsystem::lifecycle::{AbandonReason, FormationEventKind};
 
+const PRIVILEGES: &str = include_str!("../ops/app_privileges.sql");
+const AUDIT: &str = include_str!("../ops/check_app_role.sql");
+
+async fn app_pool(owner: &sqlx::PgPool) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            (*owner.connect_options())
+                .clone()
+                .username("assay_app")
+                .password("assay_app_test"),
+        )
+        .await
+        .expect("connect as assay_app")
+}
+
+async fn violations(pool: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar(AUDIT).fetch_all(pool).await.unwrap()
+}
+
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn append_only_privileges_and_triggers_are_wired(owner: sqlx::PgPool) {
+    let app = app_pool(&owner).await;
+    let who: String = sqlx::query_scalar("select current_user::text")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(who, "assay_app");
+    assert_eq!(violations(&app).await, Vec::<String>::new());
+
+    for sql in [
+        "update formations set id = id",
+        "delete from formations",
+        "update formation_players set formation_id = formation_id",
+        "delete from formation_players",
+        "update formation_events set id = id",
+        "delete from formation_events",
+        "update match_reports set id = id",
+        "delete from match_reports",
+    ] {
+        for (pool, expected) in [(&app, "42501"), (&owner, "0A000")] {
+            let error = sqlx::query(sql).execute(pool).await.unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some(expected),
+                "{sql}"
+            );
+        }
+    }
+    let mut tx = app.begin().await.unwrap();
+    sqlx::query("insert into players values ($1, 123456789, now())")
+        .bind(uuid::Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query("update players set created_at = now()")
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        sqlx::query("update roles set display_name = display_name")
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected(),
+        5
+    );
+    tx.rollback().await.unwrap();
+    app.close().await;
+}
+
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn new_tables_fail_closed_and_audit_detects_both_missing_defenses(owner: sqlx::PgPool) {
+    let app = app_pool(&owner).await;
+    sqlx::raw_sql("create table future_log (id bigserial primary key)")
+        .execute(&owner)
+        .await
+        .unwrap();
+    sqlx::query("insert into future_log default values")
+        .execute(&app)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("select count(*) from future_log")
+        .fetch_one(&app)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    for sql in ["update future_log set id = id", "delete from future_log"] {
+        let error = sqlx::query(sql).execute(&app).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("42501")
+        );
+    }
+    assert_eq!(violations(&app).await, ["future_log"]);
+    sqlx::raw_sql("create trigger future_log_guard before update or delete on future_log for each statement execute function forbid_update_delete()")
+        .execute(&owner).await.unwrap();
+    assert!(violations(&app).await.is_empty());
+
+    // Check each direction independently, including column-level and PUBLIC grants.
+    for grant in [
+        "grant update on future_log to assay_app",
+        "grant delete on future_log to assay_app",
+        "grant update (id) on future_log to assay_app",
+        "grant delete on future_log to public",
+    ] {
+        let mut tx = owner.begin().await.unwrap();
+        sqlx::raw_sql(grant).execute(&mut *tx).await.unwrap();
+        let failures: Vec<String> = sqlx::query_scalar(AUDIT).fetch_all(&mut *tx).await.unwrap();
+        assert_eq!(failures, ["future_log"], "{grant}");
+        tx.rollback().await.unwrap();
+    }
+    for change in [
+        "alter table future_log disable trigger future_log_guard",
+        "drop trigger future_log_guard on future_log; create trigger future_log_guard before update on future_log for each statement execute function forbid_update_delete()",
+    ] {
+        let mut tx = owner.begin().await.unwrap();
+        sqlx::raw_sql(change).execute(&mut *tx).await.unwrap();
+        let failures: Vec<String> = sqlx::query_scalar(AUDIT).fetch_all(&mut *tx).await.unwrap();
+        assert_eq!(failures, ["future_log"]);
+        tx.rollback().await.unwrap();
+    }
+    app.close().await;
+}
+
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn policy_is_idempotent_and_clears_legacy_defaults(owner: sqlx::PgPool) {
+    sqlx::raw_sql("grant update, delete on formations to assay_app; alter default privileges grant all on tables to assay_app; alter default privileges in schema public grant all on tables to assay_app;")
+        .execute(&owner).await.unwrap();
+    for _ in 0..2 {
+        sqlx::raw_sql(PRIVILEGES).execute(&owner).await.unwrap();
+    }
+    let app = app_pool(&owner).await;
+    assert!(violations(&app).await.is_empty());
+    sqlx::raw_sql("create table future_log (id integer); create trigger future_log_guard before update or delete on future_log for each statement execute function forbid_update_delete();")
+        .execute(&owner).await.unwrap();
+    assert!(violations(&app).await.is_empty());
+    app.close().await;
+}
+
 /// `migrations/*.up.sql` を（パス, 内容）で返す。
 fn up_migrations() -> Vec<(PathBuf, String)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

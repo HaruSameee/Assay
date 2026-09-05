@@ -23,8 +23,8 @@ use unite_matchsystem::persistence::{
 };
 use uuid::Uuid;
 
-const APP_ROLE: &str = "unite_app_test";
-const APP_ROLE_PASSWORD: &str = "unite_app_test";
+const APP_ROLE: &str = "assay_app";
+const APP_ROLE_PASSWORD: &str = "assay_app_test";
 
 /// マイグレーションが入れる 5 ロール（各チームに 1 人ずつ）。
 const ROLES: [&str; 5] = [
@@ -121,11 +121,14 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
         .map(|code| code.to_string())
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn app_role_is_denied_update_and_delete_by_privilege(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
 
-    // アプリ用ロール: 権限で弾かれる（42501）。トリガー（P0001）より前に止まる
+    // アプリ用ロール: 権限で弾かれる（42501）。トリガー（0A000）より前に止まる
     for sql in [
         "update formations set created_at = now()",
         "delete from formations",
@@ -145,7 +148,7 @@ async fn app_role_is_denied_update_and_delete_by_privilege(owner: PgPool) {
         .execute(&owner)
         .await
         .unwrap_err();
-    assert_eq!(sqlstate(&error).as_deref(), Some("P0001"));
+    assert_eq!(sqlstate(&error).as_deref(), Some("0A000"));
 
     // アプリ用ロールでも追記とリカバリ一覧は通る
     db.repo.create_formation(&formation(1)).await.unwrap();
@@ -157,7 +160,10 @@ async fn app_role_is_denied_update_and_delete_by_privilege(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn created_formation_starts_matched_and_is_unfinished(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -187,7 +193,10 @@ async fn created_formation_starts_matched_and_is_unfinished(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn create_formation_rejects_anything_but_five_versus_five(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -218,7 +227,10 @@ async fn create_formation_rejects_anything_but_five_versus_five(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn events_are_validated_then_persisted_in_order(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -276,7 +288,10 @@ async fn events_are_validated_then_persisted_in_order(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn invalid_transition_is_rejected_without_writing(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -303,7 +318,10 @@ async fn invalid_transition_is_rejected_without_writing(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn same_idempotency_key_is_not_written_twice(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -331,7 +349,10 @@ async fn same_idempotency_key_is_not_written_twice(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn concurrent_host_assignments_are_serialized(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -386,7 +407,10 @@ async fn concurrent_host_assignments_are_serialized(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn concurrent_decline_and_timeout_let_only_one_through(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -433,7 +457,10 @@ async fn concurrent_decline_and_timeout_let_only_one_through(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn concurrent_identical_events_write_one_row(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -465,7 +492,10 @@ async fn concurrent_identical_events_write_one_row(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn corrupted_log_is_still_readable_and_appendable(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -515,7 +545,10 @@ async fn corrupted_log_is_still_readable_and_appendable(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn list_unfinished_returns_only_non_terminal_formations_in_creation_order(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -554,7 +587,10 @@ async fn list_unfinished_returns_only_non_terminal_formations_in_creation_order(
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn disputed_formation_stays_unfinished_without_a_deadline(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -580,7 +616,10 @@ async fn disputed_formation_stays_unfinished_without_a_deadline(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn reports_are_accepted_only_while_the_formation_requires_them(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
@@ -673,7 +712,10 @@ async fn reports_are_accepted_only_while_the_formation_requires_them(owner: PgPo
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn the_same_role_twice_in_one_team_is_rejected_by_the_database(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
 
@@ -715,7 +757,10 @@ async fn the_same_role_twice_in_one_team_is_rejected_by_the_database(owner: PgPo
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn winners_can_be_joined_with_team_equals_outcome(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;

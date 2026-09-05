@@ -45,8 +45,8 @@ use unite_matchsystem::persistence::{
 };
 use uuid::Uuid;
 
-const APP_ROLE: &str = "unite_app_test";
-const APP_ROLE_PASSWORD: &str = "unite_app_test";
+const APP_ROLE: &str = "assay_app";
+const APP_ROLE_PASSWORD: &str = "assay_app_test";
 const GUILD: GuildId = GuildId::new(1);
 /// マイグレーションが入れる 5 ロール（各チームに 1 人ずつ）。
 const ROLES: [&str; 5] = [
@@ -382,7 +382,10 @@ async fn load_record(adapter: &Adapter, n: u128) -> (FormationLog, S, DiscordRec
 // 正常系
 // ----------------------------------------------------------------------
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -533,7 +536,10 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn declining_three_times_abandons_and_edits_the_same_prompt(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -594,7 +600,10 @@ async fn declining_three_times_abandons_and_edits_the_same_prompt(owner: PgPool)
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn a_candidate_on_the_other_team_gets_the_prompt_in_their_own_voice_chat(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -657,7 +666,10 @@ async fn a_candidate_on_the_other_team_gets_the_prompt_in_their_own_voice_chat(o
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn second_room_code_replaces_the_first_in_both_reveal_messages(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -721,7 +733,10 @@ async fn second_room_code_replaces_the_first_in_both_reveal_messages(owner: PgPo
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn stale_and_foreign_presses_are_rejected_without_writing(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -814,7 +829,10 @@ async fn stale_and_foreign_presses_are_rejected_without_writing(owner: PgPool) {
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn a_restarted_process_continues_from_the_log(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -891,7 +909,10 @@ async fn a_restarted_process_continues_from_the_log(owner: PgPool) {
 // VC プール: 名前解決と LRU
 // ----------------------------------------------------------------------
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn vc_pool_is_resolved_by_name_at_startup_and_fails_on_gaps_or_duplicates(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
 
@@ -942,7 +963,10 @@ async fn vc_pool_is_resolved_by_name_at_startup_and_fails_on_gaps_or_duplicates(
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn voice_channels_are_assigned_least_recently_used_first(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -981,7 +1005,10 @@ async fn voice_channels_are_assigned_least_recently_used_first(owner: PgPool) {
 // 失敗経路: すべて abandoned になり、詳細が payload に残る
 // ----------------------------------------------------------------------
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn a_failed_post_abandons_the_formation_with_the_operation_recorded(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -1034,7 +1061,10 @@ async fn a_failed_post_abandons_the_formation_with_the_operation_recorded(owner:
     db.done().await;
 }
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn failed_interaction_responses_are_recorded_in_the_event(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -1080,7 +1110,10 @@ async fn failed_interaction_responses_are_recorded_in_the_event(owner: PgPool) {
 // HTTP API（手動テストの入口）
 // ----------------------------------------------------------------------
 
-#[sqlx::test(fixtures("reference", "app_role"))]
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
 async fn internal_formations_endpoint_requires_the_token_and_starts_a_formation(owner: PgPool) {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};

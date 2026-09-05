@@ -1,0 +1,4 @@
+# SQLx hashes migration bytes; keep deployments identical on Windows and Linux.
+migrations/*.sql text eol=lf
+ops/*.sql text eol=lf
+ops/*.sh text eol=lf
