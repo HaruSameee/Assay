@@ -6,7 +6,7 @@ umask 077
 
 readonly R2_CONFIG=/etc/assay/r2-backup.env
 readonly OPS_DIR=/opt/assay/ops
-readonly WORK_ROOT=/var/lib/assay-backup/restore-rehearsals
+readonly WORK_ROOT=/var/lib/postgresql/assay-restore-rehearsals
 readonly PG_BIN=/usr/lib/postgresql/17/bin
 readonly PORT=55432
 readonly SOCKET_DIR=/var/run/postgresql
@@ -42,8 +42,9 @@ if ss -ltn "( sport = :$PORT )" | grep -q LISTEN; then
 fi
 
 readonly PREFIX="${R2_PREFIX%/}/"
-install -d -o root -g root -m 0700 "$WORK_ROOT"
+install -d -o postgres -g postgres -m 0700 "$WORK_ROOT"
 readonly WORKDIR="$(mktemp -d "$WORK_ROOT/.restore.XXXXXX")"
+chown postgres:postgres "$WORKDIR"
 readonly DATA_DIR="$WORKDIR/data"
 readonly LOG_FILE="$WORKDIR/postgresql.log"
 started=false
@@ -68,6 +69,7 @@ done
     cd "$WORKDIR"
     sha256sum -c SHA256SUMS
 )
+chown -R postgres:postgres "$WORKDIR"
 
 install -d -o postgres -g postgres -m 0700 "$DATA_DIR"
 runuser -u postgres -- "$PG_BIN/initdb" -D "$DATA_DIR" \

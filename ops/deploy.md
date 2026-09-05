@@ -43,7 +43,7 @@ or copy the contents of /etc/assay/*.env.
         install -o root -g root -m 0644 ops/assay-backup.cron /etc/cron.d/assay-backup
         install -o root -g root -m 0644 ops/assay-backup.logrotate /etc/logrotate.d/assay-backup
         install -o root -g root -m 0600 ops/r2-backup.env.example /etc/assay/r2-backup.env.example
-        install -d -o root -g root -m 0700 /var/lib/assay-backup/restore-rehearsals
+        install -d -o postgres -g postgres -m 0700 /var/lib/postgresql/assay-restore-rehearsals
         touch /var/log/assay-backup.log
         chown root:root /var/log/assay-backup.log
         chmod 0600 /var/log/assay-backup.log
