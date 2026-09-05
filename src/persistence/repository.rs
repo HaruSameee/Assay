@@ -149,6 +149,27 @@ impl FormationRepository {
             .collect())
     }
 
+    /// VC の組（`vc_assigned` payload の `vc.label`）ごとの最終使用時刻。
+    ///
+    /// その組を使った formation のイベントのうち最新の `occurred_at`。VC プールの LRU 割当の入力。
+    /// 一度も使われていない組は含まれない。
+    pub async fn vc_last_used(&self) -> Result<HashMap<String, Timestamp>, RepositoryError> {
+        let rows = sqlx::query!(
+            "select v.payload->'vc'->>'label' as \"label!\", max(e.occurred_at) as \"last_used!\" \
+             from formation_events v \
+             join formation_events e on e.formation_id = v.formation_id \
+             where v.kind = $1 and v.payload->'vc'->>'label' is not null \
+             group by 1",
+            FormationEventKind::VcAssigned.as_str(),
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.label, row.last_used))
+            .collect())
+    }
+
     /// Discord のユーザー ID からプレイヤー ID を引く。見つからないものは結果に含まれない。
     pub async fn find_players_by_discord_ids(
         &self,

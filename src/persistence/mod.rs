@@ -27,7 +27,10 @@ mod error;
 mod model;
 mod repository;
 
-pub use codec::{ABANDON_REASON_KEY, DISCORD_THREAD_ID_KEY, ROOM_CODE_KEY, decode_payload};
+pub use codec::{
+    ABANDON_REASON_KEY, ROOM_CODE_KEY, VC_BLUE_CHANNEL_ID_KEY, VC_KEY, VC_LABEL_KEY,
+    VC_RED_CHANNEL_ID_KEY, decode_payload,
+};
 pub use error::RepositoryError;
 pub use model::{
     AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewFormationPlayer, NewReport,

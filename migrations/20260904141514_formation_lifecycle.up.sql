@@ -2,7 +2,8 @@
 -- 出典: 04-試合ライフサイクル仕様 §6「スキーマ（追記専用）」＋ Phase 1 修正指示（2026-09-04）
 --       ＋ Phase 2 レビュー（2026-09-05: kind の CHECK、actor_player_id → subject_player_id）
 --       ＋ Phase 4 レビュー（2026-09-05: team を text の red/blue に、(formation_id, team, role) の unique、
---         roles の正規値 5 行、abandoned の理由の追加）。
+--         roles の正規値 5 行、abandoned の理由の追加）＋ Phase 4 追加修正（2026-09-05: outcome を red/blue/draw に、
+--         thread_created → vc_assigned、スレッド用インデックスの削除）。
 --       本番 DB は未作成で適用先が開発 DB と CI だけだったため、ALTER を積まずにこのファイルを書き直した。
 --       本番にデプロイした後は、変更は必ず新しいマイグレーションで積むこと。
 --
@@ -69,7 +70,7 @@ insert into roles (id, display_name, sort_order) values
 
 -- ----------------------------------------------------------------------
 -- formations: マッチメイカが10人を確定させた時点で1行。以後不変。
--- 生成時点で確定していない値（Discord スレッド ID など）は列にせず formation_events に積む。
+-- 生成時点で確定していない値（VC 割当など）は列にせず formation_events に積む。
 -- ----------------------------------------------------------------------
 create table formations (
     id                          uuid        primary key,
@@ -128,7 +129,7 @@ create table formation_events (
     occurred_at        timestamptz not null,
     -- 種別。値は Rust 側の FormationEventKind::ALL と一致させる（tests/schema.rs で検証）
     kind               text        not null check (kind in (
-        'thread_created', 'host_assigned', 'host_accepted', 'host_declined',
+        'vc_assigned', 'host_assigned', 'host_accepted', 'host_declined',
         'host_timeout', 'code_posted', 'confirmed', 'disputed', 'voided', 'abandoned'
     )),
     -- このイベントが対象とするプレイヤー（行為者ではない）
@@ -143,11 +144,6 @@ create index formation_events_formation_id_occurred_at_idx
 create index formation_events_formation_id_id_idx
     on formation_events (formation_id, id);
 
--- Discord のインタラクションは thread_id で飛んでくるので、thread_created イベントから逆引きする
-create unique index formation_events_thread_id_idx
-    on formation_events ((payload->>'discord_thread_id'))
-    where kind = 'thread_created';
-
 comment on table formation_events is
     '追記専用: UPDATE / DELETE 禁止（reject_mutation トリガーで拒否）。formation の状態遷移ログ。現在状態は formation の行を id 順に畳み込んで導出する（順序の正は id）。';
 comment on column formation_events.occurred_at is
@@ -157,7 +153,7 @@ comment on column formation_events.kind is
 comment on column formation_events.subject_player_id is
     'このイベントが対象とするプレイヤー（行為者ではない）。システム起因の host_assigned / host_timeout でも対象者を入れる。行為者と対象が異なり、行為者を記録する必要が出た場合は payload に入れる（列は増やさない）';
 comment on column formation_events.payload is
-    'イベントの生データ。thread_created: {"discord_thread_id": "...", "vc": {...}} / code_posted: {"room_code": "..."} / abandoned: {"reason": "host_candidates_exhausted" | "not_enough_players" | "thread_creation_failed" | "vc_pool_exhausted" | "member_add_failed" | "discord_call_failed"}。Discord 側の副作用（メッセージ ID）と、その失敗（"discord_failures": [{"operation": "...", "error": "..."}]）もここに残す。誰が来なかったかの推測は入れない（システム側の失敗で特定できる player_id は入れる）';
+    'イベントの生データ。vc_assigned: {"vc": {"label": "3", "red_channel_id": "...", "blue_channel_id": "..."}} / code_posted: {"room_code": "..."} / abandoned: {"reason": "host_candidates_exhausted" | "not_enough_players" | "vc_pool_exhausted" | "discord_call_failed"}。Discord 側の副作用（投稿したメッセージの ID）と、その失敗（"discord_failures": [{"operation": "...", "error": "..."}]）もここに残す。設定は VC の名前で持ち、ログにはチャンネル ID を記録する（名前は変わるが、ログは永久）。誰が来なかったかの推測は入れない';
 comment on column formation_events.idempotency_key is
     'アプリが供給する冪等キー。(formation_id, idempotency_key) の unique で、Discord API の再送による同一イベントの二重追記を防ぐ。Phase 4 では Discord のインタラクション ID を使う';
 
@@ -170,7 +166,8 @@ create table match_reports (
     formation_id   uuid        not null references formations (id),
     player_id      uuid        not null,
     reported_at    timestamptz not null,
-    outcome        text        not null check (outcome in ('team_0', 'team_1', 'draw')),
+    -- 勝ったチームは formation_players.team と同じ値域（red / blue）。勝者側は where fp.team = mr.outcome で引ける
+    outcome        text        not null check (outcome in ('red', 'blue', 'draw')),
     raw_result     jsonb       not null,
     supersedes_id  bigint      references match_reports (id),
     foreign key (formation_id, player_id)
@@ -189,7 +186,7 @@ create unique index match_reports_supersedes_uniq
 comment on table match_reports is
     '追記専用: UPDATE / DELETE 禁止（reject_mutation トリガーで拒否）。報告の取り消し・訂正は supersedes_id を持つ新しい行で表現する。他人の報告内容は本人の報告前に返さない（API レベルでブラインド）。報告者は複合 FK により当該試合の参加者に限られる。';
 comment on column match_reports.outcome is
-    '報告者が主張する結果。team_0 / team_1 / draw（team_0 = red、team_1 = blue）。引き分けを NULL で表現しない（未報告と区別できなくなる）';
+    '報告者が主張する結果。red / blue / draw（勝ったチームは formation_players.team と同じ値）。引き分けを NULL で表現しない（未報告と区別できなくなる）';
 comment on column match_reports.raw_result is
     '報告された生データ（スクリーンショット URL を含む）。パースに失敗しても必ず保存する';
 comment on column match_reports.supersedes_id is

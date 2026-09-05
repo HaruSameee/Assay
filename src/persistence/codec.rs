@@ -12,9 +12,14 @@ use super::model::{EventId, StoredEvent, UnreadableRow};
 pub const ROOM_CODE_KEY: &str = "room_code";
 /// `abandoned` の payload キー（[`crate::lifecycle::AbandonReason`] の文字列）。
 pub const ABANDON_REASON_KEY: &str = "reason";
-/// `thread_created` の payload キー。値は文字列（64bit の Discord ID を JSON 数値にしない。
-/// `formation_events_thread_id_idx` も文字列として見る）。
-pub const DISCORD_THREAD_ID_KEY: &str = "discord_thread_id";
+/// `vc_assigned` の payload キー: VC の組（`{"label": "...", "red_channel_id": "...", "blue_channel_id": "..."}`）。
+pub const VC_KEY: &str = "vc";
+/// [`VC_KEY`] の中: 表示用ラベル（設定の名前 `vc<N>-red` / `vc<N>-blue` の `<N>`）。
+pub const VC_LABEL_KEY: &str = "label";
+/// [`VC_KEY`] の中: red チームの VC のチャンネル ID。値は文字列（64bit の Discord ID を JSON 数値にしない）。
+pub const VC_RED_CHANNEL_ID_KEY: &str = "red_channel_id";
+/// [`VC_KEY`] の中: blue チームの VC のチャンネル ID。値は文字列。
+pub const VC_BLUE_CHANNEL_ID_KEY: &str = "blue_channel_id";
 
 /// 生の payload から状態機械が読む部分を取り出す。失敗しない。
 ///

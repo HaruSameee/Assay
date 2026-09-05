@@ -7,7 +7,10 @@ use crate::lifecycle::{
     PlayerId, Snapshot, Timestamp, UnknownValue, derive_snapshot_iter,
 };
 
-use super::codec::{ABANDON_REASON_KEY, DISCORD_THREAD_ID_KEY, ROOM_CODE_KEY, decode_payload};
+use super::codec::{
+    ABANDON_REASON_KEY, ROOM_CODE_KEY, VC_BLUE_CHANNEL_ID_KEY, VC_KEY, VC_LABEL_KEY,
+    VC_RED_CHANNEL_ID_KEY, decode_payload,
+};
 
 /// `formation_events.id`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -84,11 +87,11 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// DB の値（`team_0` / `team_1` / `draw`。`team_0` = red、`team_1` = blue）。
+    /// DB の値（`red` / `blue` / `draw`）。勝ったチームは `formation_players.team` と同じ値なので、
+    /// 勝者側のプレイヤーは `where fp.team = mr.outcome` で引ける。
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Win(Team::Red) => "team_0",
-            Self::Win(Team::Blue) => "team_1",
+            Self::Win(team) => team.as_str(),
             Self::Draw => "draw",
         }
     }
@@ -129,7 +132,7 @@ pub struct NewFormationPlayer {
 /// 追記するイベント。
 ///
 /// `payload` は DB に入れる生の JSON。状態機械が読む項目（部屋コード、解散理由）は
-/// その中から [`decode_payload`] で取り出す。読まない項目（スレッド ID など）もそのまま残る。
+/// その中から [`decode_payload`] で取り出す。読まない項目（VC の割当など）もそのまま残る。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewEvent {
     /// 種別。
@@ -167,22 +170,31 @@ impl NewEvent {
         self
     }
 
-    /// `thread_created`。スレッド ID は JSON では文字列で持つ。
-    pub fn thread_created(
-        discord_thread_id: u64,
+    /// `vc_assigned`。VC の組（ラベルと red / blue のチャンネル ID）。ID は JSON では文字列で持つ。
+    pub fn vc_assigned(
+        label: &str,
+        red_channel_id: u64,
+        blue_channel_id: u64,
         occurred_at: Timestamp,
         idempotency_key: impl Into<String>,
     ) -> Self {
+        let mut vc = Map::new();
+        vc.insert(VC_LABEL_KEY.to_owned(), Value::String(label.to_owned()));
+        vc.insert(
+            VC_RED_CHANNEL_ID_KEY.to_owned(),
+            Value::String(red_channel_id.to_string()),
+        );
+        vc.insert(
+            VC_BLUE_CHANNEL_ID_KEY.to_owned(),
+            Value::String(blue_channel_id.to_string()),
+        );
         Self::new(
-            FormationEventKind::ThreadCreated,
+            FormationEventKind::VcAssigned,
             None,
             occurred_at,
             idempotency_key,
         )
-        .with_payload(object(
-            DISCORD_THREAD_ID_KEY,
-            Value::String(discord_thread_id.to_string()),
-        ))
+        .with_payload(object(VC_KEY, Value::Object(vc)))
     }
 
     /// `code_posted`（subject = ホスト）。
@@ -261,7 +273,7 @@ pub struct StoredEvent {
     pub id: EventId,
     /// 状態機械に渡す形。
     pub event: FormationEvent,
-    /// DB に入っている生の payload。状態機械が読まない項目（Discord のスレッド ID・
+    /// DB に入っている生の payload。状態機械が読まない項目（Discord のチャンネル ID・
     /// メッセージ ID・VC 割当など）はここから読む。副作用の記録の正はこの列。
     pub payload: Value,
 }

@@ -67,7 +67,7 @@ fn ten_players() -> Formation {
 /// matched → confirmed の正常系イベント列。
 fn happy_path(host: PlayerId) -> Vec<FormationEvent> {
     vec![
-        ev(0, K::ThreadCreated, None),
+        ev(0, K::VcAssigned, None),
         ev(1, K::HostAssigned, Some(host)),
         ev(2, K::HostAccepted, Some(host)),
         code(3, host, "1234"),
@@ -113,7 +113,7 @@ fn three_consecutive_host_timeouts_end_in_abandoned() {
     assert_eq!(candidates, vec![pid(1), pid(2), pid(3)]);
 
     // アプリ側のループを模す: 指名 → 期限切れ → 次の候補、を候補が尽きるまで
-    let mut events = vec![ev(0, K::ThreadCreated, None)];
+    let mut events = vec![ev(0, K::VcAssigned, None)];
     let mut seq = 1;
     let mut timeouts = 0;
     loop {
@@ -205,7 +205,7 @@ fn duplicate_idempotency_keys_are_no_ops_recorded_as_anomalies() {
         happy_path(a),
         // ホストが次々と脱落し、最後は解散
         vec![
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(2, K::HostTimeout, Some(a)),
             ev(3, K::HostAssigned, Some(b)),
@@ -217,7 +217,7 @@ fn duplicate_idempotency_keys_are_no_ops_recorded_as_anomalies() {
         ],
         // 係争になり、スタッフが無効化
         vec![
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(2, K::HostAccepted, Some(a)),
             code(3, a, "1234"),
@@ -249,7 +249,7 @@ fn duplicate_idempotency_keys_are_no_ops_recorded_as_anomalies() {
 fn derive_state_never_fails_on_a_corrupted_log() {
     let (a, b) = (pid(1), pid(2));
     let events = vec![
-        ev(0, K::ThreadCreated, None),
+        ev(0, K::VcAssigned, None),
         ev(1, K::Confirmed, None), // #1 不正遷移（まだ試合前）
         ev(2, K::HostAssigned, Some(a)),
         ev(3, K::HostAccepted, Some(b)), // #3 対象不一致
@@ -311,7 +311,7 @@ fn derive_state_never_fails_on_a_corrupted_log() {
 fn reposted_room_code_overwrites_the_previous_one() {
     let (a, b) = (pid(1), pid(2));
     let events = vec![
-        ev(0, K::ThreadCreated, None),
+        ev(0, K::VcAssigned, None),
         ev(1, K::HostAssigned, Some(a)),
         ev(2, K::HostAccepted, Some(a)),
         code(3, a, "111111"),
@@ -330,8 +330,8 @@ fn reposted_room_code_overwrites_the_previous_one() {
 }
 
 #[test]
-fn matched_can_be_abandoned_when_thread_creation_fails() {
-    let events = [abandon(0, AbandonReason::ThreadCreationFailed)];
+fn matched_can_be_abandoned_when_no_voice_channel_is_free() {
+    let events = [abandon(0, AbandonReason::VcPoolExhausted)];
     let (state, anomalies) = derive_state(&events);
     assert_eq!(state, S::Abandoned);
     assert!(anomalies.is_empty());
@@ -344,14 +344,14 @@ fn matched_can_be_abandoned_when_thread_creation_fails() {
         Err(TransitionError::PayloadMismatch { .. })
     ));
     // 解散後は何も積めない
-    assert!(apply(&state, &ev(1, K::ThreadCreated, None)).is_err());
+    assert!(apply(&state, &ev(1, K::VcAssigned, None)).is_err());
 }
 
-/// スレッド作成後、候補を打診してはタイムアウトする、を `cycles` 回繰り返すイベント列。
+/// VC 割当後、候補を打診してはタイムアウトする、を `cycles` 回繰り返すイベント列。
 /// 状態機械自体は回数を制限しない（上限は設定と `next_host_action` の責務）。
 fn host_churn(cycles: usize) -> Vec<FormationEvent> {
     let mut events = Vec::with_capacity(cycles * 2 + 1);
-    events.push(ev(0, K::ThreadCreated, None));
+    events.push(ev(0, K::VcAssigned, None));
     for i in 0..cycles {
         let host = pid((i % 2) as u128 + 1);
         let seq = (2 * i + 1) as i64;

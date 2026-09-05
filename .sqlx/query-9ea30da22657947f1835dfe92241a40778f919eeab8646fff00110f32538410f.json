@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select payload from formation_events where formation_id = $1 and kind = 'thread_created'",
+  "query": "select payload from formation_events where formation_id = $1 and kind = 'vc_assigned'",
   "describe": {
     "columns": [
       {
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "e98c08dc305032da5c117d2beaac7bf523ebbd1ce0aaa989c26ce3c2023420fc"
+  "hash": "9ea30da22657947f1835dfe92241a40778f919eeab8646fff00110f32538410f"
 }

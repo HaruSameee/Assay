@@ -13,9 +13,9 @@ use super::ids::{PlayerId, Timestamp};
 /// （打診中のホスト、試した候補数、部屋コード）を持たせている。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormationState {
-    /// マッチメイカが10人を確定した直後。スレッド作成待ち。タイムアウトなし。
+    /// マッチメイカが10人を確定した直後。VC 割当待ち。タイムアウトなし。
     Matched,
-    /// スレッド作成済み。ホストを指名し、承諾を待つ。
+    /// VC 割当済み。ホストを指名し、承諾を待つ。
     AwaitingHost {
         /// 打診中のホスト候補。`None` は「次の候補を指名する前」。
         pending: Option<PlayerId>,
@@ -45,7 +45,7 @@ pub enum FormationState {
     Disputed,
     /// 試合が成立しなかった。レートに影響させない。報告義務も生じない。
     Voided,
-    /// 解散（ホスト候補の全滅、人が揃わない、スレッド作成失敗）。報告義務は生じない。
+    /// 解散（ホスト候補の全滅、人が揃わない、VC 無し、Discord への投稿失敗）。報告義務は生じない。
     Abandoned,
 }
 
@@ -96,9 +96,9 @@ impl fmt::Display for FormationState {
 /// `host_timeout` の対象プレイヤーから導出する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FormationEventKind {
-    /// Discord のプライベートスレッドを作成した。payload に `discord_thread_id`。
-    /// `matched` → `awaiting_host`。コード開示前なら作り直し（状態は変わらない）も受け付ける。
-    ThreadCreated,
+    /// VC の組（red / blue）を割り当てた。payload に `vc`（ラベルと両チャンネルの ID）。
+    /// `matched` → `awaiting_host`。コード開示前なら割り当て直し（状態は変わらない）も受け付ける。
+    VcAssigned,
     /// ホスト候補を1人指名した（subject = 候補）。`awaiting_host` の中で候補が定まる。
     HostAssigned,
     /// 候補が「部屋を作る」を押した（subject = 候補）。`awaiting_host` → `awaiting_code`。
@@ -124,7 +124,7 @@ pub enum FormationEventKind {
 impl FormationEventKind {
     /// 全種別。DB の CHECK 制約はこの一覧と一致させる。
     pub const ALL: [Self; 10] = [
-        Self::ThreadCreated,
+        Self::VcAssigned,
         Self::HostAssigned,
         Self::HostAccepted,
         Self::HostDeclined,
@@ -139,7 +139,7 @@ impl FormationEventKind {
     /// `formation_events.kind` に入る文字列。
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ThreadCreated => "thread_created",
+            Self::VcAssigned => "vc_assigned",
             Self::HostAssigned => "host_assigned",
             Self::HostAccepted => "host_accepted",
             Self::HostDeclined => "host_declined",
@@ -188,31 +188,24 @@ impl FromStr for FormationEventKind {
 /// `abandoned` の理由。payload は `{"reason": "<as_str>", ...}`。
 ///
 /// 人の推測（誰が来なかったか）は入れない。ホストは正確に言えず、間違ったデータが永久に残るだけなので。
-/// システム側の失敗で特定できる対象（スレッドに追加できなかった player_id）は入れる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AbandonReason {
     /// ホスト候補が全滅した（`awaiting_host`）。
     HostCandidatesExhausted,
     /// 部屋に人が揃わず、ホストが「不成立」を押した（`awaiting_code`）。
     NotEnoughPlayers,
-    /// Discord のスレッド作成がリトライしても失敗した（`matched`）。
-    ThreadCreationFailed,
     /// 空いている VC の組が無かった（`matched`）。10 人を拘束せずキューに戻す。
     VcPoolExhausted,
-    /// スレッドに追加できなかった参加者がいる（`awaiting_host`）。payload に対象の player_id。
-    MemberAddFailed,
-    /// 上記以外の Discord 呼び出し（投稿・編集）がリトライしても失敗した。payload に操作名と理由。
+    /// Discord への投稿・編集がリトライしても失敗した。payload に操作名と理由。
     DiscordCallFailed,
 }
 
 impl AbandonReason {
     /// 全理由。
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 4] = [
         Self::HostCandidatesExhausted,
         Self::NotEnoughPlayers,
-        Self::ThreadCreationFailed,
         Self::VcPoolExhausted,
-        Self::MemberAddFailed,
         Self::DiscordCallFailed,
     ];
 
@@ -221,9 +214,7 @@ impl AbandonReason {
         match self {
             Self::HostCandidatesExhausted => "host_candidates_exhausted",
             Self::NotEnoughPlayers => "not_enough_players",
-            Self::ThreadCreationFailed => "thread_creation_failed",
             Self::VcPoolExhausted => "vc_pool_exhausted",
-            Self::MemberAddFailed => "member_add_failed",
             Self::DiscordCallFailed => "discord_call_failed",
         }
     }
@@ -251,7 +242,7 @@ impl FromStr for AbandonReason {
 
 /// 状態機械が読む payload。DB の `payload` jsonb から Phase 3 で取り出す。
 ///
-/// 状態遷移に関与しない項目（`discord_thread_id`、判定結果、`voided` の理由など）は
+/// 状態遷移に関与しない項目（VC の割当、判定結果、`voided` の理由など）は
 /// ここに含めない。それらは DB の payload にはあるが、状態機械は読まない。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EventPayload {
@@ -296,12 +287,12 @@ pub fn apply(
     check_payload(event)?;
 
     let next = match event.kind {
-        K::ThreadCreated => match state {
+        K::VcAssigned => match state {
             S::Matched => S::AwaitingHost {
                 pending: None,
                 tried: 0,
             },
-            // スレッドの作り直し（コード開示前）。状態は変わらない
+            // VC の割り当て直し（コード開示前）。状態は変わらない
             S::AwaitingHost { .. } | S::AwaitingCode { .. } => state.clone(),
             _ => return Err(invalid(state, event)),
         },
@@ -704,14 +695,14 @@ mod tests {
                 in_progress(a, "1234"),
                 abandon(0, AbandonReason::NotEnoughPlayers),
             ),
-            (in_progress(a, "1234"), ev(0, K::ThreadCreated, None)),
+            (in_progress(a, "1234"), ev(0, K::VcAssigned, None)),
             (in_progress(a, "1234"), ev(0, K::HostAssigned, Some(a))),
-            (S::Disputed, ev(0, K::ThreadCreated, None)),
+            (S::Disputed, ev(0, K::VcAssigned, None)),
             (S::Confirmed, ev(0, K::Voided, None)),
             (S::Confirmed, ev(0, K::Disputed, None)),
             (S::Voided, ev(0, K::Confirmed, None)),
             (S::Abandoned, ev(0, K::HostAssigned, Some(a))),
-            (S::Abandoned, ev(0, K::ThreadCreated, None)),
+            (S::Abandoned, ev(0, K::VcAssigned, None)),
         ];
         for (state, event) in cases {
             let result = apply(&state, &event);
@@ -809,7 +800,7 @@ mod tests {
     fn stale_host_events_are_rejected_by_validation_and_skipped_by_derive() {
         let (a, b, c) = (pid(1), pid(2), pid(3));
         let events = vec![
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(2, K::HostTimeout, Some(a)),
             ev(3, K::HostAssigned, Some(b)),
@@ -863,26 +854,26 @@ mod tests {
     }
 
     #[test]
-    fn thread_recreation_is_accepted_before_code_disclosure() {
+    fn vc_reassignment_is_accepted_before_code_disclosure() {
         let a = pid(1);
         let pending = awaiting_host(Some(a), 1);
         assert_eq!(
-            apply(&pending, &ev(9, K::ThreadCreated, None)).unwrap(),
+            apply(&pending, &ev(9, K::VcAssigned, None)).unwrap(),
             pending
         );
         let code_state = S::AwaitingCode { host: a, tried: 1 };
         assert_eq!(
-            apply(&code_state, &ev(9, K::ThreadCreated, None)).unwrap(),
+            apply(&code_state, &ev(9, K::VcAssigned, None)).unwrap(),
             code_state
         );
-        assert!(apply(&in_progress(a, "1234"), &ev(9, K::ThreadCreated, None)).is_err());
+        assert!(apply(&in_progress(a, "1234"), &ev(9, K::VcAssigned, None)).is_err());
     }
 
     #[test]
     fn code_timeout_returns_to_awaiting_host_and_keeps_the_count() {
         let a = pid(1);
         let (state, anomalies) = derive_state(&[
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(2, K::HostAccepted, Some(a)),
             ev(3, K::HostTimeout, Some(a)),
@@ -895,7 +886,7 @@ mod tests {
     fn disputed_is_resolved_by_staff_into_confirmed_or_voided() {
         let a = pid(1);
         let (disputed, anomalies) = derive_state(&[
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(2, K::HostAccepted, Some(a)),
             code(3, a, "1234"),
@@ -919,7 +910,7 @@ mod tests {
     fn snapshot_since_follows_state_changes_including_corrections() {
         let a = pid(1);
         let snapshot = derive_snapshot(&[
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(7, K::HostAssigned, Some(a)), // 再打診: 状態は変わらないので since も変わらない
         ]);
@@ -928,7 +919,7 @@ mod tests {
         assert!(snapshot.anomalies.is_empty());
 
         let snapshot = derive_snapshot(&[
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::HostAssigned, Some(a)),
             ev(2, K::HostAccepted, Some(a)),
             code(3, a, "1111"),
@@ -941,8 +932,8 @@ mod tests {
     #[test]
     fn anomalies_are_displayable() {
         let (_, anomalies) = derive_state(&[
-            ev(0, K::ThreadCreated, None),
-            ev(0, K::ThreadCreated, None),
+            ev(0, K::VcAssigned, None),
+            ev(0, K::VcAssigned, None),
             ev(1, K::Confirmed, None),
         ]);
         assert_eq!(anomalies.len(), 2);

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select fp.player_id from match_reports mr join formation_players fp on fp.formation_id = mr.formation_id and fp.team = mr.outcome where mr.formation_id = $1 and mr.player_id = $2 order by fp.player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "player_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6b80e49bd8f91973f7943430dceeaa5bc50cf7ddf81cfae52fa0c4650b0f9918"
+}

@@ -97,7 +97,7 @@ fn default_sigma() -> f64 {
 /// `POST /internal/formations` の出力。
 #[derive(Debug, Serialize)]
 pub struct CreateFormationResponse {
-    /// 作られた formation。スレッド作成はバックグラウンドで進む。
+    /// 作られた formation。VC の割当と投稿はバックグラウンドで進む。
     pub formation_id: Uuid,
 }
 

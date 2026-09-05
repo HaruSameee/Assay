@@ -1,23 +1,25 @@
 //! Discord アダプタ本体。イベント駆動の部分だけ（時間駆動は Phase 5）。
 //!
 //! 流れ:
-//! 1. `matched` → VC を確保 → プライベートスレッド作成 → 10 人追加 → 割り当て表 →
-//!    `thread_created`（payload にスレッド ID・VC 割当・割り当て表のメッセージ ID）
-//! 2. `HostSelector` の候補を打診 → `host_assigned`（payload に打診メッセージ ID）
-//! 3. 「部屋を作る」→ モーダル → `host_accepted` → モーダル送信 → 開示 → `code_posted`
+//! 1. `matched` → VC の組を LRU で確保 → 割り当て表を red / blue 両方の VC チャットに投稿 →
+//!    `vc_assigned`（payload に VC のラベルと両チャンネル ID、割り当て表のメッセージ ID）
+//! 2. `HostSelector` の候補を、候補の側の VC チャットにだけ打診 → `host_assigned`
+//!    （payload に打診メッセージのチャンネル ID と ID）
+//! 3. 「部屋を作る」→ モーダル → `host_accepted` → モーダル送信 → 両 VC に開示 → `code_posted`
 //!    （payload にルーム ID・開示メッセージ ID）
-//! 4. 「今回はパスする」→ `host_declined` → 次の候補（打診メッセージを編集）。尽きたら `abandoned`
+//! 4. 「今回はパスする」→ `host_declined` → 次の候補（同じ側なら打診メッセージを編集、反対側なら
+//!    古い打診のボタンを外して反対側に投稿）。尽きたら `abandoned`
 //!
 //! 失敗経路（すべて `abandoned` で解散し、理由と詳細を payload に残す。10 人を黙って拘束しない）:
 //! - 空いている VC が無い → `vc_pool_exhausted`
-//! - スレッド作成が N 回失敗 → `thread_creation_failed`
-//! - スレッドに追加できない参加者がいる → `member_add_failed`（payload に対象の player_id）
 //! - 割り当て表・打診・開示の投稿や編集が N 回失敗 → `discord_call_failed`（payload に操作名）
 //!
 //! 原則:
-//! - 副作用の記録が正。Discord に何かを作ったら、その ID を必ず `formation_events.payload` に入れる。
+//! - 副作用の記録が正。Discord に投稿したら、その ID を必ず `formation_events.payload` に入れる。
 //!   失敗も同じ payload に残す（stdout のログは記録ではない）。再起動後は [`DiscordRecord`] を
 //!   ログから導出して続きを操作する。Discord 側を検索し直さない。
+//! - VC チャットのメッセージは消さない（VC は使い回すが、過去のルーム ID は試合終了で無効）。
+//!   すべての投稿に見出し（VC ラベル・時刻・試合 ID）を付ける。
 //! - 順序は「副作用 → 記録」。インタラクションでは、状態機械で事前に検証してから応答し、
 //!   応答の成否を含めて追記する。正式な検証は [`FormationRepository::append_event`]
 //!   （ロック → 検証 → INSERT）が行う。
@@ -31,11 +33,9 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
 
 use chrono::Utc;
 use serenity::model::id::{ChannelId, GuildId, InteractionId, MessageId, UserId};
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::lifecycle::{
@@ -44,7 +44,7 @@ use crate::lifecycle::{
     PlayerId, apply, next_host_action,
 };
 use crate::persistence::{
-    FormationLog, FormationRepository, NewEvent, RepositoryError, RosterEntry,
+    FormationLog, FormationRepository, NewEvent, RepositoryError, RosterEntry, Team,
 };
 
 use super::config::DiscordConfig;
@@ -52,7 +52,7 @@ use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
 use super::gateway::{Gateway, GatewayError, InteractionRef, InteractionResponse, OutgoingMessage};
 use super::payload::{self, DiscordFailure, DiscordRecord};
 use super::render;
-use super::vc_pool::VcPool;
+use super::vc_pool::{VcPair, VcPool};
 
 /// アダプタのエラー。Discord の失敗はここには出てこない（payload に記録して `abandoned` にする）。
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +60,7 @@ pub enum AdapterError {
     /// 永続化層。
     #[error(transparent)]
     Repository(#[from] RepositoryError),
-    /// ログの記録と現在状態が食い違っている（スレッド ID が無い、編成に居ない、など）。
+    /// ログの記録と現在状態が食い違っている（VC 割当が無い、編成に居ない、など）。
     #[error("formation {0}: {1}")]
     Inconsistent(FormationId, String),
 }
@@ -122,28 +122,25 @@ pub struct Adapter {
     lifecycle: LifecycleConfig,
     selector: Box<dyn HostSelector + Send + Sync>,
     vc_pool: VcPool,
-    /// 直近にスレッドを作った時刻。連続作成の間隔を空けるため。
-    last_thread_created_at: Mutex<Option<Instant>>,
 }
 
 impl Adapter {
-    /// 組み立てる。
+    /// 組み立てる。`vc_pool` は起動時に名前から解決した組（[`super::resolve_vc_pool`]）。
     pub fn new(
         repo: FormationRepository,
         gateway: Arc<dyn Gateway>,
         config: DiscordConfig,
+        vc_pool: Vec<VcPair>,
         lifecycle: LifecycleConfig,
         selector: Box<dyn HostSelector + Send + Sync>,
     ) -> Self {
-        let vc_pool = VcPool::new(config.vc_pool.clone());
         Self {
             repo,
             gateway,
             config,
             lifecycle,
             selector,
-            vc_pool,
-            last_thread_created_at: Mutex::new(None),
+            vc_pool: VcPool::new(vc_pool),
         }
     }
 
@@ -159,7 +156,7 @@ impl Adapter {
 
     /// 起動時: 未終了の formation のうち、イベント駆動で続きができるものを進める。
     ///
-    /// - `matched`（スレッド未作成）→ スレッド作成から
+    /// - `matched`（VC 未割当）→ VC の確保から
     /// - `awaiting_host` で候補未指名（辞退の直後に落ちた）→ 次の候補を打診
     ///
     /// 期限切れの判定や、応答待ちのままの候補への催促はしない（時間駆動は Phase 5）。
@@ -182,7 +179,7 @@ impl Adapter {
         Ok(())
     }
 
-    /// `matched` の formation にスレッドを作り、割り当て表を投稿し、最初のホスト候補を打診する。
+    /// `matched` の formation に VC の組を割り当て、割り当て表を投稿し、最初のホスト候補を打診する。
     ///
     /// 既に `matched` でなければ何もしない（再送に安全）。Discord 側の失敗は `abandoned` として
     /// 記録し、`Ok(())` を返す（呼び出し側が失敗として扱う必要は無い。ログを読めば分かる）。
@@ -202,127 +199,55 @@ impl Adapter {
             ));
         }
 
-        // VC の確保。占有状態は DB（未終了 formation の thread_created）から導出する。
+        // VC の確保。占有状態と最終使用時刻は DB（vc_assigned の payload）から導出する
         let unfinished = self.repo.list_unfinished().await?;
         let occupied = VcPool::occupied_labels(&unfinished);
-        let Some(reservation) = self.vc_pool.reserve(&occupied) else {
+        let last_used = self.repo.vc_last_used().await?;
+        let Some(reservation) = self.vc_pool.reserve(&occupied, &last_used) else {
             warn!(formation = %id, "no free voice channel pair; abandoning");
             self.abandon(id, AbandonReason::VcPoolExhausted, &[])
                 .await?;
             return Ok(());
         };
         let vc = reservation.pair().clone();
+        info!(formation = %id, vc = %vc.label, red = %vc.red, blue = %vc.blue, "voice channels assigned");
 
-        self.pace_thread_creation().await;
-        let name = render::thread_name(id);
-        let thread = match self
-            .retry("create_private_thread", None, || {
-                self.gateway
-                    .create_private_thread(self.config.parent_channel_id, &name)
-            })
-            .await
-        {
-            Ok(thread) => thread,
-            Err(failure) => {
-                error!(formation = %id, error = %failure.error, "thread creation failed after retries; abandoning");
-                // reservation は drop されて VC は解放される
-                self.abandon(id, AbandonReason::ThreadCreationFailed, &[failure])
-                    .await?;
-                return Ok(());
-            }
-        };
-        info!(formation = %id, %thread, vc = %vc.label, "thread created");
-
-        // 10 人を追加する。失敗は全員分集めてから解散する（誰が追加できなかったかを全部残す）
-        let mut member_failures = Vec::new();
-        for entry in &roster {
-            let player = Some((entry.player_id, entry.discord_user_id));
-            match render::user_of(entry) {
-                Some(user) => {
-                    if let Err(failure) = self
-                        .retry("add_thread_member", player, || {
-                            self.gateway.add_thread_member(thread, user)
-                        })
-                        .await
-                    {
-                        member_failures.push(failure);
-                    }
-                }
-                None => member_failures.push(DiscordFailure {
-                    operation: "add_thread_member".into(),
-                    error: "player has no valid discord user id".into(),
-                    attempts: 0,
-                    player,
-                }),
-            }
-        }
-
-        // 割り当て表。全員入っているときだけ出す
-        let mut assignment_failure = None;
-        let mut assignment_message_id = None;
-        if member_failures.is_empty() {
-            let assignment = render::assignment(&roster, &vc, &self.config.room_checklist);
-            match self
-                .retry("send:assignment", None, || {
-                    self.gateway.send_message(thread, &assignment)
-                })
-                .await
-            {
-                Ok(message_id) => assignment_message_id = Some(message_id),
-                Err(failure) => assignment_failure = Some(failure),
-            }
-        }
-
-        // 記録: スレッド ID と VC 割当は、解散するとしても残す（VC の占有状態の導出元でもある）
-        let mut failures = member_failures.clone();
-        failures.extend(assignment_failure.iter().cloned());
+        // 割り当て表を両方の VC チャットに投稿する（副作用 → 記録）
+        let heading = render::heading(&vc, log.created_at, id);
+        let assignment = render::assignment(
+            &heading,
+            &roster,
+            &vc,
+            &self.config.room_map,
+            &self.config.room_checklist,
+        );
+        let (assignment_ids, mut failures) =
+            self.post_to_both(&vc, "assignment", &assignment).await;
         let event = NewEvent::new(
-            FormationEventKind::ThreadCreated,
+            FormationEventKind::VcAssigned,
             None,
             Utc::now(),
-            format!("thread_created:{thread}"),
+            format!("vc_assigned:{}", vc.label),
         )
-        .with_payload(payload::thread_created(
-            thread,
-            &vc,
-            assignment_message_id,
-            &failures,
-        ));
+        .with_payload(payload::vc_assigned(&vc, &assignment_ids, &failures));
         let outcome = self.repo.append_event(id, &event).await?;
         log_anomalies(id, &outcome.anomalies);
         reservation.commit();
 
-        if !member_failures.is_empty() {
-            error!(formation = %id, count = member_failures.len(), "players could not be added to the thread; abandoning");
-            self.abandon_in_thread(
-                id,
-                thread,
-                None,
-                AbandonReason::MemberAddFailed,
-                member_failures,
-            )
-            .await?;
+        if !failures.is_empty() {
+            error!(formation = %id, count = failures.len(), "assignment table could not be posted; abandoning");
+            failures.clear();
+            let record = DiscordRecord::from_log(&self.repo.load_events(id).await?);
+            self.abandon_in_vc(id, &vc, &record, AbandonReason::DiscordCallFailed, failures)
+                .await?;
             return Ok(());
         }
-        if let Some(failure) = assignment_failure {
-            error!(formation = %id, error = %failure.error, "assignment table could not be posted; abandoning");
-            self.abandon_in_thread(
-                id,
-                thread,
-                None,
-                AbandonReason::DiscordCallFailed,
-                vec![failure],
-            )
-            .await?;
-            return Ok(());
-        }
-
         self.nominate_next(id).await
     }
 
     /// 候補未指名の `awaiting_host` で、次の候補を打診する（または候補が尽きて解散する）。
     ///
-    /// それ以外の状態では何もしない。
+    /// 打診は候補の側の VC チャットにだけ出す。それ以外の状態では何もしない。
     pub async fn nominate_next(&self, id: FormationId) -> Result<(), AdapterError> {
         let log = self.repo.load_events(id).await?;
         let snapshot = log.snapshot();
@@ -332,18 +257,19 @@ impl Adapter {
             return Ok(());
         };
         let record = DiscordRecord::from_log(&log);
-        let thread = record
-            .thread_id
-            .ok_or_else(|| AdapterError::Inconsistent(id, "no thread recorded".into()))?;
-        let prompt = record.host_prompt_message_id;
+        let vc = record
+            .vc
+            .clone()
+            .ok_or_else(|| AdapterError::Inconsistent(id, "no voice channels recorded".into()))?;
+        let heading = render::heading(&vc, log.created_at, id);
 
         let candidate_index = match action {
             HostAction::Abandon => {
                 return self
-                    .abandon_in_thread(
+                    .abandon_in_vc(
                         id,
-                        thread,
-                        prompt,
+                        &vc,
+                        &record,
                         AbandonReason::HostCandidatesExhausted,
                         Vec::new(),
                     )
@@ -356,10 +282,10 @@ impl Adapter {
         let Some(candidate) = candidates.get(candidate_index).copied() else {
             // 候補リストが上限より短い。HostAction の規約どおり解散と同じ扱い
             return self
-                .abandon_in_thread(
+                .abandon_in_vc(
                     id,
-                    thread,
-                    prompt,
+                    &vc,
+                    &record,
                     AbandonReason::HostCandidatesExhausted,
                     Vec::new(),
                 )
@@ -377,24 +303,47 @@ impl Adapter {
         let user = render::user_of(entry).ok_or_else(|| {
             AdapterError::Inconsistent(id, format!("candidate {candidate} has no discord user"))
         })?;
+        let channel = vc.channel(entry.team);
 
-        let message =
-            render::host_prompt(user, id, candidate, candidate_index + 1, candidates.len());
+        let message = render::host_prompt(
+            &heading,
+            user,
+            id,
+            candidate,
+            candidate_index + 1,
+            candidates.len(),
+        );
+        let mut failures = Vec::new();
+        // 同じ側の VC に打診メッセージがあれば編集する。反対側にあればボタンを外して、こちらに投稿する
+        let existing = match record.host_prompt {
+            Some((prompt_channel, prompt_message)) if prompt_channel == channel => {
+                Some(prompt_message)
+            }
+            Some((prompt_channel, prompt_message)) => {
+                let moved = render::host_prompt_moved(&heading, entry.team);
+                if let Err(failure) = self
+                    .retry("edit:host_prompt_moved", || {
+                        self.gateway
+                            .edit_message(prompt_channel, prompt_message, &moved)
+                    })
+                    .await
+                {
+                    failures.push(failure);
+                }
+                None
+            }
+            None => None,
+        };
         let prompt_message_id = match self
-            .post_or_edit(thread, prompt, "host_prompt", &message)
+            .post_or_edit(channel, existing, "host_prompt", &message)
             .await
         {
             Ok(message_id) => message_id,
             Err(failure) => {
                 error!(formation = %id, error = %failure.error, "host prompt could not be posted; abandoning");
+                failures.push(failure);
                 return self
-                    .abandon_in_thread(
-                        id,
-                        thread,
-                        prompt,
-                        AbandonReason::DiscordCallFailed,
-                        vec![failure],
-                    )
+                    .abandon_in_vc(id, &vc, &record, AbandonReason::DiscordCallFailed, failures)
                     .await;
             }
         };
@@ -405,12 +354,14 @@ impl Adapter {
             format!("host_assigned:{prompt_message_id}:{candidate_index}"),
         )
         .with_payload(payload::host_assigned(
+            channel,
             prompt_message_id,
             entry.discord_user_id,
+            &failures,
         ));
         let outcome = self.repo.append_event(id, &event).await?;
         log_anomalies(id, &outcome.anomalies);
-        info!(formation = %id, %candidate, index = candidate_index, "host candidate nominated");
+        info!(formation = %id, %candidate, index = candidate_index, %channel, "host candidate nominated");
         Ok(())
     }
 
@@ -486,13 +437,14 @@ impl Adapter {
             &mut failures,
         )
         .await;
-        // 状態表示を「作成中」に。他の 9 人にも承諾が分かる
+        // 状態表示を「作成中」に。同じ VC の全員に承諾が分かる
         let record = DiscordRecord::from_log(&log);
-        if let (Some(thread), Some(prompt)) = (record.thread_id, record.host_prompt_message_id) {
-            let message = render::host_accepted(incoming.user, formation, player);
+        if let (Some(vc), Some((channel, prompt))) = (&record.vc, record.host_prompt) {
+            let heading = render::heading(vc, log.created_at, formation);
+            let message = render::host_accepted(&heading, incoming.user, formation, player);
             if let Err(failure) = self
-                .retry("edit:host_prompt", None, || {
-                    self.gateway.edit_message(thread, prompt, &message)
+                .retry("edit:host_prompt", || {
+                    self.gateway.edit_message(channel, prompt, &message)
                 })
                 .await
             {
@@ -600,7 +552,7 @@ impl Adapter {
         Ok(())
     }
 
-    /// モーダル送信: 検証 → 開示メッセージを投稿（または編集）→ 状態表示を更新 → `code_posted` を追記。
+    /// モーダル送信: 検証 → 両 VC に開示（投稿または編集）→ 状態表示を更新 → `code_posted` を追記。
     async fn on_code_submit(
         &self,
         incoming: &IncomingInteraction,
@@ -631,41 +583,56 @@ impl Adapter {
             return Ok(());
         };
         let record = DiscordRecord::from_log(&log);
-        let thread = record
-            .thread_id
-            .ok_or_else(|| AdapterError::Inconsistent(formation, "no thread recorded".into()))?;
+        let vc = record.vc.clone().ok_or_else(|| {
+            AdapterError::Inconsistent(formation, "no voice channels recorded".into())
+        })?;
+        let heading = render::heading(&vc, log.created_at, formation);
 
-        // 副作用（開示メッセージ）→ 記録（code_posted に開示メッセージ ID）
+        // 副作用（両 VC に開示）→ 記録（code_posted に開示メッセージ ID）
         let others: Vec<UserId> = roster
             .iter()
             .filter(|other| other.player_id != player)
             .filter_map(render::user_of)
             .collect();
-        let reveal = render::code_reveal(incoming.user, &others, room_code, record.vc.as_ref());
-        let code_message_id = match self
-            .post_or_edit(thread, record.code_message_id, "code_reveal", &reveal)
-            .await
-        {
-            Ok(message_id) => message_id,
-            Err(failure) => {
-                error!(formation = %formation, error = %failure.error, "room code could not be revealed; abandoning");
-                self.ephemeral(incoming, render::reveal_failed()).await;
-                return self
-                    .abandon_in_thread(
-                        formation,
-                        thread,
-                        record.host_prompt_message_id,
-                        AbandonReason::DiscordCallFailed,
-                        vec![failure],
-                    )
-                    .await;
-            }
-        };
+        let reveal = render::code_reveal(&heading, incoming.user, &others, room_code, &vc);
+        let mut code_message_ids = HashMap::new();
         let mut failures = Vec::new();
+        for team in Team::ALL {
+            let what = format!("code_reveal:{team}");
+            match self
+                .post_or_edit(
+                    vc.channel(team),
+                    record.code_message_ids.get(&team).copied(),
+                    &what,
+                    &reveal,
+                )
+                .await
+            {
+                Ok(message_id) => {
+                    code_message_ids.insert(team, message_id);
+                }
+                Err(failure) => failures.push(failure),
+            }
+        }
+        if !failures.is_empty() {
+            // 片側でも見えなければ試合にならない
+            error!(formation = %formation, count = failures.len(), "room code could not be revealed; abandoning");
+            self.ephemeral(incoming, render::reveal_failed()).await;
+            return self
+                .abandon_in_vc(
+                    formation,
+                    &vc,
+                    &record,
+                    AbandonReason::DiscordCallFailed,
+                    failures,
+                )
+                .await;
+        }
         self.respond(
             incoming,
             "respond:update_status",
             InteractionResponse::UpdateMessage(render::code_status(
+                &heading,
                 incoming.user,
                 room_code,
                 formation,
@@ -682,17 +649,17 @@ impl Adapter {
         )
         .with_payload(payload::code_posted(
             room_code,
-            code_message_id,
+            &code_message_ids,
             entry.discord_user_id,
             &failures,
         ));
         if self.record(formation, &event).await? {
-            info!(formation = %formation, %player, message = %code_message_id, "room code posted");
+            info!(formation = %formation, %player, "room code posted to both voice chats");
         }
         Ok(())
     }
 
-    /// スレッドが無い段階での解散（VC 無し、スレッド作成失敗）。
+    /// VC の無い段階での解散（VC 無し）。
     async fn abandon(
         &self,
         id: FormationId,
@@ -712,50 +679,88 @@ impl Adapter {
         Ok(())
     }
 
-    /// スレッドがある段階での解散。通知（打診メッセージがあれば編集、無ければ投稿）→ `abandoned` の順。
+    /// VC 割当後の解散。通知（打診メッセージがあればそれを編集、無い側には投稿）→ `abandoned` の順。
     /// 通知の失敗も payload に残す。
-    async fn abandon_in_thread(
+    async fn abandon_in_vc(
         &self,
         id: FormationId,
-        thread: ChannelId,
-        prompt: Option<MessageId>,
+        vc: &VcPair,
+        record: &DiscordRecord,
         reason: AbandonReason,
         mut failures: Vec<DiscordFailure>,
     ) -> Result<(), AdapterError> {
-        let notice = render::abandoned_notice(reason);
-        if let Err(failure) = self
-            .post_or_edit(thread, prompt, "abandoned_notice", &notice)
-            .await
-        {
-            failures.push(failure);
+        let log = self.repo.load_events(id).await?;
+        let heading = render::heading(vc, log.created_at, id);
+        let notice = render::abandoned_notice(&heading, reason);
+        for team in Team::ALL {
+            let channel = vc.channel(team);
+            let existing = match record.host_prompt {
+                Some((prompt_channel, prompt_message)) if prompt_channel == channel => {
+                    Some(prompt_message)
+                }
+                _ => None,
+            };
+            if let Err(failure) = self
+                .post_or_edit(
+                    channel,
+                    existing,
+                    &format!("abandoned_notice:{team}"),
+                    &notice,
+                )
+                .await
+            {
+                failures.push(failure);
+            }
         }
         self.abandon(id, reason, &failures).await?;
-        let log = self.repo.load_events(id).await?;
-        if let Some(vc) = DiscordRecord::from_log(&log).vc {
-            self.vc_pool.release(&vc.label);
-        }
+        self.vc_pool.release(&vc.label);
         Ok(())
+    }
+
+    /// 両方の VC チャットに投稿する。成功した側の ID と、失敗の一覧を返す。
+    async fn post_to_both(
+        &self,
+        vc: &VcPair,
+        what: &str,
+        message: &OutgoingMessage,
+    ) -> (HashMap<Team, MessageId>, Vec<DiscordFailure>) {
+        let mut ids = HashMap::new();
+        let mut failures = Vec::new();
+        for team in Team::ALL {
+            match self
+                .retry(&format!("send:{what}:{team}"), || {
+                    self.gateway.send_message(vc.channel(team), message)
+                })
+                .await
+            {
+                Ok(message_id) => {
+                    ids.insert(team, message_id);
+                }
+                Err(failure) => failures.push(failure),
+            }
+        }
+        (ids, failures)
     }
 
     /// メッセージがあれば編集、無ければ投稿。どちらもリトライ付き。
     async fn post_or_edit(
         &self,
-        thread: ChannelId,
+        channel: ChannelId,
         existing: Option<MessageId>,
         what: &str,
         message: &OutgoingMessage,
     ) -> Result<MessageId, DiscordFailure> {
         match existing {
             Some(message_id) => {
-                self.retry(&format!("edit:{what}"), None, || {
-                    self.gateway.edit_message(thread, message_id, message)
+                self.retry(&format!("edit:{what}"), || {
+                    self.gateway.edit_message(channel, message_id, message)
                 })
                 .await?;
                 Ok(message_id)
             }
             None => {
-                self.retry(&format!("send:{what}"), None, || {
-                    self.gateway.send_message(thread, message)
+                self.retry(&format!("send:{what}"), || {
+                    self.gateway.send_message(channel, message)
                 })
                 .await
             }
@@ -866,7 +871,6 @@ impl Adapter {
                 operation: what.to_owned(),
                 error: error.0,
                 attempts: 1,
-                player: None,
             });
         }
     }
@@ -907,31 +911,14 @@ impl Adapter {
         Ok(self.selector.candidates(&formation))
     }
 
-    /// 連続するスレッド作成の間隔を空ける（ラウンド開始時の一斉作成対策）。
-    async fn pace_thread_creation(&self) {
-        let mut last = self.last_thread_created_at.lock().await;
-        if let Some(previous) = *last {
-            let elapsed = previous.elapsed();
-            if elapsed < self.config.thread_create_stagger {
-                tokio::time::sleep(self.config.thread_create_stagger - elapsed).await;
-            }
-        }
-        *last = Some(Instant::now());
-    }
-
     /// Discord API 呼び出しを最大 N 回試す。間隔は試行回数に比例して延びる。
     /// 使い切ったら最後のエラーを [`DiscordFailure`] にして返す（payload に入れる形）。
-    async fn retry<T, F, Fut>(
-        &self,
-        what: &str,
-        player: Option<(PlayerId, i64)>,
-        mut operation: F,
-    ) -> Result<T, DiscordFailure>
+    async fn retry<T, F, Fut>(&self, what: &str, mut operation: F) -> Result<T, DiscordFailure>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, GatewayError>>,
     {
-        let attempts = self.config.thread_create_retries.max(1);
+        let attempts = self.config.retries.max(1);
         let mut last_error = None;
         for attempt in 1..=attempts {
             match operation().await {
@@ -949,7 +936,6 @@ impl Adapter {
             operation: what.to_owned(),
             error: last_error.map_or_else(|| "no attempts".into(), |error| error.0),
             attempts,
-            player,
         })
     }
 }

@@ -3,7 +3,8 @@
 //! 起動順:
 //! 1. `.env` と環境変数から設定を読む
 //! 2. DB プールを作る（アプリ用ロールで繋ぐ想定。追記専用テーブルの UPDATE / DELETE 権限は無い）
-//! 3. Discord クライアントを組み立て、その `Http` を共有してアダプタを作る
+//! 3. Discord クライアントを組み立て、その `Http` を共有してアダプタを作る。
+//!    VC プール（`vc1-red` … `vc<N>-blue`）を名前から解決し、欠落・重複なら起動を失敗させる
 //! 4. `tokio::spawn` で Discord クライアントと axum サーバを並行に動かす
 //!
 //! どちらかが終了（または Ctrl-C）したらプロセスを終える。
@@ -17,7 +18,9 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use unite_matchsystem::api::{ApiState, router};
-use unite_matchsystem::discord::{Adapter, DiscordConfig, Handler, SerenityGateway, build_client};
+use unite_matchsystem::discord::{
+    Adapter, DiscordConfig, Handler, SerenityGateway, build_client, resolve_vc_pool,
+};
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::persistence::FormationRepository;
 
@@ -53,10 +56,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let handler = Arc::new(Handler::default());
     let mut client = build_client(&discord_config.token, handler.clone()).await?;
     let gateway = Arc::new(SerenityGateway::new(client.http.clone()));
+    // 設定は名前、ログは ID。ここで解決できなければ起動しない
+    let vc_pool = resolve_vc_pool(
+        &*gateway,
+        discord_config.guild_id,
+        discord_config.vc_pool_size,
+    )
+    .await?;
     let adapter = Arc::new(Adapter::new(
         repo,
         gateway,
         discord_config,
+        vc_pool,
         lifecycle.clone(),
         Box::new(DefaultHostSelector::from_config(&lifecycle)),
     ));

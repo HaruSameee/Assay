@@ -1,7 +1,7 @@
 //! Discord API の薄い抽象。アダプタが使う操作だけを持つ。
 //!
 //! ここにある操作がアダプタから Discord へ出る**すべて**の呼び出し。
-//! チャンネルの作成・削除・権限変更は無い（VC は読むだけ）。
+//! チャンネルの作成・削除・権限変更・メッセージの削除は無い（VC は読んで投稿するだけ）。
 //! テストでは [`Gateway`] をメモリ上の偽物に差し替える。
 
 use std::sync::Arc;
@@ -10,12 +10,12 @@ use serenity::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAllowedMentions, CreateButton, CreateInputText,
     CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateModal,
-    CreateThread, EditMessage,
+    EditMessage,
 };
 use serenity::http::Http;
 use serenity::model::application::InputTextStyle;
-use serenity::model::channel::{AutoArchiveDuration, ChannelType};
-use serenity::model::id::{ChannelId, InteractionId, MessageId, UserId};
+use serenity::model::channel::ChannelType;
+use serenity::model::id::{ChannelId, GuildId, InteractionId, MessageId, UserId};
 
 /// Discord API のエラー。リトライするかどうかは呼び出し側が決める。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -81,7 +81,7 @@ pub struct Modal {
 /// インタラクションへの応答。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractionResponse {
-    /// ボタンが付いていたメッセージを書き換える。スレッドの全員に見える。
+    /// ボタンが付いていたメッセージを書き換える。チャンネルの全員に見える。
     UpdateMessage(OutgoingMessage),
     /// 押した本人にだけ見えるメッセージ。エラーの通知に使う。
     Ephemeral(String),
@@ -103,17 +103,13 @@ pub struct InteractionRef {
 /// Discord への操作。
 #[async_trait]
 pub trait Gateway: Send + Sync {
-    /// 親チャンネルにプライベートスレッドを作る。
-    async fn create_private_thread(
+    /// ギルドのボイスチャンネル一覧（名前, ID）。起動時の名前解決に使う。
+    async fn voice_channels(
         &self,
-        parent: ChannelId,
-        name: &str,
-    ) -> Result<ChannelId, GatewayError>;
+        guild: GuildId,
+    ) -> Result<Vec<(String, ChannelId)>, GatewayError>;
 
-    /// スレッドにユーザーを追加する。
-    async fn add_thread_member(&self, thread: ChannelId, user: UserId) -> Result<(), GatewayError>;
-
-    /// メッセージを投稿する。
+    /// チャンネル（VC のテキストチャット）にメッセージを投稿する。
     async fn send_message(
         &self,
         channel: ChannelId,
@@ -214,26 +210,16 @@ fn response_builder(response: InteractionResponse) -> CreateInteractionResponse 
 
 #[async_trait]
 impl Gateway for SerenityGateway {
-    async fn create_private_thread(
+    async fn voice_channels(
         &self,
-        parent: ChannelId,
-        name: &str,
-    ) -> Result<ChannelId, GatewayError> {
-        let thread = parent
-            .create_thread(
-                &self.http,
-                CreateThread::new(name)
-                    .kind(ChannelType::PrivateThread)
-                    .invitable(false)
-                    .auto_archive_duration(AutoArchiveDuration::OneDay),
-            )
-            .await?;
-        Ok(thread.id)
-    }
-
-    async fn add_thread_member(&self, thread: ChannelId, user: UserId) -> Result<(), GatewayError> {
-        thread.add_thread_member(&self.http, user).await?;
-        Ok(())
+        guild: GuildId,
+    ) -> Result<Vec<(String, ChannelId)>, GatewayError> {
+        let channels = guild.channels(&self.http).await?;
+        Ok(channels
+            .into_values()
+            .filter(|channel| channel.kind == ChannelType::Voice)
+            .map(|channel| (channel.name, channel.id))
+            .collect())
     }
 
     async fn send_message(

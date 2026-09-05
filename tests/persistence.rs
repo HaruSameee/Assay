@@ -101,11 +101,11 @@ fn ev(kind: K, subject: Option<PlayerId>, seq: i64) -> NewEvent {
 }
 
 /// formation を作り、コード開示済み（in_progress）まで進める。
-/// スレッド ID は formation ごとに一意（部分 unique インデックスがあるため）。
+/// VC の組はどの formation も同じでよい（使い回す）。
 async fn formation_in_progress(repo: &FormationRepository, n: u128, host: PlayerId) {
     repo.create_formation(&formation(n)).await.unwrap();
     for event in [
-        NewEvent::thread_created(123_456_789_012_345_000 + n as u64, at(0), "k-0"),
+        NewEvent::vc_assigned("01", 101, 102, at(0), "k-0"),
         ev(K::HostAssigned, Some(host), 1),
         ev(K::HostAccepted, Some(host), 2),
         NewEvent::code_posted(host, "111111", at(3), "k-3"),
@@ -150,7 +150,7 @@ async fn app_role_is_denied_update_and_delete_by_privilege(owner: PgPool) {
     // アプリ用ロールでも追記とリカバリ一覧は通る
     db.repo.create_formation(&formation(1)).await.unwrap();
     db.repo
-        .append_event(fid(1), &NewEvent::thread_created(1, at(0), "k-0"))
+        .append_event(fid(1), &NewEvent::vc_assigned("01", 101, 102, at(0), "k-0"))
         .await
         .unwrap();
     assert_eq!(db.repo.list_unfinished().await.unwrap().len(), 1);
@@ -180,7 +180,7 @@ async fn created_formation_starts_matched_and_is_unfinished(owner: PgPool) {
         Err(RepositoryError::FormationNotFound(_))
     ));
     assert!(matches!(
-        repo.append_event(fid(99), &ev(K::ThreadCreated, None, 0))
+        repo.append_event(fid(99), &ev(K::VcAssigned, None, 0))
             .await,
         Err(RepositoryError::FormationNotFound(_))
     ));
@@ -230,7 +230,7 @@ async fn events_are_validated_then_persisted_in_order(owner: PgPool) {
     assert_eq!(
         kinds,
         vec![
-            K::ThreadCreated,
+            K::VcAssigned,
             K::HostAssigned,
             K::HostAccepted,
             K::CodePosted
@@ -252,9 +252,9 @@ async fn events_are_validated_then_persisted_in_order(owner: PgPool) {
     assert_eq!(snapshot.since, Some(at(3)));
     assert!(snapshot.anomalies.is_empty());
 
-    // 生の payload はそのまま保存されている（スレッド ID は文字列）
+    // 生の payload はそのまま保存されている（Discord の ID は文字列）
     let stored_payload = sqlx::query!(
-        "select payload from formation_events where formation_id = $1 and kind = 'thread_created'",
+        "select payload from formation_events where formation_id = $1 and kind = 'vc_assigned'",
         fid(1).0
     )
     .fetch_one(&db.pool)
@@ -263,7 +263,7 @@ async fn events_are_validated_then_persisted_in_order(owner: PgPool) {
     .payload;
     assert_eq!(
         stored_payload,
-        json!({ "discord_thread_id": "123456789012345001" })
+        json!({ "vc": { "label": "01", "red_channel_id": "101", "blue_channel_id": "102" } })
     );
 
     let outcome = repo
@@ -308,7 +308,7 @@ async fn same_idempotency_key_is_not_written_twice(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
     repo.create_formation(&formation(1)).await.unwrap();
-    let event = NewEvent::thread_created(1, at(0), "retry-me");
+    let event = NewEvent::vc_assigned("01", 101, 102, at(0), "retry-me");
 
     let first = repo.append_event(fid(1), &event).await.unwrap();
     let second = repo.append_event(fid(1), &event).await.unwrap();
@@ -336,7 +336,7 @@ async fn concurrent_host_assignments_are_serialized(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let repo = &db.repo;
     repo.create_formation(&formation(1)).await.unwrap();
-    repo.append_event(fid(1), &NewEvent::thread_created(1, at(0), "k-0"))
+    repo.append_event(fid(1), &NewEvent::vc_assigned("01", 101, 102, at(0), "k-0"))
         .await
         .unwrap();
 
@@ -392,7 +392,7 @@ async fn concurrent_decline_and_timeout_let_only_one_through(owner: PgPool) {
     let repo = &db.repo;
     let host = pid(1);
     repo.create_formation(&formation(1)).await.unwrap();
-    repo.append_event(fid(1), &NewEvent::thread_created(1, at(0), "k-0"))
+    repo.append_event(fid(1), &NewEvent::vc_assigned("01", 101, 102, at(0), "k-0"))
         .await
         .unwrap();
     repo.append_event(fid(1), &ev(K::HostAssigned, Some(host), 1))
@@ -443,8 +443,11 @@ async fn concurrent_identical_events_write_one_row(owner: PgPool) {
     for _ in 0..5 {
         let repo = repo.clone();
         tasks.spawn(async move {
-            repo.append_event(fid(1), &NewEvent::thread_created(1, at(0), "same-key"))
-                .await
+            repo.append_event(
+                fid(1),
+                &NewEvent::vc_assigned("01", 101, 102, at(0), "same-key"),
+            )
+            .await
         });
     }
     let mut written = 0;
@@ -493,7 +496,7 @@ async fn corrupted_log_is_still_readable_and_appendable(owner: PgPool) {
 
     // 追記は止まらない。異常は結果に載って返る
     let outcome = repo
-        .append_event(fid(1), &NewEvent::thread_created(1, at(1), "k-1"))
+        .append_event(fid(1), &NewEvent::vc_assigned("01", 101, 102, at(1), "k-1"))
         .await
         .unwrap();
     assert_eq!(
@@ -527,11 +530,11 @@ async fn list_unfinished_returns_only_non_terminal_formations_in_creation_order(
     repo.append_event(fid(3), &ev(K::Confirmed, None, 4))
         .await
         .unwrap();
-    // 4: matched → abandoned（スレッド作成失敗）
+    // 4: matched → abandoned（空いている VC が無い）
     repo.create_formation(&formation(4)).await.unwrap();
     repo.append_event(
         fid(4),
-        &NewEvent::abandoned(AbandonReason::ThreadCreationFailed, at(0), "k-0"),
+        &NewEvent::abandoned(AbandonReason::VcPoolExhausted, at(0), "k-0"),
     )
     .await
     .unwrap();
@@ -599,7 +602,7 @@ async fn reports_are_accepted_only_while_the_formation_requires_them(owner: PgPo
     ));
 
     for event in [
-        NewEvent::thread_created(1, at(0), "k-0"),
+        NewEvent::vc_assigned("01", 101, 102, at(0), "k-0"),
         ev(K::HostAssigned, Some(host), 1),
         ev(K::HostAccepted, Some(host), 2),
         NewEvent::code_posted(host, "111111", at(3), "k-3"),
@@ -709,5 +712,61 @@ async fn the_same_role_twice_in_one_team_is_rejected_by_the_database(owner: PgPo
     );
     assert_eq!(roster[0].team, Team::Red);
     assert_eq!(roster[0].role_display_name, "上キャリー");
+    db.done().await;
+}
+
+#[sqlx::test(fixtures("reference", "app_role"))]
+async fn winners_can_be_joined_with_team_equals_outcome(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let repo = &db.repo;
+    let host = pid(1);
+    formation_in_progress(repo, 1, host).await;
+
+    // red の 1 人と blue の 1 人が「red の勝ち」、blue のもう 1 人が引き分けと報告
+    for (player, outcome) in [
+        (pid(1), Outcome::Win(Team::Red)),
+        (pid(6), Outcome::Win(Team::Red)),
+        (pid(7), Outcome::Draw),
+    ] {
+        repo.append_report(&NewReport {
+            formation_id: fid(1),
+            player_id: player,
+            reported_at: at(10),
+            outcome,
+            raw_result: json!({}),
+            supersedes_id: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    // outcome の値域が formation_players.team と同じなので、勝者側は CASE 無しで結合できる
+    let winners = sqlx::query!(
+        "select fp.player_id \
+         from match_reports mr \
+         join formation_players fp on fp.formation_id = mr.formation_id and fp.team = mr.outcome \
+         where mr.formation_id = $1 and mr.player_id = $2 \
+         order by fp.player_id",
+        fid(1).0,
+        pid(1).0,
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let winners: Vec<PlayerId> = winners
+        .into_iter()
+        .map(|row| PlayerId(row.player_id))
+        .collect();
+    assert_eq!(winners, (1..=5).map(pid).collect::<Vec<_>>());
+
+    // 保存されている値は red / blue / draw そのもの
+    let stored: Vec<String> = sqlx::query_scalar!(
+        "select outcome from match_reports where formation_id = $1 order by id",
+        fid(1).0
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec!["red", "red", "draw"]);
     db.done().await;
 }
