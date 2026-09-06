@@ -104,4 +104,5 @@ jobs:
       - name: Test (isolated databases; admin connection only bootstraps them)
         run: |
           DATABASE_URL="$TEST_ADMIN_DATABASE_URL" \
-            cargo test --test persistence --test discord --test schema --test registration
+            cargo test --test persistence --test discord --test schema --test registration \
+              --test queue --test matchmaker --test rating
