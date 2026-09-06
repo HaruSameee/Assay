@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into discord_failures (formation_id, formation_event_id, source_index, kind, operation, error, attempts, context, occurred_at) values ($1, $2, $3, $4, $5, $6, $7, jsonb_build_object('source', 'formation_event_payload'), $8)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "205245f4af3c43b6ac2ca4ee5abe56633c9d167e7efd02bdc7b7e22dec767432"
+}

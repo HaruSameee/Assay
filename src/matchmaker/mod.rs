@@ -20,7 +20,7 @@ pub mod repository;
 pub mod runner;
 pub mod select;
 
-pub use repository::{MatchmakerRepository, RunOutcome};
+pub use repository::{AssignedFormation, MatchmakerRepository, MatchmakerSummary, RunOutcome};
 pub use runner::{Matchmaker, MatchmakerConfig, MatchmakerConfigError};
 pub use select::{
     Candidate, MATCH_SIZE, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch,

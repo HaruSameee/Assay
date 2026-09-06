@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*)::bigint as \"count!\" from formations where created_at > $1::timestamptz - interval '15 minutes' and created_at <= $1::timestamptz",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b150ea4a12c0501ae758162de8a3411cb19b1b1be0017439de2f0a88021b9009"
+}

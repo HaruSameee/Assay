@@ -45,9 +45,11 @@ use crate::lifecycle::{
     FormationId, FormationPlayer, FormationState, HostAction, HostSelector, LifecycleConfig,
     PlayerId, apply, next_deadline, next_host_action,
 };
+use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{
-    FormationLog, FormationRepository, NewEvent, NewReport, Outcome, ReportDecision,
-    RepositoryError, RosterEntry, Team, UnfinishedFormation, VcAssignment, VcAssignmentOutcome,
+    FormationLog, FormationRepository, NewDiscordFailure, NewEvent, NewReport, Outcome,
+    ReportDecision, RepositoryError, RosterEntry, Team, UnfinishedFormation, VcAssignment,
+    VcAssignmentOutcome,
 };
 
 use super::config::DiscordConfig;
@@ -159,6 +161,78 @@ impl Adapter {
     /// VC プール。
     pub fn vc_pool(&self) -> &VcPool {
         &self.vc_pool
+    }
+
+    /// 成立があった1回分だけ、運営専用チャンネルへマッチメイカ結果を投稿する。
+    ///
+    /// formation は呼び出し前にコミット済み。投稿失敗は監査ログへ追記して `Ok` にし、
+    /// 成立や次回のマッチメイカ実行を巻き戻さない。
+    pub async fn publish_matchmaker_run_log(
+        &self,
+        outcome: &RunOutcome,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> Result<(), AdapterError> {
+        if outcome.assignments.is_empty() {
+            return Ok(());
+        }
+        let context = serde_json::json!({
+            "formed": outcome.assignments.iter().map(|assigned| assigned.formation_id.to_string()).collect::<Vec<_>>(),
+            "queued": outcome.candidates,
+            "vc_exhausted": outcome.vc_exhausted,
+        });
+        self.publish_operational_log(
+            "matchmaker_run_log",
+            render::matchmaker_run_log(outcome, occurred_at),
+            context,
+            occurred_at,
+        )
+        .await
+    }
+
+    /// 成立の有無にかかわらず、15分ごとの運用サマリを投稿する。
+    pub async fn publish_matchmaker_summary(
+        &self,
+        summary: &MatchmakerSummary,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> Result<(), AdapterError> {
+        self.publish_operational_log(
+            "matchmaker_summary",
+            render::matchmaker_summary(summary, occurred_at),
+            serde_json::json!({ "window_minutes": 15 }),
+            occurred_at,
+        )
+        .await
+    }
+
+    async fn publish_operational_log(
+        &self,
+        kind: &str,
+        message: OutgoingMessage,
+        context: serde_json::Value,
+        occurred_at: chrono::DateTime<Utc>,
+    ) -> Result<(), AdapterError> {
+        let operation = format!("send:{kind}");
+        if let Err(failure) = self
+            .retry(&operation, || {
+                self.gateway
+                    .send_message(self.config.matchmaker_log_channel_id, &message)
+            })
+            .await
+        {
+            error!(kind, error = %failure.error, "matchmaker Discord log failed; loop continues");
+            self.repo
+                .append_discord_failure(&NewDiscordFailure {
+                    formation_id: None,
+                    kind: kind.to_owned(),
+                    operation: failure.operation,
+                    error: failure.error,
+                    attempts: i32::try_from(failure.attempts).unwrap_or(i32::MAX),
+                    context,
+                    occurred_at,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// 起動時と定期走査時に、未終了の formation をイベント時刻から再開する唯一の入口。

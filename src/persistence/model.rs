@@ -356,6 +356,25 @@ pub struct StoredEvent {
     pub payload: Value,
 }
 
+/// Discord API 呼び出し失敗の横断監査ログへ追記する値。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewDiscordFailure {
+    /// 関連する formation。15 分サマリのように formation が無ければ `None`。
+    pub formation_id: Option<FormationId>,
+    /// 運用上の種別。緊急度ごとに絞り込める安定した値を使う。
+    pub kind: String,
+    /// 実際に失敗した操作。
+    pub operation: String,
+    /// Discord API のエラー。
+    pub error: String,
+    /// 試行回数。
+    pub attempts: i32,
+    /// 秘密値を含めない構造化コンテキスト。
+    pub context: Value,
+    /// 失敗時刻。
+    pub occurred_at: Timestamp,
+}
+
 /// formation の参加者 1 人分の編成（`formation_players` に `players` / `roles` を結合したもの）。
 ///
 /// Discord アダプタが割り当て表を作り、インタラクションの押下者を照合するのに使う。
@@ -365,6 +384,8 @@ pub struct RosterEntry {
     pub player_id: PlayerId,
     /// `players.discord_user_id`。
     pub discord_user_id: i64,
+    /// 他の参加者へ表示するトレーナー名。
+    pub trainer_name: Option<String>,
     /// チーム。
     pub team: Team,
     /// ロール（`roles.id`）。

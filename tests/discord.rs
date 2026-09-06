@@ -267,6 +267,7 @@ fn config() -> DiscordConfig {
         guild_id: GUILD,
         dispute_channel_id: ChannelId::new(999),
         summon_channel_id: ChannelId::new(998),
+        matchmaker_log_channel_id: ChannelId::new(997),
         vc_pool_size: 1,
         room_map: "kyogre".into(),
         room_checklist: vec!["設定 A".into(), "設定 B".into()],
@@ -529,7 +530,8 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     assert_eq!(assignment, fake.message(vc.blue, blue_assignment));
     assert!(assignment.content.starts_with("**[vc1] "));
     assert!(assignment.content.contains("match-"));
-    assert_eq!(assignment.mention_users.len(), 10);
+    assert!(assignment.mention_users.is_empty());
+    assert!(!assignment.content.contains("<@"));
     assert!(assignment.content.contains("vc1-red"));
     assert!(assignment.content.contains("vc1-blue"));
     assert!(assignment.content.contains("<#101>"));
@@ -1729,10 +1731,87 @@ async fn a_failed_summon_is_recorded_without_abandoning_the_formation(owner: PgP
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0][OPERATION_KEY], "send:summon");
     assert_eq!(failures[0][ATTEMPTS_KEY], 3);
+    let indexed = sqlx::query!(
+        "select kind, operation from discord_failures where formation_id = $1",
+        fid(1).0,
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(indexed.kind, "summon_notification");
+    assert_eq!(indexed.operation, "send:summon");
     assert!(
         !kinds(&log).contains(&K::Abandoned),
         "notification failure is not a formation failure"
     );
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn matchmaker_logs_skip_empty_runs_and_failures_do_not_discard_formations(owner: PgPool) {
+    use unite_matchsystem::matchmaker::{AssignedFormation, MatchmakerSummary, RunOutcome};
+
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let now = Utc::now();
+
+    adapter
+        .publish_matchmaker_run_log(&RunOutcome::default(), now)
+        .await
+        .unwrap();
+    assert_eq!(fake.total_sends(), 0, "成立0の回は投稿しない");
+
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    fake.fail_send_channel.store(997, Ordering::SeqCst);
+    let outcome = RunOutcome {
+        candidates: 10,
+        created: vec![fid(1)],
+        assignments: vec![AssignedFormation {
+            formation_id: fid(1),
+            vc: VcAssignment {
+                label: "1".into(),
+                red_channel_id: 101,
+                blue_channel_id: 102,
+            },
+        }],
+        vc_exhausted: false,
+        unmatched: 0,
+        longest_unmatched_wait_seconds: None,
+    };
+    adapter
+        .publish_matchmaker_run_log(&outcome, now)
+        .await
+        .unwrap();
+    adapter
+        .publish_matchmaker_summary(
+            &MatchmakerSummary {
+                queued: 0,
+                formed_last_15_minutes: 1,
+                median_wait_seconds: None,
+                longest_wait_seconds: None,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+
+    let formation_count: i64 = sqlx::query_scalar!("select count(*) from formations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(formation_count, 1, "Discordログ失敗でformationを捨てない");
+    let kinds = sqlx::query_scalar!(
+        "select kind from discord_failures where formation_event_id is null order by id"
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(kinds, ["matchmaker_run_log", "matchmaker_summary"]);
     db.done().await;
 }
 
