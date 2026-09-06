@@ -45,6 +45,8 @@ async fn append_only_privileges_and_triggers_are_wired(owner: sqlx::PgPool) {
         "delete from formation_events",
         "update match_reports set id = id",
         "delete from match_reports",
+        "update discord_failures set id = id",
+        "delete from discord_failures",
     ] {
         for (pool, expected) in [(&app, "42501"), (&owner, "0A000")] {
             let error = sqlx::query(sql).execute(pool).await.unwrap_err();

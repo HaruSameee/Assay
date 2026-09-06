@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::lifecycle::{FormationId, Timestamp};
 use crate::persistence::{RepositoryError, VcAssignment};
 
-use super::repository::{MatchmakerRepository, RunOutcome};
+use super::repository::{MatchmakerRepository, MatchmakerSummary, RunOutcome};
 
 /// 実行間隔の環境変数。**当日の校正対象**（07 §4-1）。
 pub const INTERVAL_SECONDS: &str = "MATCHMAKER_INTERVAL_SECONDS";
@@ -124,6 +124,11 @@ impl Matchmaker {
         next_id: &mut dyn FnMut() -> FormationId,
     ) -> Result<RunOutcome, RepositoryError> {
         self.repo.run_once_with(&self.vc_pool, now, next_id).await
+    }
+
+    /// Discord の 15 分サマリ用に、永続化されたキューと formation を集計する。
+    pub async fn summary(&self, now: Timestamp) -> Result<MatchmakerSummary, RepositoryError> {
+        self.repo.summary(now).await
     }
 }
 

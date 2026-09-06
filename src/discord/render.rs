@@ -10,6 +10,7 @@ use chrono::FixedOffset;
 use serenity::model::id::UserId;
 
 use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
+use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
 
 use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
@@ -72,7 +73,6 @@ pub fn assignment(
 ) -> OutgoingMessage {
     let mut content = String::from(heading);
     content.push_str("## 割り当て表\n");
-    let mut mention_users = Vec::with_capacity(roster.len());
     for team in Team::ALL {
         content.push_str(&format!(
             "{} **{}** — {}\n",
@@ -88,19 +88,16 @@ pub fn assignment(
                 .then_with(|| a.player_id.cmp(&b.player_id))
         });
         for entry in members {
-            if let Some(user) = user_of(entry) {
-                mention_users.push(user);
-                content.push_str(&format!(
-                    "- {} — {}\n",
-                    mention(user),
-                    entry.role_display_name
-                ));
-            } else {
-                content.push_str(&format!(
-                    "- （不明なユーザー） — {}\n",
-                    entry.role_display_name
-                ));
-            }
+            let name = entry
+                .trainer_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("（名前未登録）");
+            content.push_str(&format!(
+                "- {} — {}\n",
+                plain_discord_text(name),
+                entry.role_display_name
+            ));
         }
     }
     content.push_str("\n## 部屋設定\n");
@@ -111,8 +108,77 @@ pub fn assignment(
     OutgoingMessage {
         content,
         buttons: Vec::new(),
-        mention_users,
+        mention_users: Vec::new(),
     }
+}
+
+/// 表示名を1行の平文にする。Discord の mention 構文を本文へ持ち込まない。
+fn plain_discord_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' => ' ',
+            '<' => '＜',
+            '>' => '＞',
+            character => character,
+        })
+        .collect()
+}
+
+/// 成立があった1回分のマッチメイカ運用ログ。
+pub fn matchmaker_run_log(outcome: &RunOutcome, at: Timestamp) -> OutgoingMessage {
+    let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
+    let mut content = format!(
+        "**マッチメイカ実行 {} JST**\nキュー中: {}人\n成立: {}組\n",
+        at.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
+        outcome.candidates,
+        outcome.assignments.len()
+    );
+    for assigned in &outcome.assignments {
+        content.push_str(&format!(
+            "- {} → vc{} (<#{}> / <#{}>)\n",
+            match_label(assigned.formation_id),
+            assigned.vc.label,
+            assigned.vc.red_channel_id,
+            assigned.vc.blue_channel_id
+        ));
+    }
+    content.push_str(&format!(
+        "VC枯渇: {}\n未成立: {}人\n最長待ち: {}",
+        if outcome.vc_exhausted {
+            "あり"
+        } else {
+            "なし"
+        },
+        outcome.unmatched,
+        wait_minutes(outcome.longest_unmatched_wait_seconds)
+    ));
+    OutgoingMessage {
+        content,
+        buttons: Vec::new(),
+        mention_users: Vec::new(),
+    }
+}
+
+/// 15分ごとのマッチメイカ運用サマリ。
+pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> OutgoingMessage {
+    let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
+    OutgoingMessage {
+        content: format!(
+            "**マッチメイカ 15分サマリ {} JST**\nキュー中: {}人\n直近15分の成立: {}組\n待ち時間: 中央値 {} / 最長 {}",
+            at.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
+            summary.queued,
+            summary.formed_last_15_minutes,
+            wait_minutes(summary.median_wait_seconds),
+            wait_minutes(summary.longest_wait_seconds)
+        ),
+        buttons: Vec::new(),
+        mention_users: Vec::new(),
+    }
+}
+
+fn wait_minutes(seconds: Option<u64>) -> String {
+    seconds.map_or_else(|| "なし".to_owned(), |value| format!("{}分", value / 60))
 }
 
 /// 公開招集チャンネルに出す、成立通知と行き先だけのメッセージ。
@@ -463,6 +529,7 @@ mod tests {
             .map(|n| RosterEntry {
                 player_id: PlayerId(Uuid::from_u128(n)),
                 discord_user_id: 1000 + n as i64,
+                trainer_name: Some(format!("トレーナー{n}")),
                 team: if n <= 5 { Team::Red } else { Team::Blue },
                 role: format!("role{}", n % 5),
                 role_display_name: format!("ロール{}", n % 5),
@@ -566,7 +633,11 @@ mod tests {
     #[test]
     fn assignment_lists_all_ten_players_and_inserts_the_map_first() {
         let message = assignment(&head(), &roster(), &vc(), "kyogre", &["設定 A".to_owned()]);
-        assert_eq!(message.mention_users.len(), 10);
+        assert!(message.mention_users.is_empty());
+        assert!(!message.content.contains("<@"), "{}", message.content);
+        for n in 1..=10 {
+            assert!(message.content.contains(&format!("トレーナー{n}")));
+        }
         assert!(message.content.contains("**red**"));
         assert!(message.content.contains("**blue**"));
         assert!(message.content.contains("vc3-red"));
@@ -580,9 +651,19 @@ mod tests {
         let blue = message.content.find("**blue**").unwrap();
         assert!(red < blue);
         // red チーム内はロールの表示順（ロール0 が先頭）
-        let first_red = message.content[red..blue].find("<@1005>").unwrap();
-        let second_red = message.content[red..blue].find("<@1001>").unwrap();
+        let first_red = message.content[red..blue].find("トレーナー5").unwrap();
+        let second_red = message.content[red..blue].find("トレーナー1").unwrap();
         assert!(first_red < second_red);
+    }
+
+    #[test]
+    fn assignment_neutralizes_mention_syntax_in_trainer_names() {
+        let mut roster = roster();
+        roster[0].trainer_name = Some("<@123>\n@everyone".into());
+        let message = assignment(&head(), &roster, &vc(), "kyogre", &[]);
+        assert!(!message.content.contains("<@"), "{}", message.content);
+        assert!(message.content.contains("＜@123＞ @everyone"));
+        assert!(message.mention_users.is_empty());
     }
 
     /// **チーム別に 1 行ずつ。**自分がどちらの VC へ行くのかが一目で分かること。
@@ -613,6 +694,94 @@ mod tests {
             (1001..=1010).map(UserId::new).collect::<Vec<_>>()
         );
         assert!(message.buttons.is_empty());
+    }
+
+    #[test]
+    fn matchmaker_logs_do_not_contain_ratings_or_role_assignments() {
+        use crate::matchmaker::{AssignedFormation, MatchmakerSummary, RunOutcome};
+        use crate::persistence::VcAssignment;
+
+        let outcome = RunOutcome {
+            candidates: 23,
+            created: vec![formation()],
+            assignments: vec![AssignedFormation {
+                formation_id: formation(),
+                vc: VcAssignment {
+                    label: "3".into(),
+                    red_channel_id: 31,
+                    blue_channel_id: 32,
+                },
+            }],
+            vc_exhausted: false,
+            unmatched: 13,
+            longest_unmatched_wait_seconds: Some(12 * 60),
+        };
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
+        let run = matchmaker_run_log(&outcome, at);
+        let summary = matchmaker_summary(
+            &MatchmakerSummary {
+                queued: 13,
+                formed_last_15_minutes: 1,
+                median_wait_seconds: Some(6 * 60),
+                longest_wait_seconds: Some(18 * 60),
+            },
+            at,
+        );
+        assert!(run.content.contains("vc3 (<#31> / <#32>)"));
+        assert!(summary.content.contains("中央値 6分 / 最長 18分"));
+        for message in [run, summary] {
+            for forbidden in ["レート", "ロール", "top_carry", "上キャリー", "1500"] {
+                assert!(!message.content.contains(forbidden), "{}", message.content);
+            }
+            assert!(message.mention_users.is_empty());
+        }
+    }
+
+    /// レビュー用に、今回変更した4種類の文面をそのまま出す。
+    #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
+    #[test]
+    fn dump_discord_tuning_messages_for_review() {
+        use crate::matchmaker::{AssignedFormation, MatchmakerSummary, RunOutcome};
+        use crate::persistence::VcAssignment;
+
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
+        let outcome = RunOutcome {
+            candidates: 23,
+            created: vec![formation()],
+            assignments: vec![AssignedFormation {
+                formation_id: formation(),
+                vc: VcAssignment {
+                    label: "3".into(),
+                    red_channel_id: 31,
+                    blue_channel_id: 32,
+                },
+            }],
+            vc_exhausted: false,
+            unmatched: 13,
+            longest_unmatched_wait_seconds: Some(12 * 60),
+        };
+        let summary = MatchmakerSummary {
+            queued: 13,
+            formed_last_15_minutes: 1,
+            median_wait_seconds: Some(6 * 60),
+            longest_wait_seconds: Some(18 * 60),
+        };
+        println!(
+            "========== 割り当て表 ==========\n{}",
+            assignment(&head(), &roster(), &vc(), "kyogre", &["設定 A".into()]).content
+        );
+        println!(
+            "========== 招集通知 ==========\n{}",
+            summon(&roster(), &vc()).content
+        );
+        println!(
+            "========== 成立時ログ ==========\n{}",
+            matchmaker_run_log(&outcome, at).content
+        );
+        println!(
+            "========== 15分サマリ ==========\n{}",
+            matchmaker_summary(&summary, at).content
+        );
     }
 
     /// レビュー用に招集の文面をそのまま出す。

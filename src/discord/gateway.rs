@@ -166,6 +166,7 @@ fn components(buttons: &[Button]) -> Vec<CreateActionRow> {
 fn allowed_mentions(users: &[UserId]) -> CreateAllowedMentions {
     // 既定は「誰にも通知しない」。列挙したユーザーにだけ通知する。
     CreateAllowedMentions::new()
+        .everyone(false)
         .empty_roles()
         .users(users.iter().copied())
 }

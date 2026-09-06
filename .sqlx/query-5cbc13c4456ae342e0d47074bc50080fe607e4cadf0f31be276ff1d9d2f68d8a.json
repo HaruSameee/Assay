@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select fp.player_id, p.discord_user_id, fp.team, fp.role, r.display_name as role_display_name, r.sort_order as role_sort_order, fp.mu_at_match from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role where fp.formation_id = $1 order by fp.team = $2 desc, r.sort_order, fp.player_id",
+  "query": "select fp.player_id, p.discord_user_id, p.trainer_name, fp.team, fp.role, r.display_name as role_display_name, r.sort_order as role_sort_order, fp.mu_at_match from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role where fp.formation_id = $1 order by fp.team = $2 desc, r.sort_order, fp.player_id",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,17 @@
       },
       {
         "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
         "name": "team",
         "type_info": "Text",
         "origin": {
@@ -37,7 +48,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "role",
         "type_info": "Text",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "role_display_name",
         "type_info": "Text",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "role_sort_order",
         "type_info": "Int4",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "mu_at_match",
         "type_info": "Float8",
         "origin": {
@@ -90,6 +101,7 @@
     "nullable": [
       false,
       false,
+      true,
       false,
       false,
       false,
@@ -97,5 +109,5 @@
       false
     ]
   },
-  "hash": "abda1a6c3138491625ef820a9a6d4d4e368a9b2d1048011078b09f5a34bf2ac8"
+  "hash": "5cbc13c4456ae342e0d47074bc50080fe607e4cadf0f31be276ff1d9d2f68d8a"
 }

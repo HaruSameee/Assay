@@ -34,8 +34,8 @@ pub use codec::{
 };
 pub use error::RepositoryError;
 pub use model::{
-    AppendOutcome, AppendReportOutcome, EventId, FormationLog, NewEvent, NewFormation,
-    NewFormationPlayer, NewReport, Outcome, ReportId, RosterEntry, StoredEvent, Team,
+    AppendOutcome, AppendReportOutcome, EventId, FormationLog, NewDiscordFailure, NewEvent,
+    NewFormation, NewFormationPlayer, NewReport, Outcome, ReportId, RosterEntry, StoredEvent, Team,
     UnfinishedFormation, UnreadableRow, VcAssignment,
 };
 pub(crate) use model::{ReportDecision, ReportVote};

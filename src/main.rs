@@ -110,6 +110,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ));
     handler.attach(adapter.clone());
     let timeout_adapter = adapter.clone();
+    let matchmaker_log_adapter = adapter.clone();
 
     // 認証設定が欠けていたら起動しない（本番で「ログインだけ無い」状態を作らない）
     let auth = AuthState::new(
@@ -167,6 +168,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 遅れを取り戻すために連続で走らせない（Delay）。同時実行は DB の advisory lock が防ぐ。
     let mut matchmaker_scan = tokio::time::interval(matchmaker.interval());
     matchmaker_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut matchmaker_summary = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(15 * 60),
+        Duration::from_secs(15 * 60),
+    );
+    matchmaker_summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!(
         interval_seconds = matchmaker.interval().as_secs(),
         "matchmaker loop started"
@@ -198,14 +204,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ = matchmaker_scan.tick() => {
                 // 成立した formation は `vc_assigned` まで書かれた状態でコミットされる。
                 // 割り当て表とホスト打診は上の `resume_unfinished` が出す（入口を 2 つ作らない）
-                match matchmaker.run_once(chrono::Utc::now()).await {
-                    Ok(outcome) => info!(
-                        queued = outcome.candidates,
-                        formed = outcome.created.len(),
-                        vc_exhausted = outcome.vc_exhausted,
-                        "matchmaker run finished"
-                    ),
+                let now = chrono::Utc::now();
+                match matchmaker.run_once(now).await {
+                    Ok(outcome) => {
+                        info!(
+                            queued = outcome.candidates,
+                            formed = outcome.created.len(),
+                            vc_exhausted = outcome.vc_exhausted,
+                            "matchmaker run finished"
+                        );
+                        if let Err(error) = matchmaker_log_adapter
+                            .publish_matchmaker_run_log(&outcome, now)
+                            .await
+                        {
+                            error!(%error, "could not record matchmaker Discord log failure");
+                        }
+                    }
                     Err(error) => error!(%error, "matchmaker run failed"),
+                }
+            }
+            _ = matchmaker_summary.tick() => {
+                let now = chrono::Utc::now();
+                match matchmaker.summary(now).await {
+                    Ok(summary) => {
+                        if let Err(error) = matchmaker_log_adapter
+                            .publish_matchmaker_summary(&summary, now)
+                            .await
+                        {
+                            error!(%error, "could not record matchmaker summary Discord failure");
+                        }
+                    }
+                    Err(error) => error!(%error, "matchmaker summary query failed"),
                 }
             }
             _ = tokio::signal::ctrl_c() => {

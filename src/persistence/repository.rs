@@ -12,9 +12,9 @@ use crate::lifecycle::{
 use super::codec::{EventRow, decode_row};
 use super::error::RepositoryError;
 use super::model::{
-    AppendOutcome, AppendReportOutcome, EventId, FormationLog, NewEvent, NewFormation, NewReport,
-    Outcome, ReportDecision, ReportEvaluation, ReportEvidence, ReportId, ReportVote, RosterEntry,
-    Team, UnfinishedFormation, VcAssignment,
+    AppendOutcome, AppendReportOutcome, EventId, FormationLog, NewDiscordFailure, NewEvent,
+    NewFormation, NewReport, Outcome, ReportDecision, ReportEvaluation, ReportEvidence, ReportId,
+    ReportVote, RosterEntry, Team, UnfinishedFormation, VcAssignment,
 };
 use super::reporting::{confirmation_from_latest_reports, first_report_agreement_counts};
 
@@ -113,7 +113,7 @@ impl FormationRepository {
         formation_id: FormationId,
     ) -> Result<Vec<RosterEntry>, RepositoryError> {
         let rows = sqlx::query!(
-            "select fp.player_id, p.discord_user_id, fp.team, fp.role, \
+            "select fp.player_id, p.discord_user_id, p.trainer_name, fp.team, fp.role, \
                     r.display_name as role_display_name, r.sort_order as role_sort_order, \
                     fp.mu_at_match \
              from formation_players fp \
@@ -137,6 +137,7 @@ impl FormationRepository {
                 Ok(RosterEntry {
                     player_id: PlayerId(row.player_id),
                     discord_user_id: row.discord_user_id,
+                    trainer_name: row.trainer_name,
                     team,
                     role: row.role,
                     role_display_name: row.role_display_name,
@@ -355,6 +356,28 @@ impl FormationRepository {
         let outcome = append_locked(&mut tx, formation_id, event, log).await?;
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// formation を持たないものも含む Discord API 呼び出し失敗を追記する。
+    pub async fn append_discord_failure(
+        &self,
+        failure: &NewDiscordFailure,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query!(
+            "insert into discord_failures \
+             (formation_id, kind, operation, error, attempts, context, occurred_at) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+            failure.formation_id.map(|id| id.0),
+            failure.kind,
+            failure.operation,
+            failure.error,
+            failure.attempts,
+            failure.context,
+            failure.occurred_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 未終了の formation を `created_at` 順に返す（起動時のリカバリ用）。
@@ -811,12 +834,95 @@ pub(crate) async fn append_locked(
     )
     .fetch_one(&mut *conn)
     .await?;
+    index_discord_failures(
+        conn,
+        formation_id,
+        EventId(inserted.id),
+        event.occurred_at,
+        &event.payload,
+    )
+    .await?;
     Ok(AppendOutcome {
         event_id: EventId(inserted.id),
         state: next,
         already_recorded: false,
         anomalies: snapshot.anomalies,
     })
+}
+
+async fn index_discord_failures(
+    conn: &mut PgConnection,
+    formation_id: FormationId,
+    event_id: EventId,
+    occurred_at: Timestamp,
+    payload: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    let Some(failures) = payload
+        .get("discord_failures")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (source_index, failure) in failures.iter().enumerate() {
+        let Some(operation) = failure
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(error) = failure
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let attempts = failure
+            .get("attempts")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let source_index = i32::try_from(source_index).unwrap_or(i32::MAX);
+        let kind = discord_failure_kind(operation);
+        sqlx::query!(
+            "insert into discord_failures \
+             (formation_id, formation_event_id, source_index, kind, operation, error, attempts, context, occurred_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, jsonb_build_object('source', 'formation_event_payload'), $8)",
+            formation_id.0,
+            event_id.0,
+            source_index,
+            kind,
+            operation,
+            error,
+            attempts,
+            occurred_at,
+        )
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+fn discord_failure_kind(operation: &str) -> &'static str {
+    if operation.contains("summon") {
+        "summon_notification"
+    } else if operation.contains("assignment") {
+        "assignment_table"
+    } else if operation.contains("host_prompt") {
+        "host_prompt"
+    } else if operation.contains("code") {
+        "room_code"
+    } else if operation.contains("report") {
+        "report_prompt"
+    } else if operation.contains("dispute") {
+        "dispute_notification"
+    } else if operation.starts_with("respond:") {
+        "interaction_response"
+    } else {
+        "formation_discord_call"
+    }
 }
 
 /// プール共有資源を直列化する。formation ロックより先に取り、ロック順を一意にする。

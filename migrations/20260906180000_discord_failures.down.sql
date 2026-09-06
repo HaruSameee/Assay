@@ -1,0 +1,2 @@
+drop trigger discord_failures_forbid_update_delete on discord_failures;
+drop table discord_failures;

@@ -18,6 +18,8 @@ pub mod keys {
     pub const DISPUTE_CHANNEL_ID: &str = "DISCORD_DISPUTE_CHANNEL_ID";
     /// マッチ成立時に参加者10人を呼び出す公開チャンネル。
     pub const SUMMON_CHANNEL_ID: &str = "DISCORD_SUMMON_CHANNEL_ID";
+    /// マッチメイカ実行結果を投稿する運営専用チャンネル。
+    pub const MATCHMAKER_LOG_CHANNEL_ID: &str = "DISCORD_MATCHMAKER_LOG_CHANNEL_ID";
     /// VC の組の個数。`vc1-red` … `vc<N>-blue` を起動時に名前で引く。
     pub const VC_POOL_SIZE: &str = "DISCORD_VC_POOL_SIZE";
     /// 今シーズンのマップ（ランクマのローテで変わる唯一の項目）。
@@ -63,6 +65,8 @@ pub struct DiscordConfig {
     pub dispute_channel_id: ChannelId,
     /// マッチ成立時の招集を投稿する公開チャンネル。
     pub summon_channel_id: ChannelId,
+    /// マッチメイカの実行ログと15分サマリを投稿する運営専用チャンネル。
+    pub matchmaker_log_channel_id: ChannelId,
     /// VC の組の個数（`vc1` … `vc<N>`）。
     pub vc_pool_size: usize,
     /// 今シーズンのマップ。チェックリストの先頭に差し込む。CHECK 制約や enum にはしない。
@@ -101,10 +105,23 @@ impl DiscordConfig {
             keys::SUMMON_CHANNEL_ID,
             &required_from(&mut source, keys::SUMMON_CHANNEL_ID)?,
         )?);
+        let matchmaker_log_channel_id = ChannelId::new(parse_id(
+            keys::MATCHMAKER_LOG_CHANNEL_ID,
+            &required_from(&mut source, keys::MATCHMAKER_LOG_CHANNEL_ID)?,
+        )?);
         if summon_channel_id == dispute_channel_id {
             return Err(ConfigError::Invalid {
                 name: keys::SUMMON_CHANNEL_ID,
                 reason: "must differ from DISCORD_DISPUTE_CHANNEL_ID".into(),
+            });
+        }
+        if matchmaker_log_channel_id == dispute_channel_id
+            || matchmaker_log_channel_id == summon_channel_id
+        {
+            return Err(ConfigError::Invalid {
+                name: keys::MATCHMAKER_LOG_CHANNEL_ID,
+                reason: "must differ from DISCORD_DISPUTE_CHANNEL_ID and DISCORD_SUMMON_CHANNEL_ID"
+                    .into(),
             });
         }
         Ok(Self {
@@ -115,6 +132,7 @@ impl DiscordConfig {
             )?),
             dispute_channel_id,
             summon_channel_id,
+            matchmaker_log_channel_id,
             vc_pool_size,
             room_map: required_from(&mut source, keys::ROOM_MAP)?
                 .trim()
@@ -188,6 +206,7 @@ mod tests {
             (keys::GUILD_ID, "100".into()),
             (keys::DISPUTE_CHANNEL_ID, "200".into()),
             (keys::SUMMON_CHANNEL_ID, "300".into()),
+            (keys::MATCHMAKER_LOG_CHANNEL_ID, "400".into()),
             (keys::VC_POOL_SIZE, "20".into()),
             (keys::ROOM_MAP, "kyogre".into()),
             (keys::ROOM_CHECKLIST, "設定 A;設定 B".into()),
@@ -218,6 +237,31 @@ mod tests {
             DiscordConfig::from_source(|name| values.get(name).cloned()).unwrap_err(),
             ConfigError::Missing(keys::SUMMON_CHANNEL_ID)
         );
+    }
+
+    #[test]
+    fn the_matchmaker_log_channel_is_required_at_startup() {
+        let mut values = complete_values();
+        values.remove(keys::MATCHMAKER_LOG_CHANNEL_ID);
+        assert_eq!(
+            DiscordConfig::from_source(|name| values.get(name).cloned()).unwrap_err(),
+            ConfigError::Missing(keys::MATCHMAKER_LOG_CHANNEL_ID)
+        );
+    }
+
+    #[test]
+    fn matchmaker_logs_cannot_share_public_or_dispute_channels() {
+        for duplicate in ["200", "300"] {
+            let mut values = complete_values();
+            values.insert(keys::MATCHMAKER_LOG_CHANNEL_ID, duplicate.into());
+            assert!(matches!(
+                DiscordConfig::from_source(|name| values.get(name).cloned()),
+                Err(ConfigError::Invalid {
+                    name: keys::MATCHMAKER_LOG_CHANNEL_ID,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

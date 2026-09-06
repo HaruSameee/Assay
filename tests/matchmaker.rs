@@ -272,7 +272,10 @@ async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
         RunOutcome {
             candidates: 9,
             created: Vec::new(),
+            assignments: Vec::new(),
             vc_exhausted: false,
+            unmatched: 9,
+            longest_unmatched_wait_seconds: Some(600),
         }
     );
     assert_eq!(count(&db, "formations").await, 0);
@@ -281,6 +284,41 @@ async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
         9,
         "nobody left the queue"
     );
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn summary_uses_the_persisted_queue_and_last_fifteen_minutes(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 12).await;
+    enqueue_full_rosters(&db, 10, at(0)).await;
+    let matchmaker = db.matchmaker(2);
+    matchmaker.run_once(at(600)).await.unwrap();
+
+    for (number, role, enqueued_at) in [(11, ROLES[0], at(300)), (12, ROLES[1], at(540))] {
+        db.queue
+            .enqueue(
+                player(number),
+                &QueueRequest {
+                    down_range: 95,
+                    roles: vec![RolePreference {
+                        role: role.to_owned(),
+                        priority: 1,
+                    }],
+                },
+                enqueued_at,
+            )
+            .await
+            .unwrap();
+    }
+    let summary = matchmaker.summary(at(600)).await.unwrap();
+    assert_eq!(summary.queued, 2);
+    assert_eq!(summary.formed_last_15_minutes, 1);
+    assert_eq!(summary.median_wait_seconds, Some(180));
+    assert_eq!(summary.longest_wait_seconds, Some(300));
     db.done().await;
 }
 

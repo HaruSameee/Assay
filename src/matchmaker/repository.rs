@@ -40,8 +40,30 @@ pub struct RunOutcome {
     pub candidates: usize,
     /// 確定した formation。
     pub created: Vec<FormationId>,
+    /// 確定した formation と割り当てた VC。運用ログの表示にだけ使う。
+    pub assignments: Vec<AssignedFormation>,
     /// VC の空きが無くて確定を打ち切ったか。**枯渇はログに残す**（00 §6）。
     pub vc_exhausted: bool,
+    /// 今回見た候補のうち成立しなかった人数。
+    pub unmatched: usize,
+    /// 成立しなかった候補の最長待ち時間（秒）。
+    pub longest_unmatched_wait_seconds: Option<u64>,
+}
+
+/// 成立した formation と、そのトランザクションで永続化した VC 割当。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignedFormation {
+    pub formation_id: FormationId,
+    pub vc: VcAssignment,
+}
+
+/// 15 分ごとの運用サマリ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchmakerSummary {
+    pub queued: usize,
+    pub formed_last_15_minutes: usize,
+    pub median_wait_seconds: Option<u64>,
+    pub longest_wait_seconds: Option<u64>,
 }
 
 /// マッチメイカの永続化。接続はアプリ用ロールを想定する。
@@ -72,6 +94,8 @@ impl MatchmakerRepository {
         let candidates = load_candidates(&mut tx).await?;
         let mut outcome = RunOutcome {
             candidates: candidates.len(),
+            unmatched: candidates.len(),
+            longest_unmatched_wait_seconds: longest_wait(&candidates, now),
             ..RunOutcome::default()
         };
         let proposals = select_matches(&candidates, now);
@@ -139,10 +163,74 @@ impl MatchmakerRepository {
                 "match formed"
             );
             outcome.created.push(formation_id);
+            outcome.assignments.push(AssignedFormation {
+                formation_id,
+                vc: assignment,
+            });
         }
+
+        let matched: HashSet<PlayerId> = proposals
+            .iter()
+            .take(outcome.created.len())
+            .flat_map(|proposal| proposal.players.iter().map(|player| player.player_id))
+            .collect();
+        let unmatched: Vec<Candidate> = candidates
+            .into_iter()
+            .filter(|candidate| !matched.contains(&candidate.player_id))
+            .collect();
+        outcome.unmatched = unmatched.len();
+        outcome.longest_unmatched_wait_seconds = longest_wait(&unmatched, now);
 
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// 現在のキューと直近 15 分の成立数を DB の時刻から集計する。
+    pub async fn summary(&self, now: Timestamp) -> Result<MatchmakerSummary, RepositoryError> {
+        let enqueued_at = sqlx::query_scalar!("select enqueued_at from queue_entries")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut waits: Vec<u64> = enqueued_at
+            .into_iter()
+            .map(|at| wait_seconds(now, at))
+            .collect();
+        waits.sort_unstable();
+        let median_wait_seconds = median(&waits);
+        let longest_wait_seconds = waits.last().copied();
+        let formed = sqlx::query_scalar!(
+            "select count(*)::bigint as \"count!\" from formations \
+             where created_at > $1::timestamptz - interval '15 minutes' \
+               and created_at <= $1::timestamptz",
+            now,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(MatchmakerSummary {
+            queued: waits.len(),
+            formed_last_15_minutes: usize::try_from(formed).unwrap_or(usize::MAX),
+            median_wait_seconds,
+            longest_wait_seconds,
+        })
+    }
+}
+
+fn wait_seconds(now: Timestamp, enqueued_at: Timestamp) -> u64 {
+    u64::try_from(now.signed_duration_since(enqueued_at).num_seconds()).unwrap_or(0)
+}
+
+fn longest_wait(candidates: &[Candidate], now: Timestamp) -> Option<u64> {
+    candidates
+        .iter()
+        .map(|candidate| wait_seconds(now, candidate.enqueued_at))
+        .max()
+}
+
+fn median(sorted: &[u64]) -> Option<u64> {
+    let upper = *sorted.get(sorted.len() / 2)?;
+    if sorted.len() % 2 == 1 {
+        Some(upper)
+    } else {
+        Some((sorted[sorted.len() / 2 - 1] + upper) / 2)
     }
 }
 
