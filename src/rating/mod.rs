@@ -1,11 +1,30 @@
-//! レーティング再計算の入力。
+//! レーティングの導出。**現在レートを保存しない。**
 //!
-//! 現在レートを保存しない。ここでは、追記専用の `rating_adjustments` から
-//! アルゴリズムが使う初期分布を導出するだけで、対戦結果の更新式は持たない。
+//! 現在の表示レートは、追記済みのデータだけから毎回組み立てる。
+//!
+//! ```text
+//! 現在レート = 1500 + Σ rating_adjustments.delta_mu + Σ 確定した試合の増減（07 §2-2）
+//! ```
+//!
+//! 不変条件（00 §3）:
+//! - **レーティングは導出値**。現在値のテーブルを持たない。
+//! - **recompute が唯一の計算経路**。インクリメンタル更新を作らない。1 試合ぶんの増減は
+//!   [`match_delta`] が凍結値だけから決めるので、既存の値を読んで書き戻す経路が要らない。
+//! - **初期値は一律 1500**。1600 は `rating_adjustments` への `+100` の追記であって、
+//!   第二の初期値ではない（07 §2-1）。
+//!
+//! **畳み込みは順序に依存しない。**増減の入力は `formation_players.mu_at_match`
+//! （その試合の開始時点の凍結値）だけで、途中結果を参照しない。したがって全体は単なる総和で、
+//! 同じログからは必ず同じ値が出る。07 §7 が心配している「同一時刻の tiebreak」は、
+//! レートの導出には影響しない。
+//!
+//! SQL 側の同じ式は `migrations/20260906160000_rating_from_matches` のビューにある
+//! （キューとマッチメイカが人数ぶんまとめて読むため）。両者が一致することは
+//! `tests/rating.rs` が検査する。
 
 use sqlx::PgPool;
 
-use crate::lifecycle::PlayerId;
+use crate::lifecycle::{FormationId, PlayerId};
 
 /// 表示値からライブラリの内部値への変換係数。
 ///
@@ -15,6 +34,99 @@ pub const DISPLAY_SCALE: f64 = 60.0;
 pub const DEFAULT_DISPLAY_MU: f64 = 1500.0;
 /// 調整前の表示 sigma。内部 sigma は 25 / 3。
 pub const DEFAULT_DISPLAY_SIGMA: f64 = 500.0;
+
+// ----------------------------------------------------------------------
+// 初週の固定増減方式（07 §2-2）
+// ----------------------------------------------------------------------
+
+/// 基本の増減幅（表示スケール）。
+pub const BASE_DELTA: f64 = 11.0;
+/// 「相手との差」がこれ以上なら ±1 する（表示スケール）。
+pub const RATING_GAP_THRESHOLD: f64 = 50.0;
+/// 格上・格下のときの補正幅。
+pub const UPSET_ADJUSTMENT: f64 = 1.0;
+
+/// しきい値の比較に許す誤差（表示スケール）。
+///
+/// 凍結値は内部スケール（`mu = 表示値 / 60`）で保存されるので、表示スケールへ戻すと
+/// `1550 / 60 * 60 = 1549.9999999999998` のような値になる。素朴に `>= 50.0` で比較すると、
+/// **仕様が「50 以上」と書いている境界ちょうどが 50 未満に落ちる。**
+/// SQL 側のビューにも同じ幅が入っている（`tests/rating.rs` が両者の一致を検査する）。
+///
+/// 表示スケールで 1e-9 は、レートの最小単位（1）から 9 桁離れており、境界以外の判定を
+/// 変えることはない。
+pub const GAP_EPSILON: f64 = 1e-9;
+
+/// 確定した 1 試合の、そのプレイヤーから見た結果。
+///
+/// `nullified` / `voided` / `abandoned` / `disputed` はここに現れない——試合が成立して
+/// いないか、まだ確定していないので、レートに影響しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchResult {
+    /// 自分のチームが勝った。
+    Won,
+    /// 相手のチームが勝った。
+    Lost,
+    /// 引き分け。増減 0。
+    Drawn,
+}
+
+/// 07 §2-2 の増減式。表示スケールの差分を返す。
+///
+/// | 条件 | 勝ち | 負け |
+/// |---|---|---|
+/// | 差が 50 未満 | +11 | −11 |
+/// | 格上（相手平均が 50 以上高い） | +12 | −10 |
+/// | 格下（相手平均が 50 以上低い） | +10 | −12 |
+///
+/// `own` と `opponent_mean` はどちらも**その試合の開始時点の凍結値**
+/// （`formation_players.mu_at_match`）を表示スケールに直したもの。**現在レートを使わない。**
+/// これがインクリメンタル更新を不要にしている。
+///
+/// 「相手との差」は個々の相手ではなく**相手チーム 5 人の平均**との差（07 §2-2）。
+/// ロールによる調整はしない。
+pub fn match_delta(own: f64, opponent_mean: f64, result: MatchResult) -> f64 {
+    let gap = opponent_mean - own;
+    // 境界ちょうど（差 50）は「50 以上」に入る。凍結値の往復で生じる誤差を [`GAP_EPSILON`] で吸収する
+    let stronger = gap >= RATING_GAP_THRESHOLD - GAP_EPSILON;
+    let weaker = gap <= -RATING_GAP_THRESHOLD + GAP_EPSILON;
+    match result {
+        MatchResult::Drawn => 0.0,
+        MatchResult::Won if stronger => BASE_DELTA + UPSET_ADJUSTMENT,
+        MatchResult::Won if weaker => BASE_DELTA - UPSET_ADJUSTMENT,
+        MatchResult::Won => BASE_DELTA,
+        MatchResult::Lost if stronger => -(BASE_DELTA - UPSET_ADJUSTMENT),
+        MatchResult::Lost if weaker => -(BASE_DELTA + UPSET_ADJUSTMENT),
+        MatchResult::Lost => -BASE_DELTA,
+    }
+}
+
+/// 確定した 1 試合ぶんの入力。すべて凍結値から作る。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayedMatch {
+    /// どの formation か。順序には使わない（総和なので不要）。読み手の照合用。
+    pub formation_id: FormationId,
+    /// 自分の表示レート（`mu_at_match * DISPLAY_SCALE`）。
+    pub own_rating: f64,
+    /// 相手チーム 5 人の表示レートの平均。
+    pub opponent_mean_rating: f64,
+    /// 自分から見た結果。
+    pub result: MatchResult,
+}
+
+impl PlayedMatch {
+    /// この試合ぶんの増減。
+    pub fn delta(&self) -> f64 {
+        match_delta(self.own_rating, self.opponent_mean_rating, self.result)
+    }
+}
+
+/// 現在の表示レート。初期値（調整込み）に確定した試合の増減を足す。
+///
+/// **総和なので、`matches` の順序は結果を変えない。**
+pub fn display_rating(initial: InitialRating, matches: &[PlayedMatch]) -> f64 {
+    initial.mu * DISPLAY_SCALE + matches.iter().map(PlayedMatch::delta).sum::<f64>()
+}
 
 /// 永続化された調整の、再計算に必要な列。
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +198,50 @@ impl RatingAdjustmentRepository {
     pub async fn initial_rating(&self, player_id: PlayerId) -> Result<InitialRating, sqlx::Error> {
         Ok(initial_rating(self.load(player_id).await?))
     }
+
+    /// このプレイヤーの、確定した試合の一覧（07 §2-2 の入力）。
+    ///
+    /// `player_match_rating_deltas` ビューが確定判定・相手平均・凍結値の取り出しを行う。
+    /// ビューは実体を持たないので、呼ぶたびに追記ログから計算し直される。
+    pub async fn played_matches(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Vec<PlayedMatch>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select formation_id as \"formation_id!\", team as \"team!\", \
+                    outcome as \"outcome!\", own_rating as \"own_rating!\", \
+                    opponent_mean_rating as \"opponent_mean_rating!\" \
+             from player_match_rating_deltas where player_id = $1 \
+             order by formation_id",
+            player_id.0,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PlayedMatch {
+                formation_id: FormationId(row.formation_id),
+                own_rating: row.own_rating,
+                opponent_mean_rating: row.opponent_mean_rating,
+                result: match row.outcome.as_str() {
+                    "draw" => MatchResult::Drawn,
+                    winner if winner == row.team => MatchResult::Won,
+                    _ => MatchResult::Lost,
+                },
+            })
+            .collect())
+    }
+
+    /// 現在の表示レート。**1 プレイヤー分の正となる経路。**
+    ///
+    /// キューとマッチメイカは人数ぶんまとめて読む必要があるので、同じ計算を
+    /// `player_match_ratings` ビューの側で行う。両者が一致することは `tests/rating.rs`
+    /// が検査する。
+    pub async fn display_rating(&self, player_id: PlayerId) -> Result<f64, sqlx::Error> {
+        let initial = self.initial_rating(player_id).await?;
+        let matches = self.played_matches(player_id).await?;
+        Ok(display_rating(initial, &matches))
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +273,143 @@ mod tests {
 
         assert_eq!(rating.mu, 26.0);
         assert_eq!(rating.sigma, 47.0 / 6.0);
+    }
+
+    // ------------------------------------------------------------------
+    // 07 §2-2 の増減式
+    // ------------------------------------------------------------------
+
+    fn played(own: f64, opponent_mean: f64, result: MatchResult) -> PlayedMatch {
+        PlayedMatch {
+            formation_id: FormationId(uuid::Uuid::from_u128(1)),
+            own_rating: own,
+            opponent_mean_rating: opponent_mean,
+            result,
+        }
+    }
+
+    /// 差が 50 未満なら ±11。
+    #[test]
+    fn an_even_match_moves_the_base_amount() {
+        for gap in [0.0, 1.0, -1.0, 49.0, -49.0, 49.999] {
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
+                11.0,
+                "gap {gap}"
+            );
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
+                -11.0,
+                "gap {gap}"
+            );
+        }
+    }
+
+    /// 格上（相手平均が 50 以上高い）: 勝ち +12 / 負け −10。
+    #[test]
+    fn beating_a_stronger_opponent_pays_more_and_losing_costs_less() {
+        for gap in [50.0, 51.0, 300.0] {
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
+                12.0,
+                "gap {gap}"
+            );
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
+                -10.0,
+                "gap {gap}"
+            );
+        }
+    }
+
+    /// 格下（相手平均が 50 以上低い）: 勝ち +10 / 負け −12。
+    #[test]
+    fn beating_a_weaker_opponent_pays_less_and_losing_costs_more() {
+        for gap in [-50.0, -51.0, -300.0] {
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
+                10.0,
+                "gap {gap}"
+            );
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
+                -12.0,
+                "gap {gap}"
+            );
+        }
+    }
+
+    /// 引き分けは双方とも増減 0（07 §2-3）。格差があっても動かない。
+    #[test]
+    fn a_draw_moves_nobody() {
+        for gap in [0.0, 200.0, -200.0] {
+            assert_eq!(match_delta(1500.0, 1500.0 + gap, MatchResult::Drawn), 0.0);
+        }
+    }
+
+    /// ちょうど 50 は「50 以上」に入る（境界）。
+    #[test]
+    fn the_threshold_is_inclusive() {
+        assert_eq!(match_delta(1500.0, 1550.0, MatchResult::Won), 12.0);
+        assert_eq!(match_delta(1500.0, 1450.0, MatchResult::Won), 10.0);
+        // 直前の値は基本値のまま
+        assert_eq!(match_delta(1500.0, 1549.9, MatchResult::Won), 11.0);
+        assert_eq!(match_delta(1500.0, 1450.1, MatchResult::Won), 11.0);
+    }
+
+    // ------------------------------------------------------------------
+    // 畳み込み
+    // ------------------------------------------------------------------
+
+    /// 1 勝した 1500 は 1511 になる（07 §3-2 のプール融合の前提）。
+    #[test]
+    fn one_win_takes_a_fresh_player_to_fifteen_eleven() {
+        let initial = initial_rating([]);
+        assert_eq!(initial.mu * DISPLAY_SCALE, 1500.0);
+        let rating = display_rating(initial, &[played(1500.0, 1500.0, MatchResult::Won)]);
+        assert_eq!(rating, 1511.0);
+        // 1600 との差は 89 で、上方向の固定幅 95 の内側に入る
+        assert!(1600.0 - rating <= 95.0);
+    }
+
+    /// 総和なので、畳む順序は結果を変えない。同じログからは必ず同じ値。
+    #[test]
+    fn the_fold_does_not_depend_on_the_order() {
+        let matches = [
+            played(1500.0, 1600.0, MatchResult::Won),
+            played(1512.0, 1400.0, MatchResult::Lost),
+            played(1500.0, 1500.0, MatchResult::Drawn),
+            played(1500.0, 1500.0, MatchResult::Won),
+        ];
+        let forward = display_rating(initial_rating([]), &matches);
+        let mut reversed = matches;
+        reversed.reverse();
+        let backward = display_rating(initial_rating([]), &reversed);
+        assert_eq!(forward, backward);
+        // +12, -12, 0, +11
+        assert_eq!(forward, 1500.0 + 11.0);
+    }
+
+    /// 実績考慮の +100 は第二の初期値ではなく、調整ログの 1 行として効く（07 §2-1）。
+    #[test]
+    fn the_manual_adjustment_shifts_the_starting_point_only() {
+        let seeded = initial_rating([RatingAdjustment {
+            id: 1,
+            delta_mu: 100.0,
+            delta_sigma: 0.0,
+            reverts_id: None,
+        }]);
+        assert_eq!(seeded.mu * DISPLAY_SCALE, 1600.0);
+        // 1600 の人が同格に勝てば 1611
+        assert_eq!(
+            display_rating(seeded, &[played(1600.0, 1600.0, MatchResult::Won)]),
+            1611.0
+        );
+    }
+
+    /// 試合が無ければ初期値のまま。
+    #[test]
+    fn a_player_who_never_played_keeps_the_starting_rating() {
+        assert_eq!(display_rating(initial_rating([]), &[]), 1500.0);
     }
 }

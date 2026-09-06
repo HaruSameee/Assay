@@ -173,10 +173,12 @@ impl QueueRepository {
     /// キュー中の全員の、範囲判定に必要な値。
     ///
     /// **レートは導出値**なので現在値のテーブルを持たない。表示スケールの初期値
-    /// （[`crate::rating::DEFAULT_DISPLAY_MU`]）に `rating_adjustments` の差分を足したものが、
-    /// 現時点での導出経路の全体である（`match_results` は未実装で、試合結果による増減は
-    /// まだどこにも入っていない。07 §2-2 の増減式を入れるときは、この 1 本のクエリを
-    /// 伸ばす形で追加し、現在値の保存テーブルを作らないこと）。
+    /// （[`crate::rating::DEFAULT_DISPLAY_MU`]）に `rating_adjustments` の差分と、
+    /// 確定した試合の増減（07 §2-2。`player_match_ratings` ビュー）を足す。ビューは実体を
+    /// 持たないので、読むたびに追記ログから計算し直される。
+    ///
+    /// 集計は**1 回だけ**行って join する。プレイヤーごとの相関サブクエリにすると、
+    /// キューの人数だけビュー全体を走査することになる。
     ///
     /// 規模はキュー100人程度（07 §6）なので、全件読んで Rust 側で数える。
     pub async fn queued_players(&self) -> Result<Vec<QueuedPlayer>, QueueError> {
@@ -185,8 +187,10 @@ impl QueueRepository {
                     $1::double precision \
                         + coalesce((select sum(a.delta_mu) from rating_adjustments a \
                                     where a.player_id = q.player_id), 0::double precision) \
+                        + coalesce(m.delta, 0::double precision) \
                         as \"rating!\" \
-             from queue_entries q",
+             from queue_entries q \
+             left join player_match_ratings m on m.player_id = q.player_id",
             DEFAULT_DISPLAY_MU,
         )
         .fetch_all(&self.pool)

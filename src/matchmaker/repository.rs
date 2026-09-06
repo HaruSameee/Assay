@@ -186,8 +186,10 @@ fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -
 /// キュー中の全員を、マッチメイカの入力の形で読む。
 ///
 /// レートは導出値なので現在値のテーブルを持たない。表示スケールの初期値に
-/// `rating_adjustments` の差分を足したものが、現時点での導出経路の全体である
-/// （`match_results` は未実装。07 §2-2 の増減を入れるときはこのクエリを伸ばすこと）。
+/// `rating_adjustments` の差分と、確定した試合の増減（07 §2-2。`player_match_ratings`
+/// ビュー）を足す。ビューは実体を持たないので、読むたびに追記ログから計算し直される。
+///
+/// σ は固定増減方式では動かない（07 §2 は μ しか触らない）ので、調整ログだけから作る。
 ///
 /// フレックス補償は `formation_players.role_was_flexed` から導出する
 /// （[`crate::queue::flex`]）。プレイヤーの可変列には持たない。
@@ -197,6 +199,7 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
                 $1::double precision \
                     + coalesce((select sum(a.delta_mu) from rating_adjustments a \
                                 where a.player_id = q.player_id), 0::double precision) \
+                    + coalesce(m.delta, 0::double precision) \
                     as \"rating!\", \
                 $2::double precision \
                     + coalesce((select sum(a.delta_sigma) from rating_adjustments a \
@@ -206,6 +209,7 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
                 latest.created_at as \"latest_matched_at?\", \
                 latest.role_was_flexed as \"latest_role_was_flexed?\" \
          from queue_entries q \
+         left join player_match_ratings m on m.player_id = q.player_id \
          left join lateral ( \
              select fp.formation_id, f.created_at, fp.role_was_flexed \
              from formation_players fp join formations f on f.id = fp.formation_id \

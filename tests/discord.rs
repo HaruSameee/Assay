@@ -1421,6 +1421,15 @@ async fn an_elapsed_report_window_is_evaluated_by_the_existing_resume_loop(owner
     assert_eq!(log.events.last().unwrap().event.kind, K::Confirmed);
     assert_eq!(log.events.last().unwrap().payload["outcome"], "red");
     assert!(log.events.iter().all(|event| event.event.kind != K::Voided));
+
+    // **評価器が書いた confirmed が、そのままレート導出の入力になること**（07 §2-2）。
+    // ここを繋いでおかないと、ビュー側のテストは自分で作った payload しか見ていない。
+    // formation(1) は red の平均 μ が 27（表示 1620）、blue が 22（表示 1320）。
+    // red は格下に勝って +10、blue は格上に負けて −10。
+    let ratings = unite_matchsystem::rating::RatingAdjustmentRepository::new(db.pool.clone());
+    assert_eq!(ratings.display_rating(pid(1)).await.unwrap(), 1510.0);
+    assert_eq!(ratings.display_rating(pid(6)).await.unwrap(), 1490.0);
+
     db.done().await;
 }
 

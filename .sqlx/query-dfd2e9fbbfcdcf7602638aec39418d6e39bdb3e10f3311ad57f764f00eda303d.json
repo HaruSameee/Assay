@@ -1,0 +1,115 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, $1::double precision + coalesce((select sum(a.delta_mu) from rating_adjustments a where a.player_id = q.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\", $2::double precision + coalesce((select sum(a.delta_sigma) from rating_adjustments a where a.player_id = q.player_id), 0::double precision) as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q left join player_match_ratings m on m.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "down_range",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "down_range"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "enqueued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "enqueued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "sigma!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "latest_formation?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "formation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "latest_matched_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "formations",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "latest_role_was_flexed?",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "role_was_flexed"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      null,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "dfd2e9fbbfcdcf7602638aec39418d6e39bdb3e10f3311ad57f764f00eda303d"
+}
