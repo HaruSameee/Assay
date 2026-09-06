@@ -34,6 +34,11 @@ or copy the contents of /etc/assay/*.env.
    installation:
 
         sha256sum -c unite-matchsystem.sha256
+        if test -x /opt/assay/bin/unite-matchsystem; then
+          install -o root -g root -m 0755 \
+            /opt/assay/bin/unite-matchsystem \
+            /opt/assay/bin/unite-matchsystem.prev
+        fi
         install -o root -g root -m 0755 unite-matchsystem /opt/assay/bin/unite-matchsystem
         install -o root -g root -m 0644 ops/app_role.sql ops/app_privileges.sql \
           ops/check_app_role.sql ops/verify_app_role.sql ops/app.env.example \
@@ -74,3 +79,13 @@ or copy the contents of /etc/assay/*.env.
 
         journalctl -u assay.service -b --no-pager | grep 'resolved voice channel'
         curl --fail --show-error https://match.aynm.dev/healthz
+
+If the new binary must be rolled back, restore the immediately preceding binary
+and restart the service:
+
+        test -x /opt/assay/bin/unite-matchsystem.prev
+        install -o root -g root -m 0755 \
+          /opt/assay/bin/unite-matchsystem.prev \
+          /opt/assay/bin/unite-matchsystem
+        systemctl restart assay.service
+        systemctl --no-pager --full status assay.service
