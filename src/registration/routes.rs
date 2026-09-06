@@ -228,17 +228,16 @@ async fn logout(State(app): State<AuthState>, jar: SignedCookieJar) -> Response 
 /// 登録フォーム。
 async fn show_form(State(app): State<AuthState>, session: Option<CurrentSession>) -> Response {
     let Some(CurrentSession(session)) = session else {
-        // 期限切れ・未ログインはどちらも入口に戻す（再ログインに落とす）
-        return Redirect::to(ROOT_PATH).into_response();
+        return session_expired();
     };
     match app.repo.find_by_player_id(session.player_id).await {
         Ok(Some(profile)) => {
-            let display = profile.trainer_name.clone().unwrap_or_default();
+            let values = html::RegistrationFormValues::from_profile(&profile);
             Html(html::registration_form(
                 REGISTER_PATH,
-                &display,
-                Some(&profile),
-                None,
+                &profile,
+                &values,
+                &html::RegistrationFormErrors::default(),
             ))
             .into_response()
         }
@@ -267,37 +266,59 @@ struct ValidatedForm {
 }
 
 /// フォームを検証する。純粋関数（テストしやすいように分けてある）。
-fn validate(form: &RegistrationForm) -> Result<ValidatedForm, &'static str> {
+fn validate(form: &RegistrationForm) -> Result<ValidatedForm, html::RegistrationFormErrors> {
+    let mut errors = html::RegistrationFormErrors::default();
     let trainer_name = form.trainer_name.trim();
     if trainer_name.is_empty() {
-        return Err("トレーナー名を入力してください。");
+        errors.trainer_name = Some("トレーナー名を入力してください。");
+    } else if trainer_name.chars().count() > TRAINER_NAME_MAX_CHARS {
+        errors.trainer_name = Some("トレーナー名は64文字以内で入力してください。");
     }
-    if trainer_name.chars().count() > TRAINER_NAME_MAX_CHARS {
-        return Err("トレーナー名が長すぎます。");
-    }
-    let rank: Rank = form
-        .rank
-        .trim()
-        .parse()
-        .map_err(|_| "ランクを選択してください。")?;
-    let rating_text = form.rating.trim();
-    let rating = if rank.requires_rating() {
-        let value: i32 = rating_text
-            .parse()
-            .map_err(|_| "本家レートを数字で入力してください。")?;
-        if !(0..=RATING_MAX).contains(&value) {
-            return Err("本家レートの値を確認してください。");
+
+    let rank = match form.rank.trim().parse::<Rank>() {
+        Ok(rank) => Some(rank),
+        Err(_) => {
+            errors.rank = Some("本家ランクを選択してください。");
+            None
         }
-        Some(value)
+    };
+    let rating_text = form.rating.trim();
+    let rating = if rank.is_some_and(Rank::requires_rating) {
+        match rating_text.parse::<i32>() {
+            Ok(value) if (0..=RATING_MAX).contains(&value) => Some(value),
+            Ok(_) => {
+                errors.rating = Some("本家レートは0から100000の範囲で入力してください。");
+                None
+            }
+            Err(_) => {
+                errors.rating = Some("本家レートを数字で入力してください。");
+                None
+            }
+        }
     } else {
         // マスター・レジェンド以外はレートを持たない。入力があっても raw にだけ残す
         None
+    };
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let Some(rank) = rank else {
+        return Err(errors);
     };
     Ok(ValidatedForm {
         trainer_name: trainer_name.to_owned(),
         rank,
         rating,
     })
+}
+
+fn form_values(form: &RegistrationForm) -> html::RegistrationFormValues {
+    html::RegistrationFormValues {
+        trainer_name: form.trainer_name.clone(),
+        rank: form.rank.clone(),
+        rating: form.rating.clone(),
+    }
 }
 
 /// 送信されたフォームを丸ごと JSON にする（パースできなかった項目も残す）。
@@ -316,7 +337,7 @@ async fn submit_form(
     Form(form): Form<RegistrationForm>,
 ) -> Response {
     let Some(CurrentSession(session)) = session else {
-        return Redirect::to(ROOT_PATH).into_response();
+        return session_expired();
     };
     let profile = match app.repo.find_by_player_id(session.player_id).await {
         Ok(Some(profile)) => profile,
@@ -326,15 +347,15 @@ async fn submit_form(
 
     let validated = match validate(&form) {
         Ok(validated) => validated,
-        Err(message) => {
-            let display = profile.trainer_name.clone().unwrap_or_default();
+        Err(errors) => {
+            let values = form_values(&form);
             return (
                 StatusCode::BAD_REQUEST,
                 Html(html::registration_form(
                     REGISTER_PATH,
-                    &display,
-                    Some(&profile),
-                    Some(message),
+                    &profile,
+                    &values,
+                    &errors,
                 )),
             )
                 .into_response();
@@ -375,6 +396,17 @@ fn internal_error(error: RegistrationError) -> Response {
         Html(html::error_page(
             "エラー",
             "処理に失敗しました。時間をおいてお試しください。",
+        )),
+    )
+        .into_response()
+}
+
+fn session_expired() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Html(html::error_page(
+            "セッションの有効期限が切れました",
+            "ログイン状態を確認できませんでした。入口に戻って、Discord で再度ログインしてください。",
         )),
     )
         .into_response()

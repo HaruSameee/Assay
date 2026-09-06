@@ -1,7 +1,4 @@
-//! 登録フォームの最小限の HTML。テンプレートエンジンは入れない。
-//!
-//! サイト名・ロゴ・配色は設定値として外出しする方針（03-技術仕様 §8）なので、ここには
-//! 固有名を書かない。文言だけで、見た目は最小限にとどめる。
+//! 登録・認証画面の HTML。テンプレートエンジンや外部 CSS は使わない。
 //!
 //! ユーザー由来の値（トレーナー名、Discord の表示名）は必ず [`escape`] を通す。
 
@@ -9,6 +6,176 @@ use crate::lifecycle::FormationId;
 
 use super::gate::QueueEligibility;
 use super::model::{PlayerProfile, Rank};
+
+const STYLES: &str = r#"
+:root {
+  color-scheme: dark;
+  --bg: #101114;
+  --surface: #191b20;
+  --surface-strong: #22252c;
+  --border: #343944;
+  --text: #f4f6f8;
+  --muted: #aeb4bf;
+  --accent: #58d6a3;
+  --accent-strong: #35b987;
+  --discord: #5865f2;
+  --discord-hover: #4752c4;
+  --danger: #ff737b;
+  --danger-bg: #2a191d;
+  --focus: #8bb8ff;
+}
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body {
+  min-width: 0;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+}
+a { color: var(--accent); text-underline-offset: 0.2em; }
+a:hover { color: #8ce8c2; }
+.shell { width: min(100% - 32px, 680px); margin: 0 auto; }
+.site-header {
+  display: flex;
+  min-height: 72px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+.brand { color: var(--text); font-size: 1.2rem; font-weight: 750; text-decoration: none; }
+.brand:hover { color: var(--text); }
+.context { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; }
+main { padding: 48px 0 64px; }
+.eyebrow { margin: 0 0 8px; color: var(--accent); font-size: 0.78rem; font-weight: 700; text-transform: uppercase; }
+h1 { margin: 0 0 16px; font-size: 2rem; line-height: 1.25; }
+h2 { margin: 0 0 12px; font-size: 1.1rem; line-height: 1.35; }
+p { margin: 0 0 16px; }
+.lead { max-width: 38rem; color: #dce0e6; font-size: 1.08rem; }
+.muted, .field-help, .fine-print { color: var(--muted); }
+.fine-print, .field-help { font-size: 0.875rem; }
+.status-line { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.9rem; }
+.status-dot { width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: var(--accent); }
+.section { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--border); }
+.requirement { margin: 28px 0; padding: 16px 0 16px 18px; border-left: 3px solid var(--accent); }
+.requirement p:last-child { margin-bottom: 0; }
+.button,
+button {
+  display: inline-flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 10px 18px;
+  font: inherit;
+  font-weight: 700;
+  line-height: 1.3;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+.button-primary, .actions button[type="submit"] { background: var(--accent); color: #07150f; }
+.button-primary:hover, .actions button[type="submit"]:hover { background: var(--accent-strong); color: #07150f; }
+.button-secondary { border-color: var(--border); background: var(--surface); color: var(--text); }
+.button-secondary:hover { border-color: #596170; background: var(--surface-strong); color: var(--text); }
+.button-discord { width: 100%; max-width: 320px; background: var(--discord); color: #fff; }
+.button-discord:hover { background: var(--discord-hover); color: #fff; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+.actions form { margin: 0; }
+.form-header { margin-bottom: 32px; }
+.field { margin: 0 0 24px; }
+label { display: block; margin-bottom: 7px; font-weight: 700; }
+input,
+select {
+  width: 100%;
+  min-height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 10px 12px;
+  font: inherit;
+}
+input::placeholder { color: #747b88; }
+input:focus,
+select:focus,
+.button:focus-visible,
+button:focus-visible,
+a:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+input[aria-invalid="true"], select[aria-invalid="true"] { border-color: var(--danger); }
+.field-help { margin: 7px 0 0; }
+.field-error { margin: 7px 0 0; color: var(--danger); font-size: 0.9rem; font-weight: 650; }
+.notice,
+.error-summary,
+.blocked {
+  margin: 24px 0;
+  padding: 14px 16px;
+  border-left: 3px solid var(--accent);
+  background: var(--surface);
+}
+.error-summary,
+.blocked { border-left-color: var(--danger); background: var(--danger-bg); }
+.notice p:last-child, .error-summary p:last-child, .blocked p:last-child { margin-bottom: 0; }
+.details { margin: 24px 0 0; }
+.details div { display: grid; grid-template-columns: minmax(120px, 0.65fr) minmax(0, 1.35fr); gap: 16px; padding: 15px 0; border-bottom: 1px solid var(--border); }
+.details dt { color: var(--muted); }
+.details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-weight: 650; }
+.blocked ul { margin: 8px 0 0; padding-left: 1.25rem; }
+.site-footer { padding: 22px 0 32px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.78rem; }
+@media (max-width: 480px) {
+  .shell { width: min(100% - 24px, 680px); }
+  .site-header { min-height: 60px; }
+  .context { display: none; }
+  main { padding: 34px 0 48px; }
+  h1 { font-size: 1.7rem; }
+  .actions { display: grid; grid-template-columns: 1fr; }
+  .actions .button, .actions button, .actions form { width: 100%; }
+  .details div { grid-template-columns: 1fr; gap: 3px; }
+}
+"#;
+
+/// 登録フォームに表示する値。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistrationFormValues {
+    pub trainer_name: String,
+    pub rank: String,
+    pub rating: String,
+}
+
+impl RegistrationFormValues {
+    pub fn from_profile(profile: &PlayerProfile) -> Self {
+        let declaration = profile.latest_declaration.as_ref();
+        Self {
+            trainer_name: profile.trainer_name.clone().unwrap_or_default(),
+            rank: declaration
+                .and_then(|declaration| declaration.rank)
+                .map(|rank| rank.as_str().to_owned())
+                .unwrap_or_default(),
+            rating: declaration
+                .and_then(|declaration| declaration.rating)
+                .map(|rating| rating.to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// 項目ごとの入力エラー。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistrationFormErrors {
+    pub trainer_name: Option<&'static str>,
+    pub rank: Option<&'static str>,
+    pub rating: Option<&'static str>,
+}
+
+impl RegistrationFormErrors {
+    pub fn is_empty(&self) -> bool {
+        self.trainer_name.is_none() && self.rank.is_none() && self.rating.is_none()
+    }
+}
 
 /// HTML の特殊文字を実体参照にする。属性値にもテキストにも使える。
 pub fn escape(value: &str) -> String {
@@ -31,15 +198,14 @@ pub fn page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{title}</title>\n\
-         <style>\n\
-         body{{font-family:system-ui,sans-serif;line-height:1.7;max-width:40rem;margin:2rem auto;padding:0 1rem}}\n\
-         label{{display:block;margin:1rem 0 .25rem;font-weight:600}}\n\
-         input,select{{font:inherit;padding:.4rem;width:100%;box-sizing:border-box}}\n\
-         button{{font:inherit;margin-top:1.5rem;padding:.5rem 1.2rem}}\n\
-         .note{{color:#555;font-size:.9rem}}\n\
-         .blocked{{border-left:4px solid #b00;padding-left:.8rem}}\n\
-         </style>\n</head>\n<body>\n{body}\n</body>\n</html>\n",
+         <meta name=\"theme-color\" content=\"#101114\">\n\
+         <title>{title} | Assay</title>\n<style>{STYLES}</style>\n</head>\n<body>\n\
+         <div class=\"shell\">\n<header class=\"site-header\">\n\
+         <a class=\"brand\" href=\"/\">Assay</a>\n\
+         <span class=\"context\">Pokemon UNITE community match</span>\n</header>\n\
+         <main>{body}</main>\n\
+         <footer class=\"site-footer\">Assay は非公式のコミュニティ運営サービスです。</footer>\n\
+         </div>\n</body>\n</html>\n",
         title = escape(title),
     )
 }
@@ -49,35 +215,50 @@ pub fn login_page(login_path: &str) -> String {
     page(
         "ログイン",
         &format!(
-            "<h1>ログイン</h1>\n\
-             <p>Discord アカウントでログインします。要求するのはユーザー識別（identify）だけで、\
-             メールアドレスや参加サーバーの一覧は取得しません。</p>\n\
-             <p><a href=\"{path}\">Discord でログイン</a></p>\n",
+            "<section aria-labelledby=\"login-title\">\n\
+             <p class=\"eyebrow\">Pokemon UNITE community ranked match</p>\n\
+             <h1 id=\"login-title\">Assay</h1>\n\
+             <p class=\"lead\">決まった時間にソロで参加し、10人で試合を組む非公式ランクマッチです。\
+             試合結果から独自レートを記録します。</p>\n\
+             <div class=\"requirement\">\n<h2>参加資格</h2>\n\
+             <p>ポケモンユナイト本家ランクが<strong>レジェンド以上</strong>であること。</p>\n</div>\n\
+             <a class=\"button button-discord\" href=\"{path}\">Discord でログイン</a>\n\
+             <p class=\"fine-print\">Discord から取得するのはユーザー識別情報（identify）のみです。\
+             メールアドレスや参加サーバー一覧は取得しません。</p>\n\
+             </section>\n",
             path = escape(login_path),
         ),
     )
 }
 
-/// 登録フォーム。既に申告があれば初期値に入れる。
+fn field_error(id: &str, message: Option<&str>) -> String {
+    message
+        .map(|message| {
+            format!(
+                "<p id=\"{id}-error\" class=\"field-error\" role=\"alert\">{}</p>\n",
+                escape(message)
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn field_attributes(id: &str, message: Option<&str>, help_id: &str) -> String {
+    match message {
+        Some(_) => format!(" aria-invalid=\"true\" aria-describedby=\"{help_id} {id}-error\""),
+        None => format!(" aria-describedby=\"{help_id}\""),
+    }
+}
+
+/// 登録フォーム。既存値を初期表示し、エラー時には送信値を保持する。
 pub fn registration_form(
     action: &str,
-    discord_display_name: &str,
-    profile: Option<&PlayerProfile>,
-    error: Option<&str>,
+    profile: &PlayerProfile,
+    values: &RegistrationFormValues,
+    errors: &RegistrationFormErrors,
 ) -> String {
-    let trainer_name = profile
-        .and_then(|profile| profile.trainer_name.as_deref())
-        .unwrap_or_default();
-    let declared = profile.and_then(|profile| profile.latest_declaration.as_ref());
-    let current_rank = declared.and_then(|declaration| declaration.rank);
-    let current_rating = declared
-        .and_then(|declaration| declaration.rating)
-        .map(|rating| rating.to_string())
-        .unwrap_or_default();
-
-    let mut options = String::new();
+    let mut options = String::from("<option value=\"\">選択してください</option>\n");
     for rank in Rank::ALL {
-        let selected = if Some(rank) == current_rank {
+        let selected = if values.rank == rank.as_str() {
             " selected"
         } else {
             ""
@@ -89,38 +270,86 @@ pub fn registration_form(
         ));
     }
 
-    let error_block = error
-        .map(|message| format!("<p class=\"blocked\">{}</p>\n", escape(message)))
-        .unwrap_or_default();
-    let registered_note = if profile.is_some_and(PlayerProfile::is_registered) {
-        "<p class=\"note\">登録済みです。内容を変えて再送信すると、新しい申告として記録されます\
-         （過去の申告は残ります）。</p>\n"
+    let registered = profile.is_registered();
+    let heading = if registered {
+        "登録内容を変更"
+    } else {
+        "参加登録"
+    };
+    let submit_label = if registered {
+        "変更内容を保存"
+    } else {
+        "登録する"
+    };
+    let registration_note = if registered {
+        "<div class=\"notice\"><p>登録済みです。変更を保存すると新しい申告として追記され、\
+         過去の申告も記録に残ります。</p></div>\n"
     } else {
         ""
     };
+    let error_summary = if errors.is_empty() {
+        String::new()
+    } else {
+        String::from(
+            "<div class=\"error-summary\" role=\"alert\"><p><strong>入力内容を確認してください。</strong></p>\
+             <p>修正が必要な項目の下に理由を表示しています。</p></div>\n",
+        )
+    };
+
+    let trainer_error = field_error("trainer_name", errors.trainer_name);
+    let rank_error = field_error("rank", errors.rank);
+    let rating_error = field_error("rating", errors.rating);
+    let trainer_attributes =
+        field_attributes("trainer_name", errors.trainer_name, "trainer_name-help");
+    let rank_attributes = field_attributes("rank", errors.rank, "rank-help");
+    let rating_attributes = field_attributes("rating", errors.rating, "rating-help");
 
     page(
-        "登録",
+        heading,
         &format!(
-            "<h1>登録</h1>\n\
-             <p class=\"note\">Discord: {discord}</p>\n\
-             {registered_note}{error_block}\
-             <form method=\"post\" action=\"{action}\">\n\
-             <label for=\"trainer_name\">トレーナー名（ゲーム内名）</label>\n\
-             <input id=\"trainer_name\" name=\"trainer_name\" maxlength=\"64\" required value=\"{trainer}\">\n\
-             <p class=\"note\">他の参加者から見えます。トレーナー情報の公開が参加条件です。</p>\n\
+            "<section aria-labelledby=\"registration-title\">\n\
+             <div class=\"form-header\">\n<p class=\"eyebrow\">Registration</p>\n\
+             <h1 id=\"registration-title\">{heading}</h1>\n\
+             <p class=\"lead\">参加資格とマッチングのために、現在のトレーナー情報を申告してください。</p>\n\
+             <p class=\"status-line\"><span class=\"status-dot\" aria-hidden=\"true\"></span>Discord 認証済み</p>\n\
+             </div>\n{registration_note}{error_summary}\
+             <form method=\"post\" action=\"{action}\" novalidate>\n\
+             <div class=\"field\">\n\
+             <label for=\"trainer_name\">トレーナー名</label>\n\
+             <input id=\"trainer_name\" name=\"trainer_name\" maxlength=\"64\" autocomplete=\"off\" required\
+             value=\"{trainer}\"{trainer_attributes}>\n\
+             <p id=\"trainer_name-help\" class=\"field-help\">ゲーム内で現在使っている名前を入力してください。\
+             <strong>トレーナー名は他の参加者に公開されます。</strong></p>\n{trainer_error}</div>\n\
+             <div class=\"field\">\n\
              <label for=\"rank\">本家ランク</label>\n\
-             <select id=\"rank\" name=\"rank\" required>\n{options}</select>\n\
-             <label for=\"rating\">本家レート（マスター・レジェンドのみ）</label>\n\
-             <input id=\"rating\" name=\"rating\" inputmode=\"numeric\" value=\"{rating}\">\n\
-             <p class=\"note\">参加資格は{entry}以上です。未満でも登録は受け付けて記録します。\
-             上がったら再申告してください。</p>\n\
-             <button type=\"submit\">送信</button>\n</form>\n",
-            discord = escape(discord_display_name),
+             <select id=\"rank\" name=\"rank\" required{rank_attributes}>\n{options}</select>\n\
+             <p id=\"rank-help\" class=\"field-help\">現在の本家ランクを選択してください。参加資格はレジェンド以上です。</p>\n\
+             {rank_error}</div>\n\
+             <div class=\"field\">\n\
+             <label for=\"rating\">本家レート</label>\n\
+             <input id=\"rating\" name=\"rating\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"例: 2600\"\
+             value=\"{rating}\"{rating_attributes}>\n\
+             <p id=\"rating-help\" class=\"field-help\">マスターまたはレジェンドの場合に、現在の数値を入力してください。</p>\n\
+             {rating_error}</div>\n\
+             <div class=\"actions\"><button type=\"submit\">{submit_label}</button></div>\n\
+             </form>\n\
+             <form class=\"section\" method=\"post\" action=\"/auth/logout\">\n\
+             <button class=\"button-secondary\" type=\"submit\">ログアウト</button>\n</form>\n\
+             </section>\n",
+            heading = heading,
+            registration_note = registration_note,
+            error_summary = error_summary,
             action = escape(action),
-            trainer = escape(trainer_name),
-            rating = escape(&current_rating),
-            entry = escape(Rank::ENTRY_REQUIREMENT.display_name()),
+            trainer = escape(&values.trainer_name),
+            trainer_attributes = trainer_attributes,
+            trainer_error = trainer_error,
+            options = options,
+            rank_attributes = rank_attributes,
+            rank_error = rank_error,
+            rating = escape(&values.rating),
+            rating_attributes = rating_attributes,
+            rating_error = rating_error,
+            submit_label = submit_label,
         ),
     )
 }
@@ -144,10 +373,13 @@ pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibili
         .unwrap_or_else(|| "(申告なし)".to_owned());
 
     let status = if eligibility.is_allowed() {
-        "<p>キューに参加できます。</p>\n".to_owned()
+        "<div class=\"notice\"><p><strong>キューに参加できます。</strong></p>\
+         <p class=\"muted\">準備ができたらキュー画面へ進んでください。</p></div>\n"
+            .to_owned()
     } else {
-        let mut block =
-            String::from("<div class=\"blocked\">\n<p>いまはキューに入れません。</p>\n<ul>\n");
+        let mut block = String::from(
+            "<div class=\"blocked\" role=\"status\">\n<p><strong>いまはキューに入れません。</strong></p>\n<ul>\n",
+        );
         for message in eligibility.messages() {
             block.push_str(&format!("<li>{}</li>\n", escape(&message)));
         }
@@ -158,11 +390,20 @@ pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibili
     page(
         "登録内容",
         &format!(
-            "<h1>登録内容</h1>\n\
-             <dl>\n<dt>トレーナー名</dt><dd>{trainer}</dd>\n\
-             <dt>直近の申告</dt><dd>{declared}</dd>\n</dl>\n\
+            "<section aria-labelledby=\"result-title\">\n\
+             <p class=\"eyebrow\">Registration complete</p>\n\
+             <h1 id=\"result-title\">登録内容</h1>\n\
+             <p class=\"lead\">現在登録されている内容です。変更はいつでも新しい申告として保存できます。</p>\n\
+             <dl class=\"details\">\n<div><dt>トレーナー名</dt><dd>{trainer}</dd></div>\n\
+             <div><dt>直近の申告</dt><dd>{declared}</dd></div>\n</dl>\n\
              {status}\
-             <p><a href=\"/register\">申告し直す</a></p>\n",
+             <div class=\"actions\">\n\
+             <a class=\"button button-primary\" href=\"/queue\">キュー画面へ</a>\n\
+             <a class=\"button button-secondary\" href=\"/register\">登録内容を変更</a>\n\
+             </div>\n\
+             <form class=\"section\" method=\"post\" action=\"/auth/logout\">\n\
+             <button class=\"button-secondary\" type=\"submit\">ログアウト</button>\n</form>\n\
+             </section>\n",
             trainer = escape(trainer),
             declared = escape(&declared),
         ),
@@ -174,7 +415,12 @@ pub fn error_page(title: &str, message: &str) -> String {
     page(
         title,
         &format!(
-            "<h1>{title}</h1>\n<p>{message}</p>\n<p><a href=\"/\">最初に戻る</a></p>\n",
+            "<section aria-labelledby=\"error-title\">\n\
+             <p class=\"eyebrow\">Request error</p>\n\
+             <h1 id=\"error-title\">{title}</h1>\n\
+             <div class=\"error-summary\"><p>{message}</p></div>\n\
+             <div class=\"actions\"><a class=\"button button-primary\" href=\"/\">入口に戻る</a></div>\n\
+             </section>\n",
             title = escape(title),
             message = escape(message),
         ),
@@ -216,6 +462,21 @@ mod tests {
         }
     }
 
+    fn values(profile: &PlayerProfile) -> RegistrationFormValues {
+        RegistrationFormValues::from_profile(profile)
+    }
+
+    fn unregistered_profile() -> PlayerProfile {
+        PlayerProfile {
+            player_id: PlayerId(Uuid::from_u128(2)),
+            discord_user_id: "1002".into(),
+            trainer_name: None,
+            status: Some(PlayerStatus::Active),
+            registered_at: None,
+            latest_declaration: None,
+        }
+    }
+
     #[test]
     fn escaping_covers_every_html_metacharacter() {
         assert_eq!(
@@ -228,7 +489,13 @@ mod tests {
     #[test]
     fn a_hostile_trainer_name_cannot_break_out_of_the_form() {
         let hostile = r#"" onfocus="alert(1)"#;
-        let rendered = registration_form("/register", "discord", Some(&profile(hostile)), None);
+        let profile = profile(hostile);
+        let rendered = registration_form(
+            "/register",
+            &profile,
+            &values(&profile),
+            &RegistrationFormErrors::default(),
+        );
         assert!(!rendered.contains("onfocus=\"alert"), "{rendered}");
         assert!(
             rendered.contains("&quot; onfocus=&quot;alert(1)"),
@@ -238,7 +505,13 @@ mod tests {
 
     #[test]
     fn the_form_lists_every_rank_and_preselects_the_latest_declaration() {
-        let rendered = registration_form("/register", "名前", Some(&profile("トレーナー")), None);
+        let profile = profile("トレーナー");
+        let rendered = registration_form(
+            "/register",
+            &profile,
+            &values(&profile),
+            &RegistrationFormErrors::default(),
+        );
         for rank in Rank::ALL {
             assert!(
                 rendered.contains(&format!("value=\"{}\"", rank.as_str())),
@@ -254,19 +527,39 @@ mod tests {
 
     #[test]
     fn the_form_works_for_a_first_time_visitor() {
-        let rendered = registration_form(
-            "/register",
-            "名前",
-            None,
-            Some("レートを数字で入れてください"),
-        );
-        assert!(rendered.contains("レートを数字で入れてください"));
-        assert!(!rendered.contains("selected"), "nothing preselected");
+        let profile = unregistered_profile();
+        let submitted = RegistrationFormValues {
+            trainer_name: "入力中".into(),
+            rank: "legend".into(),
+            rating: "not-a-number".into(),
+        };
+        let errors = RegistrationFormErrors {
+            rating: Some("本家レートを数字で入力してください。"),
+            ..RegistrationFormErrors::default()
+        };
+        let rendered = registration_form("/register", &profile, &submitted, &errors);
+        assert!(rendered.contains("本家レートを数字で入力してください。"));
+        assert!(rendered.contains("value=\"入力中\""));
+        assert!(rendered.contains("value=\"not-a-number\""));
+        assert!(rendered.contains("id=\"rating-error\""));
+        assert!(rendered.contains("aria-invalid=\"true\""));
         assert!(!rendered.contains("登録済みです"));
     }
 
     #[test]
-    fn the_result_page_explains_each_gate_separately() {
+    fn the_form_discloses_trainer_name_visibility() {
+        let profile = profile("トレーナー");
+        let rendered = registration_form(
+            "/register",
+            &profile,
+            &values(&profile),
+            &RegistrationFormErrors::default(),
+        );
+        assert!(rendered.contains("トレーナー名は他の参加者に公開されます"));
+    }
+
+    #[test]
+    fn the_result_page_explains_each_gate_separately_and_links_to_queue() {
         let eligibility = QueueEligibility {
             registration: Some(RegistrationBlock::RankBelowEntry {
                 declared: Some(Rank::Master),
@@ -277,6 +570,7 @@ mod tests {
         assert!(rendered.contains("いまはキューに入れません"));
         assert!(rendered.contains("参加資格は"), "{rendered}");
         assert!(rendered.contains("未報告の試合が1件"), "{rendered}");
+        assert!(rendered.contains("href=\"/queue\""), "{rendered}");
 
         let allowed = registration_result(&profile("トレーナー"), &QueueEligibility::default());
         assert!(allowed.contains("キューに参加できます"));
@@ -284,15 +578,31 @@ mod tests {
     }
 
     #[test]
+    fn pages_include_mobile_layout_and_accessible_focus_styles() {
+        let rendered = login_page("/auth/login");
+        assert!(rendered.contains("@media (max-width: 480px)"));
+        assert!(rendered.contains("width: min(100% - 24px, 680px)"));
+        assert!(rendered.contains(":focus-visible"));
+        assert!(rendered.contains("background: var(--discord)"));
+    }
+
+    #[test]
     fn every_page_is_a_complete_document() {
+        let profile = profile("t");
         for rendered in [
             login_page("/auth/login"),
-            registration_form("/register", "名前", None, None),
-            registration_result(&profile("t"), &QueueEligibility::default()),
+            registration_form(
+                "/register",
+                &profile,
+                &values(&profile),
+                &RegistrationFormErrors::default(),
+            ),
+            registration_result(&profile, &QueueEligibility::default()),
             error_page("エラー", "やり直してください"),
         ] {
             assert!(rendered.starts_with("<!doctype html>"), "{rendered}");
             assert!(rendered.contains("<meta charset=\"utf-8\">"));
+            assert!(rendered.contains("<meta name=\"viewport\""));
             assert!(rendered.trim_end().ends_with("</html>"));
         }
     }
