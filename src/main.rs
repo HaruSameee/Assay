@@ -9,6 +9,9 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use unite_matchsystem::admin::{
+    ADMIN_DISCORD_USER_IDS, AdminRepository, AdminState, admin_ids_from_env, router as admin_router,
+};
 use unite_matchsystem::api::{ApiState, router};
 use unite_matchsystem::discord::{
     Adapter, DiscordConfig, Handler, SerenityGateway, build_client, resolve_vc_pool,
@@ -17,10 +20,12 @@ use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository};
 use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
 use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
+use unite_matchsystem::rating::RatingAdjustmentRepository;
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
     router as registration_router,
 };
+use unite_matchsystem::status::{StatusRepository, StatusState, router as status_router};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const INTERNAL_API_TOKEN: &str = "INTERNAL_API_TOKEN";
@@ -52,6 +57,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let discord_config = DiscordConfig::from_env()?;
     let auth_config = AuthConfig::from_env()?;
     let matchmaker_config = MatchmakerConfig::from_env()?;
+    // 管理者 ID 未設定は「パネル無し」で正常起動（fail-closed）。数字でない値は起動で落とす
+    let admin_ids = admin_ids_from_env()?;
     let report_gate_disabled = report_gate_disabled_from_env()?;
     if report_gate_disabled {
         warn!(
@@ -68,6 +75,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let registration_repo =
         RegistrationRepository::new(pool.clone()).with_report_gate_disabled(report_gate_disabled);
     let queue_repo = QueueRepository::new(pool.clone());
+    let ratings_repo = RatingAdjustmentRepository::new(pool.clone());
+    let status_repo = StatusRepository::new(pool.clone());
+    let admin_store = AdminRepository::new(pool.clone());
     let matchmaker_repo = MatchmakerRepository::new(pool);
 
     let handler = Arc::new(Handler::default());
@@ -121,10 +131,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .merge(registration_router(auth))
     .merge(queue_router(QueueState::new(
-        auth_config,
+        auth_config.clone(),
         registration_repo,
         queue_repo,
+    )))
+    .merge(status_router(StatusState::new(
+        auth_config.clone(),
+        ratings_repo,
+        status_repo,
     )));
+    info!("status routes mounted");
+    // fail-closed: 管理者 ID が未設定ならルート自体をマウントしない
+    // （INTERNAL_API_TOKEN と同じ方針。設定してもセッションの Discord ID 照合が正）
+    let app = match admin_ids {
+        Some(ids) => {
+            info!(admins = %ids, "admin routes mounted");
+            app.merge(admin_router(AdminState::new(auth_config, ids, admin_store)))
+        }
+        None => {
+            warn!(
+                "{ADMIN_DISCORD_USER_IDS} is not set: admin routes are not mounted \
+                 (GET /admin will 404 for everyone)"
+            );
+            app
+        }
+    };
 
     let mut discord_task = tokio::spawn(async move { client.start().await });
     let mut http_task = tokio::spawn(async move { axum::serve(listener, app).await });

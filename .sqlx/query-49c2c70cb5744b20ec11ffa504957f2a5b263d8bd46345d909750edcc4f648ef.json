@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*) as \"matches!\", count(*) filter (where d.outcome = d.team) as \"wins!\", count(*) filter (where d.outcome <> d.team and d.outcome <> 'draw') as \"losses!\", count(*) filter (where d.outcome = 'draw') as \"draws!\" from player_match_rating_deltas d where d.player_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "matches!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "wins!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "losses!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "draws!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "49c2c70cb5744b20ec11ffa504957f2a5b263d8bd46345d909750edcc4f648ef"
+}
