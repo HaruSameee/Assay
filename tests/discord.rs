@@ -31,7 +31,7 @@ use unite_matchsystem::discord::gateway::{
 use unite_matchsystem::discord::payload::{
     ASSIGNMENT_MESSAGE_IDS_KEY, ATTEMPTS_KEY, CODE_MESSAGE_IDS_KEY, DISCORD_FAILURES_KEY,
     DiscordRecord, HOST_PROMPT_CHANNEL_ID_KEY, HOST_PROMPT_MESSAGE_ID_KEY, OPERATION_KEY,
-    TIMEOUT_REASON_KEY,
+    REPORT_MESSAGE_IDS_KEY, TIMEOUT_REASON_KEY,
 };
 use unite_matchsystem::discord::{
     DiscordConfig, ResolveError, VcPair, VcPoolSetupError, resolve_vc_pool,
@@ -262,6 +262,7 @@ fn config() -> DiscordConfig {
     DiscordConfig {
         token: "test".into(),
         guild_id: GUILD,
+        dispute_channel_id: ChannelId::new(999),
         vc_pool_size: 1,
         room_map: "kyogre".into(),
         room_checklist: vec!["設定 A".into(), "設定 B".into()],
@@ -355,6 +356,65 @@ async fn started(db: &AppDb, adapter: &Adapter, n: u128) -> (VcPair, ChannelId, 
     );
     let (channel, prompt) = record.host_prompt.unwrap();
     (record.vc.unwrap(), channel, prompt)
+}
+
+/// formation を報告受付中まで進める。
+async fn reporting_started(
+    db: &AppDb,
+    adapter: &Adapter,
+    fake: &FakeGateway,
+    n: u128,
+    interaction: u64,
+) -> (VcPair, DiscordRecord) {
+    let (vc, channel, prompt) = started(db, adapter, n).await;
+    let (accept, _) = prompt_buttons(fake, channel, prompt);
+    adapter
+        .handle_interaction(button(interaction, user(1), &accept))
+        .await
+        .unwrap();
+    let submit = custom(Action::CodeSubmit, fid(n), pid(1));
+    adapter
+        .handle_interaction(modal(interaction + 1, user(1), &submit, "1234"))
+        .await
+        .unwrap();
+    let (_, state, record) = load(db, fid(n)).await;
+    assert!(matches!(state, S::InProgress { .. }));
+    (vc, record)
+}
+
+fn report_button(fake: &FakeGateway, record: &DiscordRecord, action: Action) -> String {
+    let message = fake.message(
+        record.vc.as_ref().unwrap().red,
+        record.report_message_ids[&Team::Red],
+    );
+    message
+        .buttons
+        .iter()
+        .find(|button| CustomId::parse(&button.custom_id).is_some_and(|id| id.action == action))
+        .expect("report button")
+        .custom_id
+        .clone()
+}
+
+async fn append_test_report(
+    db: &AppDb,
+    player: u128,
+    outcome: Outcome,
+    reported_at: chrono::DateTime<Utc>,
+    key: &str,
+) {
+    db.repo
+        .append_latest_report(NewReport {
+            formation_id: fid(1),
+            player_id: pid(player),
+            reported_at,
+            outcome,
+            raw_result: serde_json::json!({ "source": "test", "key": key }),
+            supersedes_id: None,
+            idempotency_key: key.into(),
+        })
+        .await
+        .unwrap();
 }
 
 /// 打診メッセージの [部屋を作る] / [今回はパスする] の custom_id。
@@ -532,6 +592,16 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         code_event.payload[CODE_MESSAGE_IDS_KEY]["blue"],
         blue_code.get().to_string()
     );
+    let red_report = record.report_message_ids[&Team::Red];
+    let blue_report = record.report_message_ids[&Team::Blue];
+    assert_eq!(
+        code_event.payload[REPORT_MESSAGE_IDS_KEY]["red"],
+        red_report.get().to_string()
+    );
+    assert_eq!(
+        code_event.payload[REPORT_MESSAGE_IDS_KEY]["blue"],
+        blue_report.get().to_string()
+    );
 
     // 6. 開示メッセージは両 VC で同じ内容。残り 9 人に通知し、ルーム ID と集合場所を含む
     let reveal = fake.message(vc.red, red_code);
@@ -550,12 +620,273 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         other => panic!("expected UpdateMessage, got {other:?}"),
     }
 
-    // red: 割り当て表・打診・開示、blue: 割り当て表・開示。それ以外の投稿は無い
+    // 報告入口も両 VC で同じ。選択肢以外に人数・報告者・集計を一切出さない。
+    let report = fake.message(vc.red, red_report);
+    assert_eq!(report, fake.message(vc.blue, blue_report));
+    assert_eq!(
+        report
+            .buttons
+            .iter()
+            .map(|button| button.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["赤の勝ち", "青の勝ち", "無効試合"]
+    );
+    assert!(!report.content.contains("人"), "{}", report.content);
+    assert!(!report.content.contains("済"), "{}", report.content);
+    assert!(report.mention_users.is_empty());
+
+    // red: 割り当て表・打診・開示・報告、blue: 割り当て表・開示・報告。
     assert_eq!(
         fake.sends_in(vc.red),
-        vec![red_assignment, prompt, red_code]
+        vec![red_assignment, prompt, red_code, red_report]
     );
-    assert_eq!(fake.sends_in(vc.blue), vec![blue_assignment, blue_code]);
+    assert_eq!(
+        fake.sends_in(vc.blue),
+        vec![blue_assignment, blue_code, blue_report]
+    );
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn reports_are_participant_only_blind_and_idempotent(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let (_, record) = reporting_started(&db, &adapter, &fake, 1, 10_000).await;
+    let red = report_button(&fake, &record, Action::ReportRed);
+
+    adapter
+        .handle_interaction(button(10_010, UserId::new(999_999), &red))
+        .await
+        .unwrap();
+    assert!(matches!(
+        fake.last_response(),
+        InteractionResponse::Ephemeral(ref content)
+            if content == "この試合の参加者だけが報告できます。"
+    ));
+    let count = sqlx::query_scalar!(
+        "select count(*) as \"count!\" from match_reports where formation_id = $1",
+        fid(1).0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+
+    let interaction = button(10_011, user(1), &red);
+    adapter
+        .handle_interaction(interaction.clone())
+        .await
+        .unwrap();
+    adapter.handle_interaction(interaction).await.unwrap();
+    assert!(matches!(
+        fake.last_response(),
+        InteractionResponse::Ephemeral(ref content) if content == "受け付けました"
+    ));
+    let rows = sqlx::query!(
+        "select player_id, outcome, raw_result, idempotency_key from match_reports where formation_id = $1",
+        fid(1).0
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].player_id, pid(1).0);
+    assert_eq!(rows[0].outcome, "red");
+    assert_eq!(rows[0].idempotency_key, "10011");
+    assert_eq!(rows[0].raw_result["source"], "discord_button");
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn ten_unanimous_reports_confirm_immediately(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let (_, record) = reporting_started(&db, &adapter, &fake, 1, 10_100).await;
+    let red = report_button(&fake, &record, Action::ReportRed);
+
+    for n in 1..=10 {
+        adapter
+            .handle_interaction(button(10_110 + n, user(n), &red))
+            .await
+            .unwrap();
+    }
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Confirmed);
+    let event = log.events.last().unwrap();
+    assert_eq!(event.event.kind, K::Confirmed);
+    assert_eq!(event.payload["outcome"], "red");
+    assert_eq!(event.payload["decision_basis"], "all_players_reported");
+    assert_eq!(event.payload["first_report_agreement_matching"], 10);
+    assert_eq!(event.payload["first_report_agreement_total"], 10);
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn six_unanimous_reports_confirm_after_the_window(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let lifecycle = LifecycleConfig {
+        report_window: Duration::from_secs(1),
+        no_report_timeout: Duration::from_secs(3600),
+        ..LifecycleConfig::default()
+    };
+    let adapter = adapter_with_lifecycle(&db, fake.clone(), 1, lifecycle);
+    reporting_started(&db, &adapter, &fake, 1, 10_200).await;
+    let old = Utc::now() - TimeDelta::seconds(10);
+    for n in 1..=6 {
+        append_test_report(
+            &db,
+            n,
+            Outcome::Win(Team::Red),
+            old,
+            &format!("old-red-{n}"),
+        )
+        .await;
+    }
+
+    adapter.resume_unfinished().await.unwrap();
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Confirmed);
+    assert_eq!(log.events.last().unwrap().payload["outcome"], "red");
+    assert_eq!(
+        log.events.last().unwrap().payload["decision_basis"],
+        "report_window_elapsed"
+    );
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn split_reports_are_disputed_instead_of_using_a_majority(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let lifecycle = LifecycleConfig {
+        report_window: Duration::from_secs(1),
+        no_report_timeout: Duration::from_secs(3600),
+        ..LifecycleConfig::default()
+    };
+    let adapter = adapter_with_lifecycle(&db, fake.clone(), 1, lifecycle);
+    reporting_started(&db, &adapter, &fake, 1, 10_300).await;
+    let old = Utc::now() - TimeDelta::seconds(10);
+    for n in 1..=5 {
+        append_test_report(
+            &db,
+            n,
+            Outcome::Win(Team::Red),
+            old,
+            &format!("split-red-{n}"),
+        )
+        .await;
+    }
+    append_test_report(&db, 6, Outcome::Win(Team::Blue), old, "split-blue").await;
+
+    adapter.resume_unfinished().await.unwrap();
+    let (log, state, record) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Disputed);
+    let (channel, message_id) = record.dispute_notification.unwrap();
+    assert_eq!(channel, ChannelId::new(999));
+    let notification = fake.message(channel, message_id);
+    assert!(notification.content.contains("赤の勝ち:"));
+    assert!(notification.content.contains("青の勝ち:"));
+    assert!(notification.content.contains("<@1001>"));
+    let sends = fake.sends_in(channel).len();
+    adapter.resume_unfinished().await.unwrap();
+    assert_eq!(
+        fake.sends_in(channel).len(),
+        sends,
+        "notification is resumed from its recorded ID"
+    );
+    assert_eq!(
+        log.events
+            .iter()
+            .filter(|event| event.event.kind == K::Confirmed)
+            .count(),
+        0
+    );
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn unanimous_invalid_reports_end_as_nullified(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let (_, record) = reporting_started(&db, &adapter, &fake, 1, 10_400).await;
+    let invalid = report_button(&fake, &record, Action::ReportNullified);
+
+    for n in 1..=10 {
+        adapter
+            .handle_interaction(button(10_410 + n, user(n), &invalid))
+            .await
+            .unwrap();
+    }
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Nullified);
+    let event = log.events.last().unwrap();
+    assert_eq!(event.event.kind, K::Nullified);
+    assert_eq!(event.payload["outcome"], "nullified");
+    assert_ne!(state, S::Voided);
+    assert_ne!(state, S::Confirmed);
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn confirmation_uses_latest_reports_but_agreement_uses_first_reports(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let (_, record) = reporting_started(&db, &adapter, &fake, 1, 10_500).await;
+    let blue = report_button(&fake, &record, Action::ReportBlue);
+    let red = report_button(&fake, &record, Action::ReportRed);
+
+    adapter
+        .handle_interaction(button(10_510, user(1), &blue))
+        .await
+        .unwrap();
+    adapter
+        .handle_interaction(button(10_511, user(1), &red))
+        .await
+        .unwrap();
+    for n in 2..=10 {
+        adapter
+            .handle_interaction(button(10_511 + n, user(n), &red))
+            .await
+            .unwrap();
+    }
+
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Confirmed);
+    let event = log.events.last().unwrap();
+    assert_eq!(event.payload["outcome"], "red");
+    assert_eq!(event.payload["first_report_agreement_matching"], 9);
+    assert_eq!(event.payload["first_report_agreement_total"], 10);
+    let reports = sqlx::query_scalar!(
+        "select count(*) as \"count!\" from match_reports where formation_id = $1",
+        fid(1).0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(reports, 11);
     db.done().await;
 }
 
@@ -1052,7 +1383,7 @@ async fn booting_with_no_reports_past_the_deadline_voids_the_formation(owner: Pg
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
-async fn an_elapsed_report_window_is_left_for_phase_six_to_evaluate(owner: PgPool) {
+async fn an_elapsed_report_window_is_evaluated_by_the_existing_resume_loop(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
     let lifecycle = LifecycleConfig {
@@ -1079,13 +1410,16 @@ async fn an_elapsed_report_window_is_left_for_phase_six_to_evaluate(owner: PgPoo
             outcome: Outcome::Win(Team::Red),
             raw_result: serde_json::json!({ "source": "test" }),
             supersedes_id: None,
+            idempotency_key: "phase5-report".into(),
         })
         .await
         .unwrap();
 
     adapter.resume_unfinished().await.unwrap();
     let (log, state, _) = load(&db, fid(1)).await;
-    assert!(matches!(state, S::InProgress { .. }));
+    assert_eq!(state, S::Confirmed);
+    assert_eq!(log.events.last().unwrap().event.kind, K::Confirmed);
+    assert_eq!(log.events.last().unwrap().payload["outcome"], "red");
     assert!(log.events.iter().all(|event| event.event.kind != K::Voided));
     db.done().await;
 }

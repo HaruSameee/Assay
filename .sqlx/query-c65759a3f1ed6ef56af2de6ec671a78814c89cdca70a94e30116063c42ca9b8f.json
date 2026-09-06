@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, formation_id, player_id, outcome, raw_result, supersedes_id from match_reports where idempotency_key = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "formation_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "formation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "raw_result",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "raw_result"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "supersedes_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "supersedes_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "c65759a3f1ed6ef56af2de6ec671a78814c89cdca70a94e30116063c42ca9b8f"
+}

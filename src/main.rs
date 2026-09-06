@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use unite_matchsystem::api::{ApiState, router};
 use unite_matchsystem::discord::{
@@ -17,7 +17,8 @@ use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::persistence::FormationRepository;
 use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
 use unite_matchsystem::registration::{
-    AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, router as registration_router,
+    AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
+    router as registration_router,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
@@ -49,6 +50,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(Arc::from);
     let discord_config = DiscordConfig::from_env()?;
     let auth_config = AuthConfig::from_env()?;
+    let report_gate_disabled = report_gate_disabled_from_env()?;
+    if report_gate_disabled {
+        warn!(
+            "REPORT_GATE_DISABLED=true: report gate is disabled; registration gate remains active"
+        );
+    }
     let lifecycle = LifecycleConfig::default();
 
     let pool = PgPoolOptions::new()
@@ -56,7 +63,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .connect(&database_url)
         .await?;
     let repo = FormationRepository::new(pool.clone());
-    let registration_repo = RegistrationRepository::new(pool.clone());
+    let registration_repo =
+        RegistrationRepository::new(pool.clone()).with_report_gate_disabled(report_gate_disabled);
     let queue_repo = QueueRepository::new(pool);
 
     let handler = Arc::new(Handler::default());

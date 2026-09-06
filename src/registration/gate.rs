@@ -189,6 +189,7 @@ mod tests {
             in_progress.clone(),
             FormationState::Confirmed,
             FormationState::Disputed,
+            FormationState::Nullified,
         ] {
             assert!(
                 formation_blocks_queue(&state, false),
@@ -223,6 +224,7 @@ mod tests {
             },
             FormationState::Confirmed,
             FormationState::Disputed,
+            FormationState::Nullified,
         ] {
             assert!(
                 !formation_blocks_queue(&state, true),

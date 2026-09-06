@@ -28,7 +28,7 @@ pub mod repository;
 pub mod routes;
 pub mod session;
 
-pub use config::{AuthConfig, AuthConfigError, Secret};
+pub use config::{AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env};
 pub use gate::{QueueEligibility, RegistrationBlock, evaluate, formation_blocks_queue};
 pub use model::{Declaration, NewDeclaration, PlayerProfile, PlayerStatus, Rank};
 pub use oauth::{DiscordUser, HttpOAuthClient, OAuthClient, OAuthError};

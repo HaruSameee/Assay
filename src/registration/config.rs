@@ -26,6 +26,32 @@ pub mod keys {
     pub const SESSION_SECRET: &str = "SESSION_SECRET";
     /// セッションの有効期限（時間）。過ぎたら再ログインに落とす。
     pub const SESSION_TTL_HOURS: &str = "SESSION_TTL_HOURS";
+    /// 緊急時に報告ゲートだけを止める。登録ゲートには影響しない。
+    pub const REPORT_GATE_DISABLED: &str = "REPORT_GATE_DISABLED";
+}
+
+/// 報告ゲートの縮退フラグ。未設定は false で、明示的な `true` だけが無効化する。
+pub fn report_gate_disabled_from_env() -> Result<bool, AuthConfigError> {
+    match env::var(keys::REPORT_GATE_DISABLED) {
+        Err(env::VarError::NotPresent) => parse_report_gate_disabled(None),
+        Ok(value) => parse_report_gate_disabled(Some(&value)),
+        Err(env::VarError::NotUnicode(_)) => Err(AuthConfigError::Invalid {
+            name: keys::REPORT_GATE_DISABLED,
+            reason: "must be true or false".into(),
+        }),
+    }
+}
+
+fn parse_report_gate_disabled(value: Option<&str>) -> Result<bool, AuthConfigError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(_) => Err(AuthConfigError::Invalid {
+            name: keys::REPORT_GATE_DISABLED,
+            reason: "must be true or false".into(),
+        }),
+    }
 }
 
 mod defaults {
@@ -271,5 +297,14 @@ mod tests {
         );
         // 同じ材料からは同じ鍵（プロセスを再起動してもセッションが切れない）
         assert_eq!(config.cookie_key().signing(), config.cookie_key().signing());
+    }
+
+    #[test]
+    fn report_gate_flag_is_fail_closed_by_default() {
+        assert!(!parse_report_gate_disabled(None).unwrap());
+        assert!(!parse_report_gate_disabled(Some("")).unwrap());
+        assert!(!parse_report_gate_disabled(Some("false")).unwrap());
+        assert!(parse_report_gate_disabled(Some("TRUE")).unwrap());
+        assert!(parse_report_gate_disabled(Some("yes")).is_err());
     }
 }

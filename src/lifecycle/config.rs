@@ -78,6 +78,7 @@ pub fn next_deadline(
         | S::AwaitingHost { pending: None, .. }
         | S::Confirmed
         | S::Disputed
+        | S::Nullified
         | S::Voided
         | S::Abandoned => return None,
     };
@@ -199,6 +200,7 @@ mod tests {
             nominating,
             S::Confirmed,
             S::Disputed,
+            S::Nullified,
             S::Voided,
             S::Abandoned,
         ] {

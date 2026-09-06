@@ -28,7 +28,7 @@ use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::persistence::{
-    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team,
+    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
 };
 use unite_matchsystem::queue::{QueueRepository, QueueState, router};
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
@@ -419,6 +419,18 @@ async fn the_registration_and_report_gates_are_reported_separately(owner: PgPool
     let reporter = player(11);
     register(&db, reporter, Rank::Legend).await;
     unreported_formation(&db, 0xf1, reporter).await;
+    db.formations
+        .append_report(&NewReport {
+            formation_id: fid(0xf1),
+            player_id: player(2),
+            reported_at: at(10),
+            outcome: Outcome::Win(Team::Blue),
+            raw_result: json!({ "source": "other-player" }),
+            idempotency_key: "queue-blind-other-report".into(),
+            supersedes_id: None,
+        })
+        .await
+        .unwrap();
     let (status, denied) = post_queue(&app, reporter, body.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -431,6 +443,19 @@ async fn the_registration_and_report_gates_are_reported_separately(owner: PgPool
         1,
         "{denied}"
     );
+    let response = denied.to_string();
+    for private in [
+        "outcome",
+        "blue",
+        "other-player",
+        "report_count",
+        "reported_by",
+    ] {
+        assert!(
+            !response.contains(private),
+            "private report data leaked: {response}"
+        );
+    }
 
     // 両方: 理由が2つとも残る（1つの真偽値に畳まれない）
     let both = player(12);

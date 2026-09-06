@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select report.id, report.player_id, report.outcome from match_reports report where report.formation_id = $1 and not exists (select 1 from match_reports correction where correction.supersedes_id = report.id) order by report.player_id, report.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "outcome"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "480674b2e6c96fb28a33462d0dab10d8787b9e8ddcc216aa44468cb2450791bb"
+}

@@ -26,6 +26,9 @@ pub enum RepositoryError {
         /// 再利用されたキー。
         idempotency_key: String,
     },
+    /// 同じ Discord インタラクション ID が異なる報告内容に再利用された。
+    #[error("report idempotency key {0:?} is already used by a different report")]
+    ReportIdempotencyKeyReused(String),
     /// 報告を受け付けない状態（コード開示前、または試合不成立）。
     ///
     /// 理由となる状態は載せない。報告者に返してよいのは「受理できなかった」までで、

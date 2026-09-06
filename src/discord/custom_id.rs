@@ -10,6 +10,7 @@
 use uuid::Uuid;
 
 use crate::lifecycle::{FormationId, PlayerId};
+use crate::persistence::{Outcome, Team};
 
 /// モーダル内のルーム ID 入力欄の `custom_id`。
 pub const ROOM_CODE_INPUT_ID: &str = "room_code";
@@ -25,14 +26,23 @@ pub enum Action {
     CodeOpen,
     /// ルーム ID のモーダルが送信された。
     CodeSubmit,
+    /// 赤チーム勝利の報告。
+    ReportRed,
+    /// 青チーム勝利の報告。
+    ReportBlue,
+    /// 無効試合の報告。
+    ReportNullified,
 }
 
 impl Action {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 7] = [
         Self::HostAccept,
         Self::HostDecline,
         Self::CodeOpen,
         Self::CodeSubmit,
+        Self::ReportRed,
+        Self::ReportBlue,
+        Self::ReportNullified,
     ];
 
     fn tag(self) -> &'static str {
@@ -41,6 +51,18 @@ impl Action {
             Self::HostDecline => "hd",
             Self::CodeOpen => "co",
             Self::CodeSubmit => "cs",
+            Self::ReportRed => "rr",
+            Self::ReportBlue => "rb",
+            Self::ReportNullified => "rn",
+        }
+    }
+
+    pub fn report_outcome(self) -> Option<Outcome> {
+        match self {
+            Self::ReportRed => Some(Outcome::Win(Team::Red)),
+            Self::ReportBlue => Some(Outcome::Win(Team::Blue)),
+            Self::ReportNullified => Some(Outcome::Nullified),
+            _ => None,
         }
     }
 }
@@ -64,6 +86,12 @@ impl CustomId {
             formation,
             player,
         }
+    }
+
+    /// 全参加者が使う報告ボタン。押下者は埋め込まず、編成の Discord ID から特定する。
+    pub fn report(action: Action, formation: FormationId) -> Self {
+        debug_assert!(action.report_outcome().is_some());
+        Self::new(action, formation, PlayerId(Uuid::nil()))
     }
 
     /// Discord に渡す文字列。

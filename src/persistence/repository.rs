@@ -12,22 +12,26 @@ use crate::lifecycle::{
 use super::codec::{EventRow, decode_row};
 use super::error::RepositoryError;
 use super::model::{
-    AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewReport, ReportId, RosterEntry,
+    AppendOutcome, AppendReportOutcome, EventId, FormationLog, NewEvent, NewFormation, NewReport,
+    Outcome, ReportDecision, ReportEvaluation, ReportEvidence, ReportId, ReportVote, RosterEntry,
     Team, UnfinishedFormation, VcAssignment,
 };
+use super::reporting::{confirmation_from_latest_reports, first_report_agreement_counts};
 
 /// 終端状態を作る種別。[`FormationRepository::list_unfinished`] の SQL 側の絞り込みに使う。
-const TERMINAL_KINDS: [FormationEventKind; 3] = [
+const TERMINAL_KINDS: [FormationEventKind; 4] = [
     FormationEventKind::Confirmed,
+    FormationEventKind::Nullified,
     FormationEventKind::Voided,
     FormationEventKind::Abandoned,
 ];
 
 /// VC を解放する種別。`disputed` はスタッフ裁定待ちとしては未終了だが、VC の組を占有し続ける
 /// 理由は無いのでプールからは解放する。
-const VC_RELEASE_KINDS: [FormationEventKind; 4] = [
+const VC_RELEASE_KINDS: [FormationEventKind; 5] = [
     FormationEventKind::Confirmed,
     FormationEventKind::Disputed,
+    FormationEventKind::Nullified,
     FormationEventKind::Voided,
     FormationEventKind::Abandoned,
 ];
@@ -40,6 +44,11 @@ const VC_POOL_LOCK_KEY: i64 = 0x4153_5341_595F_5643;
 
 /// 訂正チェーンの分岐を防ぐ部分 unique インデックス名（マイグレーションと一致させる）。
 const SUPERSEDES_UNIQUE_INDEX: &str = "match_reports_supersedes_uniq";
+
+const FINAL_OUTCOME_KEY: &str = "outcome";
+const DECISION_BASIS_KEY: &str = "decision_basis";
+const AGREEMENT_MATCHING_KEY: &str = "first_report_agreement_matching";
+const AGREEMENT_TOTAL_KEY: &str = "first_report_agreement_total";
 
 /// プール全体のロック下での VC 割当結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,44 +446,114 @@ impl FormationRepository {
     /// 他人の報告は読まない（ブラインド）。
     pub async fn append_report(&self, report: &NewReport) -> Result<ReportId, RepositoryError> {
         let mut tx = self.pool.begin().await?;
-        let snapshot = lock_and_load(&mut tx, report.formation_id)
-            .await?
-            .snapshot();
-        if !snapshot.state.requires_reports() {
-            return Err(RepositoryError::ReportsNotAccepted {
-                formation_id: report.formation_id,
-            });
-        }
-        if let Some(previous) = report.supersedes_id {
-            let owner = sqlx::query!(
-                "select formation_id, player_id from match_reports where id = $1",
-                previous.0
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            let same_owner = owner.is_some_and(|owner| {
-                owner.formation_id == report.formation_id.0 && owner.player_id == report.player_id.0
-            });
-            if !same_owner {
-                return Err(RepositoryError::SupersedeMismatch(previous));
-            }
-        }
-        let inserted = sqlx::query!(
-            "insert into match_reports \
-             (formation_id, player_id, reported_at, outcome, raw_result, supersedes_id) \
-             values ($1, $2, $3, $4, $5, $6) returning id",
-            report.formation_id.0,
-            report.player_id.0,
-            report.reported_at,
-            report.outcome.as_str(),
-            report.raw_result,
-            report.supersedes_id.map(|report| report.0),
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| map_report_insert_error(error, report.supersedes_id))?;
+        let log = lock_and_load(&mut tx, report.formation_id).await?;
+        let inserted = append_report_locked(&mut tx, &log, report, true).await?;
         tx.commit().await?;
-        Ok(ReportId(inserted.id))
+        Ok(inserted.report_id)
+    }
+
+    /// Discord ボタンから報告を追記する。訂正先は同じロック下で現在の最新報告から決める。
+    pub async fn append_latest_report(
+        &self,
+        mut report: NewReport,
+    ) -> Result<AppendReportOutcome, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let log = lock_and_load(&mut tx, report.formation_id).await?;
+        if let Some(existing) = existing_report_for_key(&mut tx, &report, false).await? {
+            tx.commit().await?;
+            return Ok(existing);
+        }
+        report.supersedes_id =
+            latest_report_id(&mut tx, report.formation_id, report.player_id).await?;
+        let inserted = append_report_locked(&mut tx, &log, &report, false).await?;
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// 最新報告で確定判定し、必要なら同じ formation ロック下で終端イベントを追記する。
+    /// 最初の報告は一致率指標にだけ使い、判定には混ぜない。
+    pub(crate) async fn evaluate_reports(
+        &self,
+        formation_id: FormationId,
+        report_window_elapsed: bool,
+        occurred_at: Timestamp,
+        idempotency_key: String,
+    ) -> Result<ReportEvaluation, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let log = lock_and_load(&mut tx, formation_id).await?;
+        let evidence = load_report_evidence(&mut tx, formation_id).await?;
+        if !matches!(log.snapshot().state, FormationState::InProgress { .. }) {
+            tx.commit().await?;
+            return Ok(ReportEvaluation {
+                decision: ReportDecision::Pending,
+                evidence,
+                event: None,
+            });
+        }
+        let decision = confirmation_from_latest_reports(&evidence, report_window_elapsed);
+        let event = match decision {
+            ReportDecision::Pending => None,
+            ReportDecision::Confirmed(outcome) => {
+                let (matching, total) = first_report_agreement_counts(&evidence, outcome);
+                let payload = serde_json::json!({
+                    FINAL_OUTCOME_KEY: outcome.as_str(),
+                    DECISION_BASIS_KEY: if report_window_elapsed { "report_window_elapsed" } else { "all_players_reported" },
+                    AGREEMENT_MATCHING_KEY: matching,
+                    AGREEMENT_TOTAL_KEY: total,
+                });
+                let candidate = NewEvent::new(
+                    FormationEventKind::Confirmed,
+                    None,
+                    occurred_at,
+                    idempotency_key,
+                )
+                .with_payload(payload);
+                Some(append_locked(&mut tx, formation_id, &candidate, log).await?)
+            }
+            ReportDecision::Nullified => {
+                let (matching, total) =
+                    first_report_agreement_counts(&evidence, Outcome::Nullified);
+                let payload = serde_json::json!({
+                    FINAL_OUTCOME_KEY: Outcome::Nullified.as_str(),
+                    DECISION_BASIS_KEY: if report_window_elapsed { "report_window_elapsed" } else { "all_players_reported" },
+                    AGREEMENT_MATCHING_KEY: matching,
+                    AGREEMENT_TOTAL_KEY: total,
+                });
+                let candidate = NewEvent::new(
+                    FormationEventKind::Nullified,
+                    None,
+                    occurred_at,
+                    idempotency_key,
+                )
+                .with_payload(payload);
+                Some(append_locked(&mut tx, formation_id, &candidate, log).await?)
+            }
+            ReportDecision::Disputed => {
+                let candidate = NewEvent::new(
+                    FormationEventKind::Disputed,
+                    None,
+                    occurred_at,
+                    idempotency_key,
+                )
+                .with_payload(report_breakdown_payload(&evidence));
+                Some(append_locked(&mut tx, formation_id, &candidate, log).await?)
+            }
+        };
+        tx.commit().await?;
+        Ok(ReportEvaluation {
+            decision,
+            evidence,
+            event,
+        })
+    }
+
+    /// 係争通知の再開用。HTTP には公開せず、Discord アダプタ内部だけが読む。
+    pub(crate) async fn report_evidence(
+        &self,
+        formation_id: FormationId,
+    ) -> Result<ReportEvidence, RepositoryError> {
+        let mut conn = self.pool.acquire().await?;
+        load_report_evidence(&mut conn, formation_id).await
     }
 
     /// Phase 5 の期限判定専用。報告内容・報告者・件数を返さず、HTTP 層には公開しない。
@@ -490,6 +569,216 @@ impl FormationRepository {
         .await?;
         Ok(row.first_report_at)
     }
+
+    /// 報告ゼロ期限のイベントを、formation ロック下で報告有無を再確認してから追記する。
+    /// Discord の報告処理と期限走査が競合しても、ロックを先に取った側だけが成立する。
+    pub(crate) async fn append_if_no_reports(
+        &self,
+        formation_id: FormationId,
+        event: &NewEvent,
+    ) -> Result<Option<AppendOutcome>, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let log = lock_and_load(&mut tx, formation_id).await?;
+        if !matches!(log.snapshot().state, FormationState::InProgress { .. }) {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let has_reports = sqlx::query_scalar!(
+            "select exists(select 1 from match_reports where formation_id = $1) as \"has_reports!\"",
+            formation_id.0,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_reports {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let outcome = append_locked(&mut tx, formation_id, event, log).await?;
+        tx.commit().await?;
+        Ok(Some(outcome))
+    }
+}
+
+async fn append_report_locked(
+    conn: &mut PgConnection,
+    log: &FormationLog,
+    report: &NewReport,
+    compare_supersedes: bool,
+) -> Result<AppendReportOutcome, RepositoryError> {
+    if report.idempotency_key.trim().is_empty() {
+        return Err(RepositoryError::ReportIdempotencyKeyReused(
+            report.idempotency_key.clone(),
+        ));
+    }
+    if let Some(existing) = existing_report_for_key(conn, report, compare_supersedes).await? {
+        return Ok(existing);
+    }
+    if !log.snapshot().state.requires_reports() {
+        return Err(RepositoryError::ReportsNotAccepted {
+            formation_id: report.formation_id,
+        });
+    }
+    if let Some(previous) = report.supersedes_id {
+        let owner = sqlx::query!(
+            "select formation_id, player_id from match_reports where id = $1",
+            previous.0
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        let same_owner = owner.is_some_and(|owner| {
+            owner.formation_id == report.formation_id.0 && owner.player_id == report.player_id.0
+        });
+        if !same_owner {
+            return Err(RepositoryError::SupersedeMismatch(previous));
+        }
+    }
+    let inserted = sqlx::query!(
+        "insert into match_reports \
+         (formation_id, player_id, reported_at, outcome, raw_result, supersedes_id, idempotency_key) \
+         values ($1, $2, $3, $4, $5, $6, $7) returning id",
+        report.formation_id.0,
+        report.player_id.0,
+        report.reported_at,
+        report.outcome.as_str(),
+        report.raw_result,
+        report.supersedes_id.map(|report| report.0),
+        report.idempotency_key,
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|error| map_report_insert_error(error, report.supersedes_id))?;
+    Ok(AppendReportOutcome {
+        report_id: ReportId(inserted.id),
+        already_recorded: false,
+    })
+}
+
+/// 同じインタラクション ID の再送だけを no-op にする。時刻は再送処理時に変わりうるので比較しない。
+async fn existing_report_for_key(
+    conn: &mut PgConnection,
+    report: &NewReport,
+    compare_supersedes: bool,
+) -> Result<Option<AppendReportOutcome>, RepositoryError> {
+    let existing = sqlx::query!(
+        "select id, formation_id, player_id, outcome, raw_result, supersedes_id \
+         from match_reports where idempotency_key = $1",
+        report.idempotency_key,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let same = existing.formation_id == report.formation_id.0
+        && existing.player_id == report.player_id.0
+        && existing.outcome == report.outcome.as_str()
+        && existing.raw_result == report.raw_result
+        && (!compare_supersedes || existing.supersedes_id == report.supersedes_id.map(|id| id.0));
+    if !same {
+        return Err(RepositoryError::ReportIdempotencyKeyReused(
+            report.idempotency_key.clone(),
+        ));
+    }
+    Ok(Some(AppendReportOutcome {
+        report_id: ReportId(existing.id),
+        already_recorded: true,
+    }))
+}
+
+async fn latest_report_id(
+    conn: &mut PgConnection,
+    formation_id: FormationId,
+    player_id: PlayerId,
+) -> Result<Option<ReportId>, sqlx::Error> {
+    let row = sqlx::query!(
+        "select report.id from match_reports report \
+         where report.formation_id = $1 and report.player_id = $2 \
+           and not exists (select 1 from match_reports correction where correction.supersedes_id = report.id) \
+         order by report.id desc limit 1",
+        formation_id.0,
+        player_id.0,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|row| ReportId(row.id)))
+}
+
+async fn load_report_evidence(
+    conn: &mut PgConnection,
+    formation_id: FormationId,
+) -> Result<ReportEvidence, RepositoryError> {
+    let participant_count = sqlx::query_scalar!(
+        "select count(*) as \"participant_count!\" from formation_players where formation_id = $1",
+        formation_id.0,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let latest = sqlx::query!(
+        "select report.id, report.player_id, report.outcome \
+         from match_reports report \
+         where report.formation_id = $1 \
+           and not exists (select 1 from match_reports correction where correction.supersedes_id = report.id) \
+         order by report.player_id, report.id",
+        formation_id.0,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let first = sqlx::query!(
+        "select distinct on (report.player_id) report.id, report.player_id, report.outcome \
+         from match_reports report where report.formation_id = $1 \
+         order by report.player_id, report.id",
+        formation_id.0,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let parse = |id: i64, player_id: Uuid, outcome: String| {
+        outcome
+            .parse()
+            .map(|outcome| ReportVote {
+                id: ReportId(id),
+                player_id: PlayerId(player_id),
+                outcome,
+            })
+            .map_err(|error| {
+                RepositoryError::InvalidFormation(format!(
+                    "formation {formation_id}: unreadable report {id}: {error}"
+                ))
+            })
+    };
+    Ok(ReportEvidence {
+        latest_for_confirmation: latest
+            .into_iter()
+            .map(|row| parse(row.id, row.player_id, row.outcome))
+            .collect::<Result<_, _>>()?,
+        first_for_agreement_metric: first
+            .into_iter()
+            .map(|row| parse(row.id, row.player_id, row.outcome))
+            .collect::<Result<_, _>>()?,
+        participant_count: usize::try_from(participant_count).map_err(|_| {
+            RepositoryError::InvalidFormation(format!(
+                "formation {formation_id}: invalid participant count {participant_count}"
+            ))
+        })?,
+    })
+}
+
+fn report_breakdown_payload(evidence: &ReportEvidence) -> serde_json::Value {
+    let count = |outcome| {
+        evidence
+            .latest_for_confirmation
+            .iter()
+            .filter(|vote| vote.outcome == outcome)
+            .count()
+    };
+    serde_json::json!({
+        DECISION_BASIS_KEY: "report_window_elapsed",
+        "latest_report_breakdown": {
+            "red": count(Outcome::Win(Team::Red)),
+            "blue": count(Outcome::Win(Team::Blue)),
+            "draw": count(Outcome::Draw),
+            "nullified": count(Outcome::Nullified),
+        }
+    })
 }
 
 /// `append_event` とプール割当が共用する、ロック取得済みトランザクション内の追記。

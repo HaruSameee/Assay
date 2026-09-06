@@ -82,17 +82,37 @@ impl std::str::FromStr for Team {
 pub enum Outcome {
     /// どちらかのチームの勝ち。
     Win(Team),
-    /// 引き分け。
+    /// 成立した試合の引き分け。Discord の Phase 6 ボタンからは生成しない。
     Draw,
+    /// 試合が成立しなかったという報告。`draw` や報告ゼロの `voided` とは別。
+    Nullified,
 }
 
 impl Outcome {
-    /// DB の値（`red` / `blue` / `draw`）。勝ったチームは `formation_players.team` と同じ値なので、
+    /// DB の値（`red` / `blue` / `draw` / `nullified`）。勝ったチームは `formation_players.team` と同じ値なので、
     /// 勝者側のプレイヤーは `where fp.team = mr.outcome` で引ける。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Win(team) => team.as_str(),
             Self::Draw => "draw",
+            Self::Nullified => "nullified",
+        }
+    }
+}
+
+impl std::str::FromStr for Outcome {
+    type Err = UnknownValue;
+
+    fn from_str(s: &str) -> Result<Self, UnknownValue> {
+        match s {
+            "red" => Ok(Self::Win(Team::Red)),
+            "blue" => Ok(Self::Win(Team::Blue)),
+            "draw" => Ok(Self::Draw),
+            "nullified" => Ok(Self::Nullified),
+            _ => Err(UnknownValue {
+                what: "report outcome",
+                value: s.to_owned(),
+            }),
         }
     }
 }
@@ -276,8 +296,52 @@ pub struct NewReport {
     pub outcome: Outcome,
     /// 報告された生データ。受け取ったものをそのまま入れる（パースに失敗しても捨てない）。
     pub raw_result: Value,
+    /// Discord インタラクション ID。新規報告では必須で、同じキーだけを no-op にする。
+    pub idempotency_key: String,
     /// 打ち消す以前の報告（同じプレイヤー・同じ formation のものに限る）。
     pub supersedes_id: Option<ReportId>,
+}
+
+/// 評価器が読む1人分の報告。外向きの API には公開しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportVote {
+    pub id: ReportId,
+    pub player_id: PlayerId,
+    pub outcome: Outcome,
+}
+
+/// 最新報告と最初の報告を、用途を名前で取り違えられない形に分けたもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportEvidence {
+    /// 確定・係争判定に使う、各プレイヤーの訂正チェーンの先頭。
+    pub latest_for_confirmation: Vec<ReportVote>,
+    /// 一致率の指標にだけ使う、各プレイヤーが最初に送った報告。
+    pub first_for_agreement_metric: Vec<ReportVote>,
+    pub participant_count: usize,
+}
+
+/// 報告評価の結果。`Pending` はまだイベントを積まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportDecision {
+    Pending,
+    Confirmed(Outcome),
+    Nullified,
+    Disputed,
+}
+
+/// サーバ内部の評価結果。報告者へのレスポンスには変換しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportEvaluation {
+    pub decision: ReportDecision,
+    pub evidence: ReportEvidence,
+    pub event: Option<AppendOutcome>,
+}
+
+/// 報告追記の結果。外向きには確定状態や他人の情報を返さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendReportOutcome {
+    pub report_id: ReportId,
+    pub already_recorded: bool,
 }
 
 /// 永続化済みのイベント（DB の id 付き）。

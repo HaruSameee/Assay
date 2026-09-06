@@ -785,6 +785,7 @@ async fn the_report_gate_opens_when_the_player_reports(owner: PgPool) {
             outcome: Outcome::Win(Team::Red),
             raw_result: json!({}),
             supersedes_id: None,
+            idempotency_key: "registration-report-1".into(),
         })
         .await
         .unwrap();
@@ -801,6 +802,7 @@ async fn the_report_gate_opens_when_the_player_reports(owner: PgPool) {
             outcome: Outcome::Win(Team::Blue),
             raw_result: json!({}),
             supersedes_id: None,
+            idempotency_key: "registration-report-2-other".into(),
         })
         .await
         .unwrap();
@@ -836,6 +838,7 @@ async fn a_disputed_formation_does_not_re_block_a_player_who_reported(owner: PgP
             outcome: Outcome::Win(Team::Red),
             raw_result: json!({}),
             supersedes_id: None,
+            idempotency_key: "registration-report-flag".into(),
         })
         .await
         .unwrap();
@@ -949,5 +952,41 @@ async fn the_two_gates_are_reported_separately(owner: PgPool) {
     let eligibility = db.repo.queue_eligibility(player).await.unwrap();
     assert_eq!(eligibility.registration, Some(RegistrationBlock::Suspended));
     assert_eq!(eligibility.pending_reports, vec![fid(1)]);
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn disabling_the_report_gate_does_not_disable_the_registration_gate(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let player = PlayerId(Uuid::from_u128(1));
+    db.repo
+        .register(&unite_matchsystem::registration::NewDeclaration {
+            player_id: player,
+            declared_at: at(0),
+            trainer_name: "トレーナー".into(),
+            rank: Rank::Master,
+            rating: Some(1400),
+            raw: json!({}),
+        })
+        .await
+        .unwrap();
+    formation_in_progress(&db, 1, player).await;
+
+    let disabled = RegistrationRepository::new(db.pool.clone()).with_report_gate_disabled(true);
+    let eligibility = disabled.queue_eligibility(player).await.unwrap();
+    assert_eq!(eligibility.pending_reports, Vec::new());
+    assert_eq!(
+        eligibility.registration,
+        Some(RegistrationBlock::RankBelowEntry {
+            declared: Some(Rank::Master)
+        })
+    );
+    assert!(
+        !eligibility.is_allowed(),
+        "registration gate must remain active"
+    );
     db.done().await;
 }

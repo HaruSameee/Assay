@@ -199,6 +199,21 @@ fn voided_after_code_posted_does_not_raise_the_report_gate() {
 }
 
 #[test]
+fn unanimous_invalid_is_distinct_from_no_report_voided() {
+    let state = in_progress(pid(1), "1234");
+    let nullified = apply(&state, &ev(4, K::Nullified, None)).unwrap();
+
+    assert_eq!(nullified, S::Nullified);
+    assert!(nullified.is_terminal());
+    assert!(
+        nullified.requires_reports(),
+        "確定済みでも本人が報告するまではゲートを残す"
+    );
+    assert_ne!(nullified, S::Voided);
+    assert!(apply(&nullified, &ev(5, K::Confirmed, None)).is_err());
+}
+
+#[test]
 fn duplicate_idempotency_keys_are_no_ops_recorded_as_anomalies() {
     let (a, b, c) = (pid(1), pid(2), pid(3));
     let scenarios: Vec<Vec<FormationEvent>> = vec![

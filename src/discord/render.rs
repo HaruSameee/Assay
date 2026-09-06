@@ -10,7 +10,7 @@ use chrono::FixedOffset;
 use serenity::model::id::UserId;
 
 use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
-use crate::persistence::{RosterEntry, Team};
+use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
 
 use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
 use super::gateway::{Button, ButtonStyle, Modal, OutgoingMessage};
@@ -234,6 +234,93 @@ pub fn code_reveal(
     }
 }
 
+/// 全参加者向けの報告入口。集計・人数・報告者名は一切載せない。
+pub fn report_prompt(heading: &str, formation: FormationId) -> OutgoingMessage {
+    OutgoingMessage {
+        content: format!(
+            "{heading}試合の内容を選んで報告してください。報告内容は他の参加者には表示されません。"
+        ),
+        buttons: vec![
+            Button {
+                custom_id: CustomId::report(Action::ReportRed, formation).encode(),
+                label: "赤の勝ち".into(),
+                style: ButtonStyle::Primary,
+            },
+            Button {
+                custom_id: CustomId::report(Action::ReportBlue, formation).encode(),
+                label: "青の勝ち".into(),
+                style: ButtonStyle::Primary,
+            },
+            Button {
+                custom_id: CustomId::report(Action::ReportNullified, formation).encode(),
+                label: "無効試合".into(),
+                style: ButtonStyle::Secondary,
+            },
+        ],
+        mention_users: Vec::new(),
+    }
+}
+
+/// 報告を受理した本人だけに返す。判定状態や他人の情報は含めない。
+pub fn report_received() -> String {
+    "受け付けました".into()
+}
+
+/// 編成外のユーザーにだけ返す。
+pub fn report_not_participant() -> String {
+    "この試合の参加者だけが報告できます。".into()
+}
+
+/// コード開示前や報告不能状態の操作にだけ返す。内部状態は明かさない。
+pub fn report_unavailable() -> String {
+    "この報告は受け付けられませんでした。".into()
+}
+
+/// 係争を運営専用チャンネルへ通知する。最新報告だけの内訳を出す。
+pub(crate) fn dispute_notification(
+    formation: FormationId,
+    roster: &[RosterEntry],
+    latest: &[ReportVote],
+) -> OutgoingMessage {
+    let participant = |player: PlayerId| {
+        roster
+            .iter()
+            .find(|entry| entry.player_id == player)
+            .and_then(user_of)
+            .map(mention)
+            .unwrap_or_else(|| player.to_string())
+    };
+    let voters = |outcome: Outcome| {
+        let names: Vec<String> = latest
+            .iter()
+            .filter(|vote| vote.outcome == outcome)
+            .map(|vote| participant(vote.player_id))
+            .collect();
+        if names.is_empty() {
+            "なし".into()
+        } else {
+            names.join(" ")
+        }
+    };
+    let participants = roster
+        .iter()
+        .map(|entry| participant(entry.player_id))
+        .collect::<Vec<_>>()
+        .join(" ");
+    OutgoingMessage {
+        content: format!(
+            "## disputed: {}\nformation: `{formation}`\n参加者: {participants}\n赤の勝ち: {}\n青の勝ち: {}\n引き分け: {}\n無効試合: {}",
+            match_label(formation),
+            voters(Outcome::Win(Team::Red)),
+            voters(Outcome::Win(Team::Blue)),
+            voters(Outcome::Draw),
+            voters(Outcome::Nullified),
+        ),
+        buttons: Vec::new(),
+        mention_users: Vec::new(),
+    }
+}
+
 /// 解散の通知。理由は運用上の事実だけを書く（人の推測はしない）。両方の VC チャットに出す。
 pub fn abandoned_notice(heading: &str, reason: AbandonReason) -> OutgoingMessage {
     let why = match reason {
@@ -310,8 +397,7 @@ mod tests {
 
     use super::*;
 
-    /// 勝敗を示す語。VC チャットに出る文言にこれらが含まれてはならない。
-    /// Phase 6 で報告の文言が増えたら、このリストも見直すこと。
+    /// ロビー運用の文言には勝敗を混ぜない。Phase 6 の専用報告入口はこの対象外。
     const FORBIDDEN: [&str; 14] = [
         "勝",
         "負",

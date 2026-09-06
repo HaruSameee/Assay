@@ -438,12 +438,9 @@ fn event_kind_check_matches_rust_enum() {
         .into_iter()
         .filter_map(|(path, sql)| kind_check_values(&sql).map(|values| (path, values)))
         .collect();
-    assert_eq!(
-        checks.len(),
-        1,
-        "exactly one migration must define the kind CHECK: {checks:?}"
-    );
-    let (path, sql_values) = &checks[0];
+    let (path, sql_values) = checks
+        .last()
+        .expect("at least one migration must define the kind CHECK");
 
     let mut sql_sorted = sql_values.clone();
     sql_sorted.sort();

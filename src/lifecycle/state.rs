@@ -43,6 +43,8 @@ pub enum FormationState {
     Confirmed,
     /// 報告が拮抗。スタッフ介入待ち。裁定で `Confirmed` または `Voided` へ進む。
     Disputed,
+    /// 報告者全員が試合無効で一致した。`Voided`（報告ゼロ）とは区別する。
+    Nullified,
     /// 試合が成立しなかった。レートに影響させない。報告義務も生じない。
     Voided,
     /// 解散（ホスト候補の全滅、人が揃わない、VC 無し、Discord への投稿失敗）。報告義務は生じない。
@@ -59,6 +61,7 @@ impl FormationState {
             Self::InProgress { .. } => "in_progress",
             Self::Confirmed => "confirmed",
             Self::Disputed => "disputed",
+            Self::Nullified => "nullified",
             Self::Voided => "voided",
             Self::Abandoned => "abandoned",
         }
@@ -66,7 +69,10 @@ impl FormationState {
 
     /// これ以上遷移しない状態か。`Disputed` はスタッフ裁定で進むので終端ではない。
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Confirmed | Self::Voided | Self::Abandoned)
+        matches!(
+            self,
+            Self::Confirmed | Self::Nullified | Self::Voided | Self::Abandoned
+        )
     }
 
     /// 参加者に報告義務が生じる状態か（報告ゲートの前提条件）。
@@ -78,7 +84,7 @@ impl FormationState {
     pub fn requires_reports(&self) -> bool {
         matches!(
             self,
-            Self::InProgress { .. } | Self::Confirmed | Self::Disputed
+            Self::InProgress { .. } | Self::Confirmed | Self::Disputed | Self::Nullified
         )
     }
 }
@@ -115,6 +121,8 @@ pub enum FormationEventKind {
     Confirmed,
     /// 報告が拮抗した。スタッフ介入待ち。
     Disputed,
+    /// 報告者全員が「無効試合」で一致した。報告ゼロの `Voided` とは別の終端。
+    Nullified,
     /// 試合不成立（報告ゼロで期限切れ、やり直し、スタッフ）。payload に理由。
     Voided,
     /// 解散。payload に理由（[`AbandonReason`]）。個人の特定はしない。
@@ -123,7 +131,7 @@ pub enum FormationEventKind {
 
 impl FormationEventKind {
     /// 全種別。DB の CHECK 制約はこの一覧と一致させる。
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::VcAssigned,
         Self::HostAssigned,
         Self::HostAccepted,
@@ -132,6 +140,7 @@ impl FormationEventKind {
         Self::CodePosted,
         Self::Confirmed,
         Self::Disputed,
+        Self::Nullified,
         Self::Voided,
         Self::Abandoned,
     ];
@@ -147,6 +156,7 @@ impl FormationEventKind {
             Self::CodePosted => "code_posted",
             Self::Confirmed => "confirmed",
             Self::Disputed => "disputed",
+            Self::Nullified => "nullified",
             Self::Voided => "voided",
             Self::Abandoned => "abandoned",
         }
@@ -390,6 +400,10 @@ pub fn apply(
         },
         K::Disputed => match state {
             S::InProgress { .. } | S::Disputed => S::Disputed,
+            _ => return Err(invalid(state, event)),
+        },
+        K::Nullified => match state {
+            S::InProgress { .. } | S::Disputed | S::Nullified => S::Nullified,
             _ => return Err(invalid(state, event)),
         },
         K::Voided => match state {
@@ -955,6 +969,7 @@ mod tests {
             (in_progress(a, "1234"), "in_progress"),
             (S::Confirmed, "confirmed"),
             (S::Disputed, "disputed"),
+            (S::Nullified, "nullified"),
             (S::Voided, "voided"),
             (S::Abandoned, "abandoned"),
         ];

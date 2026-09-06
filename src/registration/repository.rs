@@ -53,13 +53,24 @@ fn snowflake_to_i64(discord_user_id: &str) -> Result<i64, RegistrationError> {
 pub struct RegistrationRepository {
     pool: PgPool,
     formations: FormationRepository,
+    report_gate_disabled: bool,
 }
 
 impl RegistrationRepository {
     /// プールを包む。接続はアプリ用ロールを想定する。
     pub fn new(pool: PgPool) -> Self {
         let formations = FormationRepository::new(pool.clone());
-        Self { pool, formations }
+        Self {
+            pool,
+            formations,
+            report_gate_disabled: false,
+        }
+    }
+
+    /// 緊急時に報告ゲートだけを無効化する。登録ゲートの判定は常に残る。
+    pub fn with_report_gate_disabled(mut self, disabled: bool) -> Self {
+        self.report_gate_disabled = disabled;
+        self
     }
 
     /// Discord のユーザー ID からプロフィールを引く。
@@ -233,8 +244,9 @@ impl RegistrationRepository {
     ) -> Result<QueueEligibility, RegistrationError> {
         let profile = self.find_by_player_id(player_id).await?;
         let pending = match &profile {
-            Some(_) => self.pending_reports(player_id).await?,
+            Some(_) if !self.report_gate_disabled => self.pending_reports(player_id).await?,
             None => Vec::new(),
+            Some(_) => Vec::new(),
         };
         Ok(super::gate::evaluate(profile.as_ref(), pending))
     }

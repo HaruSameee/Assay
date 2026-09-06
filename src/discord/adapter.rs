@@ -46,8 +46,8 @@ use crate::lifecycle::{
     PlayerId, apply, next_deadline, next_host_action,
 };
 use crate::persistence::{
-    FormationLog, FormationRepository, NewEvent, RepositoryError, RosterEntry, Team,
-    UnfinishedFormation, VcAssignment, VcAssignmentOutcome,
+    FormationLog, FormationRepository, NewEvent, NewReport, Outcome, ReportDecision,
+    RepositoryError, RosterEntry, Team, UnfinishedFormation, VcAssignment, VcAssignmentOutcome,
 };
 
 use super::config::DiscordConfig;
@@ -276,6 +276,7 @@ impl Adapter {
                 FormationState::AwaitingHost { pending: None, .. } => {
                     self.resume_vc_assignment(id, &formation.log).await
                 }
+                FormationState::Disputed => self.ensure_dispute_notification(id).await,
                 _ => Ok(()),
             };
         }
@@ -303,7 +304,7 @@ impl Adapter {
         self.nominate_next(id).await
     }
 
-    /// 期限切れをイベントとして記録する。報告内容の評価（`ReportWindow`）は Phase 6 の責務。
+    /// 期限切れをイベントとして記録する。報告期限は同じ再開ループから評価器へ渡す。
     async fn expire(
         &self,
         id: FormationId,
@@ -330,11 +331,39 @@ impl Adapter {
                 "room_code_not_posted",
             ),
             (Deadline::NoReports, FormationState::InProgress { .. }) => {
-                (FormationEventKind::Voided, None, "no_reports")
+                let reason = "no_reports";
+                let event = NewEvent::new(
+                    FormationEventKind::Voided,
+                    None,
+                    now,
+                    format!("timeout:{reason}:{}", deadline_at.timestamp_micros()),
+                )
+                .with_payload(payload::timeout(reason, deadline_at));
+                let Some(outcome) = self.repo.append_if_no_reports(id, &event).await? else {
+                    debug!(formation = %id, "no-report timeout lost a race to a report or state transition");
+                    return Ok(false);
+                };
+                log_anomalies(id, &outcome.anomalies);
+                info!(formation = %id, %reason, %deadline_at, "formation timeout advanced");
+                return Ok(true);
             }
             (Deadline::ReportWindow, FormationState::InProgress { .. }) => {
-                debug!(formation = %id, %deadline_at, "report window elapsed; awaiting Phase 6 evaluation");
-                return Ok(false);
+                let evaluation = self
+                    .repo
+                    .evaluate_reports(
+                        id,
+                        true,
+                        now,
+                        format!("report_evaluation:{}", deadline_at.timestamp_micros()),
+                    )
+                    .await?;
+                if evaluation.event.is_some() {
+                    info!(formation = %id, decision = ?evaluation.decision, %deadline_at, "report window evaluated");
+                }
+                if evaluation.decision == ReportDecision::Disputed {
+                    self.ensure_dispute_notification(id).await?;
+                }
+                return Ok(evaluation.event.is_some());
             }
             _ => return Ok(false),
         };
@@ -579,6 +608,10 @@ impl Adapter {
                 self.on_code_submit(&incoming, custom_id, inputs.get(ROOM_CODE_INPUT_ID))
                     .await
             }
+            (action, IncomingKind::Button { .. }) if action.report_outcome().is_some() => {
+                self.on_report(&incoming, custom_id, action.report_outcome().unwrap())
+                    .await
+            }
             (action, kind) => {
                 debug!(?action, ?kind, "interaction kind does not match the action");
                 Ok(())
@@ -770,14 +803,16 @@ impl Adapter {
         })?;
         let heading = render::heading(&vc, log.created_at, formation);
 
-        // 副作用（両 VC に開示）→ 記録（code_posted に開示メッセージ ID）
+        // 副作用（両 VC にコードと報告入口を投稿）→ 記録（code_posted に全メッセージ ID）
         let others: Vec<UserId> = roster
             .iter()
             .filter(|other| other.player_id != player)
             .filter_map(render::user_of)
             .collect();
         let reveal = render::code_reveal(&heading, incoming.user, &others, room_code, &vc);
+        let report_prompt = render::report_prompt(&heading, formation);
         let mut code_message_ids = HashMap::new();
+        let mut report_message_ids = HashMap::new();
         let mut failures = Vec::new();
         for team in Team::ALL {
             let what = format!("code_reveal:{team}");
@@ -792,6 +827,21 @@ impl Adapter {
             {
                 Ok(message_id) => {
                     code_message_ids.insert(team, message_id);
+                }
+                Err(failure) => failures.push(failure),
+            }
+            let report_what = format!("report_prompt:{team}");
+            match self
+                .post_or_edit(
+                    vc.channel(team),
+                    record.report_message_ids.get(&team).copied(),
+                    &report_what,
+                    &report_prompt,
+                )
+                .await
+            {
+                Ok(message_id) => {
+                    report_message_ids.insert(team, message_id);
                 }
                 Err(failure) => failures.push(failure),
             }
@@ -832,11 +882,114 @@ impl Adapter {
         .with_payload(payload::code_posted(
             room_code,
             &code_message_ids,
+            &report_message_ids,
             entry.discord_user_id,
             &failures,
         ));
         if self.record(formation, &event).await? {
             info!(formation = %formation, %player, "room code posted to both voice chats");
+        }
+        Ok(())
+    }
+
+    /// Discord の3択報告。参加者だけを受け付け、外向きには判定や件数を返さない。
+    async fn on_report(
+        &self,
+        incoming: &IncomingInteraction,
+        custom_id: CustomId,
+        outcome: Outcome,
+    ) -> Result<(), AdapterError> {
+        let formation = custom_id.formation;
+        let Some((entry, _)) = self.participant_for_user(incoming, formation).await? else {
+            return Ok(());
+        };
+        let report = NewReport {
+            formation_id: formation,
+            player_id: entry.player_id,
+            reported_at: Utc::now(),
+            outcome,
+            raw_result: serde_json::json!({
+                "source": "discord_button",
+                "interaction_id": incoming.id.to_string(),
+                "choice": outcome.as_str(),
+            }),
+            idempotency_key: incoming.id.to_string(),
+            supersedes_id: None,
+        };
+        let appended = match self.repo.append_latest_report(report).await {
+            Ok(appended) => appended,
+            Err(RepositoryError::ReportsNotAccepted { .. }) => {
+                self.ephemeral(incoming, render::report_unavailable()).await;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let evaluation = self
+            .repo
+            .evaluate_reports(
+                formation,
+                false,
+                Utc::now(),
+                format!("report_evaluation:all:{}", incoming.id),
+            )
+            .await?;
+        self.ephemeral(incoming, render::report_received()).await;
+        info!(
+            formation = %formation,
+            player = %entry.player_id,
+            duplicate = appended.already_recorded,
+            "report accepted"
+        );
+        if evaluation.event.is_some() {
+            info!(formation = %formation, decision = ?evaluation.decision, "all-player report evaluation advanced");
+        }
+        Ok(())
+    }
+
+    /// `disputed` の通知を再開可能にする。通知済み ID がログにあれば Discord を検索しない。
+    async fn ensure_dispute_notification(
+        &self,
+        formation: FormationId,
+    ) -> Result<(), AdapterError> {
+        let log = self.repo.load_events(formation).await?;
+        let record = DiscordRecord::from_log(&log);
+        if record.dispute_notification.is_some() {
+            return Ok(());
+        }
+        let roster = self.repo.load_roster(formation).await?;
+        let evidence = self.repo.report_evidence(formation).await?;
+        let message =
+            render::dispute_notification(formation, &roster, &evidence.latest_for_confirmation);
+        let channel = self.config.dispute_channel_id;
+        let mut failures = Vec::new();
+        let sent = match self
+            .retry("send:dispute_notification", || {
+                self.gateway.send_message(channel, &message)
+            })
+            .await
+        {
+            Ok(message_id) => Some(message_id),
+            Err(failure) => {
+                failures.push(failure);
+                None
+            }
+        };
+        let key = sent.map_or_else(
+            || {
+                format!(
+                    "dispute_notification_failure:{}",
+                    Utc::now().timestamp_micros()
+                )
+            },
+            |message_id| format!("dispute_notification:{message_id}"),
+        );
+        let event = NewEvent::new(FormationEventKind::Disputed, None, Utc::now(), key)
+            .with_payload(payload::dispute_notification(channel, sent, &failures));
+        self.repo.append_event(formation, &event).await?;
+        if let Some(message_id) = sent {
+            info!(formation = %formation, %channel, %message_id, "dispute notification posted");
+        } else {
+            error!(formation = %formation, %channel, "dispute notification failed; will retry from the log");
         }
         Ok(())
     }
@@ -953,6 +1106,32 @@ impl Adapter {
                 .await;
             return Ok(None);
         }
+        Ok(Some((entry, roster)))
+    }
+
+    /// 共有の報告ボタンを押した Discord ユーザーを、凍結済みの10人編成から特定する。
+    async fn participant_for_user(
+        &self,
+        incoming: &IncomingInteraction,
+        formation: FormationId,
+    ) -> Result<Option<(RosterEntry, Vec<RosterEntry>)>, AdapterError> {
+        let roster = match self.repo.load_roster(formation).await {
+            Ok(roster) => roster,
+            Err(RepositoryError::FormationNotFound(_)) => {
+                self.ephemeral(incoming, render::report_unavailable()).await;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let entry = roster
+            .iter()
+            .find(|entry| render::user_of(entry) == Some(incoming.user))
+            .cloned();
+        let Some(entry) = entry else {
+            self.ephemeral(incoming, render::report_not_participant())
+                .await;
+            return Ok(None);
+        };
         Ok(Some((entry, roster)))
     }
 

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into match_reports (formation_id, player_id, reported_at, outcome, raw_result, supersedes_id) values ($1, $2, $3, $4, $5, $6) returning id",
+  "query": "select report.id from match_reports report where report.formation_id = $1 and report.player_id = $2 and not exists (select 1 from match_reports correction where correction.supersedes_id = report.id) order by report.id desc limit 1",
   "describe": {
     "columns": [
       {
@@ -18,16 +18,12 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Timestamptz",
-        "Text",
-        "Jsonb",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "5badfd0bf9fbc4257978b10e8d7cde6ab9025aa5725ea3f6a51d1fc9bf598501"
+  "hash": "46b3c60754ef2748654369875fa9de7cb36475c84cef18c0311e1e9f58e07a4e"
 }

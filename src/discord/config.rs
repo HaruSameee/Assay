@@ -6,7 +6,7 @@
 use std::env;
 use std::time::Duration;
 
-use serenity::model::id::GuildId;
+use serenity::model::id::{ChannelId, GuildId};
 
 /// 環境変数名。`.env.example` と一致させる。
 pub mod keys {
@@ -14,6 +14,8 @@ pub mod keys {
     pub const TOKEN: &str = "DISCORD_TOKEN";
     /// 対象ギルド。別ギルドからのインタラクションは無視する。
     pub const GUILD_ID: &str = "DISCORD_GUILD_ID";
+    /// 係争内容を運営だけに通知するチャンネル。
+    pub const DISPUTE_CHANNEL_ID: &str = "DISCORD_DISPUTE_CHANNEL_ID";
     /// VC の組の個数。`vc1-red` … `vc<N>-blue` を起動時に名前で引く。
     pub const VC_POOL_SIZE: &str = "DISCORD_VC_POOL_SIZE";
     /// 今シーズンのマップ（ランクマのローテで変わる唯一の項目）。
@@ -55,6 +57,8 @@ pub struct DiscordConfig {
     pub token: String,
     /// 対象ギルド。
     pub guild_id: GuildId,
+    /// `disputed` の詳細を投稿する運営専用チャンネル。
+    pub dispute_channel_id: ChannelId,
     /// VC の組の個数（`vc1` … `vc<N>`）。
     pub vc_pool_size: usize,
     /// 今シーズンのマップ。チェックリストの先頭に差し込む。CHECK 制約や enum にはしない。
@@ -82,6 +86,10 @@ impl DiscordConfig {
         Ok(Self {
             token: required(keys::TOKEN)?,
             guild_id: GuildId::new(parse_id(keys::GUILD_ID, &required(keys::GUILD_ID)?)?),
+            dispute_channel_id: ChannelId::new(parse_id(
+                keys::DISPUTE_CHANNEL_ID,
+                &required(keys::DISPUTE_CHANNEL_ID)?,
+            )?),
             vc_pool_size,
             room_map: required(keys::ROOM_MAP)?.trim().to_owned(),
             room_checklist: parse_checklist(&required(keys::ROOM_CHECKLIST)?),

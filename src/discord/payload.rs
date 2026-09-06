@@ -26,6 +26,12 @@ pub const HOST_PROMPT_CHANNEL_ID_KEY: &str = "host_prompt_channel_id";
 pub const HOST_PROMPT_MESSAGE_ID_KEY: &str = "host_prompt_message_id";
 /// `code_posted`: ルーム ID を開示したメッセージの ID（`{"red": "...", "blue": "..."}`）。貼り直しは編集する。
 pub const CODE_MESSAGE_IDS_KEY: &str = "code_message_ids";
+/// `code_posted`: 報告ボタンを置いたメッセージの ID（red / blue）。
+pub const REPORT_MESSAGE_IDS_KEY: &str = "report_message_ids";
+/// `disputed`: 運営専用通知のチャンネル ID。
+pub const DISPUTE_CHANNEL_ID_KEY: &str = "dispute_channel_id";
+/// `disputed`: 運営専用通知のメッセージ ID。
+pub const DISPUTE_MESSAGE_ID_KEY: &str = "dispute_message_id";
 /// `host_*` / `code_posted`: 対象プレイヤーの Discord ユーザー ID（監査用。状態機械は読まない）。
 pub const DISCORD_USER_ID_KEY: &str = "discord_user_id";
 /// どのイベントにも付きうる: Discord 呼び出しの失敗の一覧（[`DiscordFailure`] の配列）。無ければ省略。
@@ -75,6 +81,10 @@ pub struct DiscordRecord {
     pub host_prompt: Option<(ChannelId, MessageId)>,
     /// ルーム ID を開示したメッセージ（チームごと）。
     pub code_message_ids: HashMap<Team, MessageId>,
+    /// 報告ボタンのメッセージ（チームごと）。
+    pub report_message_ids: HashMap<Team, MessageId>,
+    /// 係争の運営通知。
+    pub dispute_notification: Option<(ChannelId, MessageId)>,
 }
 
 impl DiscordRecord {
@@ -95,6 +105,8 @@ impl DiscordRecord {
                             ),
                             host_prompt: None,
                             code_message_ids: HashMap::new(),
+                            report_message_ids: HashMap::new(),
+                            dispute_notification: None,
                         };
                     }
                 }
@@ -111,6 +123,19 @@ impl DiscordRecord {
                     let ids = per_team_ids(payload.get(CODE_MESSAGE_IDS_KEY));
                     if !ids.is_empty() {
                         record.code_message_ids = ids;
+                    }
+                    let report_ids = per_team_ids(payload.get(REPORT_MESSAGE_IDS_KEY));
+                    if !report_ids.is_empty() {
+                        record.report_message_ids = report_ids;
+                    }
+                }
+                K::Disputed => {
+                    if let (Some(channel), Some(message)) = (
+                        id_field(payload, DISPUTE_CHANNEL_ID_KEY),
+                        id_field(payload, DISPUTE_MESSAGE_ID_KEY),
+                    ) {
+                        record.dispute_notification =
+                            Some((ChannelId::new(channel), MessageId::new(message)));
                     }
                 }
                 _ => {}
@@ -240,6 +265,7 @@ pub fn host_response(discord_user_id: i64, failures: &[DiscordFailure]) -> Value
 pub fn code_posted(
     room_code: &str,
     code_message_ids: &HashMap<Team, MessageId>,
+    report_message_ids: &HashMap<Team, MessageId>,
     discord_user_id: i64,
     failures: &[DiscordFailure],
 ) -> Value {
@@ -247,9 +273,27 @@ pub fn code_posted(
     map.insert(ROOM_CODE_KEY.into(), Value::String(room_code.to_owned()));
     map.insert(CODE_MESSAGE_IDS_KEY.into(), per_team_json(code_message_ids));
     map.insert(
+        REPORT_MESSAGE_IDS_KEY.into(),
+        per_team_json(report_message_ids),
+    );
+    map.insert(
         DISCORD_USER_ID_KEY.into(),
         Value::String(discord_user_id.to_string()),
     );
+    with_failures(map, failures)
+}
+
+/// `disputed` の運営通知を記録する payload。失敗時は ID 無しでエラーだけを残す。
+pub fn dispute_notification(
+    channel: ChannelId,
+    message: Option<MessageId>,
+    failures: &[DiscordFailure],
+) -> Value {
+    let mut map = Map::new();
+    map.insert(DISPUTE_CHANNEL_ID_KEY.into(), id_string(channel.get()));
+    if let Some(message) = message {
+        map.insert(DISPUTE_MESSAGE_ID_KEY.into(), id_string(message.get()));
+    }
     with_failures(map, failures)
 }
 
@@ -344,7 +388,7 @@ mod tests {
             stored(
                 4,
                 K::CodePosted,
-                code_posted("1234", &ids(104, 105), 1001, &[]),
+                code_posted("1234", &ids(104, 105), &ids(106, 107), 1001, &[]),
             ),
         ];
         let record = DiscordRecord::from_log(&log(events));
@@ -355,6 +399,8 @@ mod tests {
                 assignment_message_ids: ids(101, 102),
                 host_prompt: Some((ChannelId::new(31), MessageId::new(103))),
                 code_message_ids: ids(104, 105),
+                report_message_ids: ids(106, 107),
+                dispute_notification: None,
             }
         );
     }
@@ -408,12 +454,13 @@ mod tests {
 
     #[test]
     fn code_posted_payload_keeps_the_room_code_readable_by_the_state_machine() {
-        let payload = code_posted("9999", &ids(5, 6), 1, &[]);
+        let payload = code_posted("9999", &ids(5, 6), &ids(7, 8), 1, &[]);
         assert_eq!(
             decode_payload(K::CodePosted, &payload),
             EventPayload::RoomCode("9999".into())
         );
         assert_eq!(payload[CODE_MESSAGE_IDS_KEY]["red"], "5");
+        assert_eq!(payload[REPORT_MESSAGE_IDS_KEY]["blue"], "8");
         assert!(payload.get(DISCORD_FAILURES_KEY).is_none());
     }
 

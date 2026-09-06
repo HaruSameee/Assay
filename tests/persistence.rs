@@ -632,6 +632,7 @@ async fn reports_are_accepted_only_while_the_formation_requires_them(owner: PgPo
         outcome: Outcome::Draw,
         raw_result: json!({ "screenshot": "s3://x", "seq": seq }),
         supersedes_id,
+        idempotency_key: format!("report-{seq}"),
     };
 
     // コード開示前は受け付けない。理由（状態）はエラーに載らない
@@ -780,6 +781,7 @@ async fn winners_can_be_joined_with_team_equals_outcome(owner: PgPool) {
             outcome,
             raw_result: json!({}),
             supersedes_id: None,
+            idempotency_key: format!("outcome-{}", player.0),
         })
         .await
         .unwrap();

@@ -25,6 +25,7 @@
 mod codec;
 mod error;
 mod model;
+mod reporting;
 mod repository;
 
 pub use codec::{
@@ -33,8 +34,9 @@ pub use codec::{
 };
 pub use error::RepositoryError;
 pub use model::{
-    AppendOutcome, EventId, FormationLog, NewEvent, NewFormation, NewFormationPlayer, NewReport,
-    Outcome, ReportId, RosterEntry, StoredEvent, Team, UnfinishedFormation, UnreadableRow,
-    VcAssignment,
+    AppendOutcome, AppendReportOutcome, EventId, FormationLog, NewEvent, NewFormation,
+    NewFormationPlayer, NewReport, Outcome, ReportId, RosterEntry, StoredEvent, Team,
+    UnfinishedFormation, UnreadableRow, VcAssignment,
 };
+pub(crate) use model::{ReportDecision, ReportVote};
 pub use repository::{FormationRepository, VcAssignmentOutcome};
