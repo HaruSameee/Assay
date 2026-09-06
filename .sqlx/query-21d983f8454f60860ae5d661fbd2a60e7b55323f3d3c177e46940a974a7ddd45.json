@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from queue_entries where player_id = any($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "21d983f8454f60860ae5d661fbd2a60e7b55323f3d3c177e46940a974a7ddd45"
+}

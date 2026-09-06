@@ -88,34 +88,8 @@ impl FormationRepository {
     ///
     /// 状態は `matched`（イベント無し）。
     pub async fn create_formation(&self, formation: &NewFormation) -> Result<(), RepositoryError> {
-        validate_formation(formation)?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query!(
-            "insert into formations (id, created_at, matchmaking_params_version, predicted_win_prob) \
-             values ($1, $2, $3, $4)",
-            formation.id.0,
-            formation.created_at,
-            formation.matchmaking_params_version,
-            formation.predicted_win_prob,
-        )
-        .execute(&mut *tx)
-        .await?;
-        for player in &formation.players {
-            sqlx::query!(
-                "insert into formation_players \
-                 (formation_id, player_id, team, role, role_was_flexed, mu_at_match, sigma_at_match) \
-                 values ($1, $2, $3, $4, $5, $6, $7)",
-                formation.id.0,
-                player.player_id.0,
-                player.team.as_str(),
-                player.role,
-                player.role_was_flexed,
-                player.mu_at_match,
-                player.sigma_at_match,
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        insert_formation(&mut tx, formation).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -782,7 +756,7 @@ fn report_breakdown_payload(evidence: &ReportEvidence) -> serde_json::Value {
 }
 
 /// `append_event` とプール割当が共用する、ロック取得済みトランザクション内の追記。
-async fn append_locked(
+pub(crate) async fn append_locked(
     conn: &mut PgConnection,
     formation_id: FormationId,
     event: &NewEvent,
@@ -846,14 +820,52 @@ async fn append_locked(
 }
 
 /// プール共有資源を直列化する。formation ロックより先に取り、ロック順を一意にする。
-async fn lock_vc_pool(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+/// `formations` 1 行 + `formation_players` 10 行を、呼び出し側のトランザクションに書く。
+///
+/// マッチメイカは VC の確保・`vc_assigned` の追記・キューからの除去と**同じトランザクション**で
+/// formation を確定させる必要がある（00 §6）ので、コミットを含まないこの形で切り出してある。
+pub(crate) async fn insert_formation(
+    conn: &mut PgConnection,
+    formation: &NewFormation,
+) -> Result<(), RepositoryError> {
+    validate_formation(formation)?;
+    sqlx::query!(
+        "insert into formations (id, created_at, matchmaking_params_version, predicted_win_prob) \
+         values ($1, $2, $3, $4)",
+        formation.id.0,
+        formation.created_at,
+        formation.matchmaking_params_version,
+        formation.predicted_win_prob,
+    )
+    .execute(&mut *conn)
+    .await?;
+    for player in &formation.players {
+        sqlx::query!(
+            "insert into formation_players \
+             (formation_id, player_id, team, role, role_was_flexed, mu_at_match, sigma_at_match) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+            formation.id.0,
+            player.player_id.0,
+            player.team.as_str(),
+            player.role,
+            player.role_was_flexed,
+            player.mu_at_match,
+            player.sigma_at_match,
+        )
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn lock_vc_pool(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::query!("select pg_advisory_xact_lock($1)", VC_POOL_LOCK_KEY)
         .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
-async fn occupied_vc_labels(
+pub(crate) async fn occupied_vc_labels(
     conn: &mut PgConnection,
 ) -> Result<std::collections::HashSet<String>, sqlx::Error> {
     let released: Vec<String> = VC_RELEASE_KINDS
@@ -878,7 +890,7 @@ async fn occupied_vc_labels(
     Ok(rows.into_iter().filter_map(|row| row.label).collect())
 }
 
-async fn vc_last_released(
+pub(crate) async fn vc_last_released(
     conn: &mut PgConnection,
 ) -> Result<HashMap<String, Timestamp>, sqlx::Error> {
     let released: Vec<String> = VC_RELEASE_KINDS
@@ -997,7 +1009,7 @@ fn map_report_insert_error(error: sqlx::Error, supersedes_id: Option<ReportId>) 
 }
 
 /// 5v5 の構成か（10人、各チーム5人、重複なし）。
-fn validate_formation(formation: &NewFormation) -> Result<(), RepositoryError> {
+pub(crate) fn validate_formation(formation: &NewFormation) -> Result<(), RepositoryError> {
     let total = formation.players.len();
     if total != 10 {
         return Err(RepositoryError::InvalidFormation(format!(

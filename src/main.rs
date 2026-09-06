@@ -14,7 +14,8 @@ use unite_matchsystem::discord::{
     Adapter, DiscordConfig, Handler, SerenityGateway, build_client, resolve_vc_pool,
 };
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
-use unite_matchsystem::persistence::FormationRepository;
+use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository};
+use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
 use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
@@ -50,6 +51,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(Arc::from);
     let discord_config = DiscordConfig::from_env()?;
     let auth_config = AuthConfig::from_env()?;
+    let matchmaker_config = MatchmakerConfig::from_env()?;
     let report_gate_disabled = report_gate_disabled_from_env()?;
     if report_gate_disabled {
         warn!(
@@ -65,7 +67,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let repo = FormationRepository::new(pool.clone());
     let registration_repo =
         RegistrationRepository::new(pool.clone()).with_report_gate_disabled(report_gate_disabled);
-    let queue_repo = QueueRepository::new(pool);
+    let queue_repo = QueueRepository::new(pool.clone());
+    let matchmaker_repo = MatchmakerRepository::new(pool);
 
     let handler = Arc::new(Handler::default());
     let mut client = build_client(&discord_config.token, handler.clone()).await?;
@@ -77,6 +80,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         discord_config.vc_pool_size,
     )
     .await?;
+    // マッチメイカも同じプールから選ぶ。占有状況は DB から導出するので、これは候補一覧でしかない
+    let vc_assignments: Vec<VcAssignment> = vc_pool
+        .iter()
+        .map(|pair| VcAssignment {
+            label: pair.label.clone(),
+            red_channel_id: pair.red.get(),
+            blue_channel_id: pair.blue.get(),
+        })
+        .collect();
+    let matchmaker = Matchmaker::new(matchmaker_repo, vc_assignments, matchmaker_config);
     let adapter = Arc::new(Adapter::new(
         repo,
         gateway,
@@ -118,6 +131,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 期限の正は DB のイベント時刻。これは状態を持たない起床契機であり、起動時と同じ
     // `resume_unfinished` を呼ぶだけにして二重のリカバリ経路を作らない。
     let mut timeout_scan = tokio::time::interval(Duration::from_secs(5));
+    // マッチメイカ（07 §4-1: 3 分ごと）。1 回の実行が 1 トランザクションで完結するので、
+    // 状態を跨いで持つものが無く、プロセス再起動は次のティックから自然に続く。
+    // 遅れを取り戻すために連続で走らせない（Delay）。同時実行は DB の advisory lock が防ぐ。
+    let mut matchmaker_scan = tokio::time::interval(matchmaker.interval());
+    matchmaker_scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    info!(
+        interval_seconds = matchmaker.interval().as_secs(),
+        "matchmaker loop started"
+    );
 
     loop {
         tokio::select! {
@@ -140,6 +162,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ = timeout_scan.tick() => {
                 if let Err(error) = timeout_adapter.resume_unfinished().await {
                     error!(%error, "timeout recovery scan failed");
+                }
+            }
+            _ = matchmaker_scan.tick() => {
+                // 成立した formation は `vc_assigned` まで書かれた状態でコミットされる。
+                // 割り当て表とホスト打診は上の `resume_unfinished` が出す（入口を 2 つ作らない）
+                match matchmaker.run_once(chrono::Utc::now()).await {
+                    Ok(outcome) => info!(
+                        queued = outcome.candidates,
+                        formed = outcome.created.len(),
+                        vc_exhausted = outcome.vc_exhausted,
+                        "matchmaker run finished"
+                    ),
+                    Err(error) => error!(%error, "matchmaker run failed"),
                 }
             }
             _ = tokio::signal::ctrl_c() => {

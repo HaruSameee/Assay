@@ -26,7 +26,7 @@ mod codec;
 mod error;
 mod model;
 mod reporting;
-mod repository;
+pub(crate) mod repository;
 
 pub use codec::{
     ABANDON_REASON_KEY, ROOM_CODE_KEY, VC_BLUE_CHANNEL_ID_KEY, VC_KEY, VC_LABEL_KEY,
