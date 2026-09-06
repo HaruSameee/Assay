@@ -75,10 +75,36 @@ or copy the contents of /etc/assay/*.env.
         systemctl --no-pager --full status assay.service
 
 4. Confirm the service resolved every configured VC channel and that the
-   reverse proxy is healthy:
+   reverse proxy is healthy. Scope the log to the restart you just performed:
+   -b covers the whole machine boot, so it accumulates every earlier restart
+   and the count will not match the pool size.
 
-        journalctl -u assay.service -b --no-pager | grep 'resolved voice channel'
+        invocation="$(systemctl show -p InvocationID --value assay.service)"
+        journalctl _SYSTEMD_INVOCATION_ID="$invocation" --no-pager \
+          | grep 'voice channel pair resolved'
+        journalctl _SYSTEMD_INVOCATION_ID="$invocation" --no-pager \
+          | grep -c 'voice channel pair resolved'
+        grep '^DISCORD_VC_POOL_SIZE=' /etc/assay/app.env
         curl --fail --show-error https://match.aynm.dev/healthz
+
+   The count must equal DISCORD_VC_POOL_SIZE. The service refuses to start when
+   a pair is missing or ambiguous, so a short count means you are reading the
+   wrong invocation, not a partial pool.
+
+   If the grep finds nothing, check the log line before concluding the pool is
+   broken. The wording lives in src/discord/mod.rs and has changed once already
+   (it was "resolved voice channel" until 2026-09-06). Do not roll back a
+   running service on a failed grep alone.
+
+5. Remove the plaintext copies of the application environment once the checks
+   above pass. Each edit of /etc/assay/app.env leaves one behind, and every one
+   of them holds the bot token, the OAuth client secret and the session key:
+
+        ls /etc/assay/app.env.bak-*
+        shred -u /etc/assay/app.env.bak-*
+
+   Keep /etc/assay/app.env itself. Roll back the binary, not the environment —
+   the recovery path below does not read these files.
 
 If the new binary must be rolled back, restore the immediately preceding binary
 and restart the service:
