@@ -329,7 +329,9 @@ pub fn registration_form(
              <label for=\"rating\">本家レート</label>\n\
              <input id=\"rating\" name=\"rating\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"例: 2600\"\
              value=\"{rating}\"{rating_attributes}>\n\
-             <p id=\"rating-help\" class=\"field-help\">マスターまたはレジェンドの場合に、現在の数値を入力してください。</p>\n\
+             <p id=\"rating-help\" class=\"field-help\">マスターまたはレジェンドの場合に、現在の数値を入力してください。\
+             参加資格の確認と、運営による初期レート調整の参考にします。\
+             Assay のレートには自動反映されず、初期値は一律1500です。</p>\n\
              {rating_error}</div>\n\
              <div class=\"actions\"><button type=\"submit\">{submit_label}</button></div>\n\
              </form>\n\
@@ -396,6 +398,8 @@ pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibili
              <p class=\"lead\">現在登録されている内容です。変更はいつでも新しい申告として保存できます。</p>\n\
              <dl class=\"details\">\n<div><dt>トレーナー名</dt><dd>{trainer}</dd></div>\n\
              <div><dt>直近の申告</dt><dd>{declared}</dd></div>\n</dl>\n\
+             <p class=\"fine-print\">申告した本家レートは運営判断の参考情報です。\
+             Assay のレートには自動反映されず、初期値は一律1500です。</p>\n\
              {status}\
              <div class=\"actions\">\n\
              <a class=\"button button-primary\" href=\"/queue\">キュー画面へ</a>\n\
@@ -556,6 +560,8 @@ mod tests {
             &RegistrationFormErrors::default(),
         );
         assert!(rendered.contains("トレーナー名は他の参加者に公開されます"));
+        assert!(rendered.contains("Assay のレートには自動反映されず"));
+        assert!(rendered.contains("初期値は一律1500です"));
     }
 
     #[test]
@@ -575,6 +581,7 @@ mod tests {
         let allowed = registration_result(&profile("トレーナー"), &QueueEligibility::default());
         assert!(allowed.contains("キューに参加できます"));
         assert!(!allowed.contains("入れません"));
+        assert!(allowed.contains("Assay のレートには自動反映されず"));
     }
 
     #[test]

@@ -570,6 +570,19 @@ async fn registering_appends_a_declaration_and_every_resubmit_appends_another(ow
     assert_eq!(declaration_count(&db, player).await, 1);
     let registered_at = profile.registered_at.unwrap();
 
+    // 登録内容を変更する画面には、現在の最新値がプリフィルされる
+    let edit_form = body_text(browser.get("/register").await).await;
+    assert!(edit_form.contains("value=\"トレーナー\""), "{edit_form}");
+    assert!(
+        edit_form.contains("value=\"legend\" selected"),
+        "{edit_form}"
+    );
+    assert!(edit_form.contains("value=\"1500\""), "{edit_form}");
+    assert!(
+        edit_form.contains("Assay のレートには自動反映されず"),
+        "{edit_form}"
+    );
+
     // 申告し直し: 内容が同じでも新しい行になる（状態ベースの冪等にしない）
     browser
         .post_form("/register", &form_body("トレーナー", "legend", "1500"))
