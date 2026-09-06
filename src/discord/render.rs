@@ -117,26 +117,44 @@ pub fn assignment(
 
 /// 公開招集チャンネルに出す、成立通知と行き先だけのメッセージ。
 ///
-/// レート、ロール、報告内容は全員が見る場所へ出さない。本文のメンションと
-/// `mention_users` は同じ10人に揃える。
+/// **チームごとに行を分ける。**10 人が同じメッセージを見るので、赤と青を 1 行に並べると
+/// 自分がどちらへ行くのか分からない。チーム分けは formation 確定時に決まっているので、
+/// ここで新しく判定するものは無い。
+///
+/// レート、ロール割り当て、報告に関わる情報は全員が見る場所へ出さない（00 §3-5）。
+/// 出してよいのは**参加者名・チーム・行き先 VC だけ**。本文のメンションと `mention_users` は
+/// 同じ10人に揃える。
 pub fn summon(roster: &[RosterEntry], vc: &VcPair) -> OutgoingMessage {
-    let mut users: Vec<UserId> = roster.iter().filter_map(user_of).collect();
-    users.sort_unstable();
-    users.dedup();
-    let mentions = users
-        .iter()
-        .map(|user| mention(*user))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut lines = String::new();
+    let mut everyone: Vec<UserId> = Vec::new();
+    // red が先。並びは Team::ALL に従い、チーム内はユーザー ID 順で安定させる
+    for team in Team::ALL {
+        let mut users: Vec<UserId> = roster
+            .iter()
+            .filter(|entry| entry.team == team)
+            .filter_map(user_of)
+            .collect();
+        users.sort_unstable();
+        users.dedup();
+        if users.is_empty() {
+            continue;
+        }
+        let mentions = users
+            .iter()
+            .map(|user| mention(*user))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push_str(&format!("{mentions} → <#{}>\n", vc.channel(team).get()));
+        everyone.extend(users);
+    }
+    everyone.sort_unstable();
+    everyone.dedup();
     OutgoingMessage {
         content: format!(
-            "{mentions}\nマッチが成立しました → <#{}> / <#{}>\n\
-             割り当てとルーム設定は各VCのテキストチャットにあります",
-            vc.red.get(),
-            vc.blue.get(),
+            "{lines}マッチが成立しました。割り当てとルーム設定は各VCのテキストチャットにあります"
         ),
         buttons: Vec::new(),
-        mention_users: users,
+        mention_users: everyone,
     }
 }
 
@@ -567,22 +585,78 @@ mod tests {
         assert!(first_red < second_red);
     }
 
+    /// **チーム別に 1 行ずつ。**自分がどちらの VC へ行くのかが一目で分かること。
     #[test]
-    fn summon_mentions_only_the_participants_and_destinations() {
+    fn summon_splits_the_two_teams_onto_their_own_lines() {
         let message = summon(&roster(), &vc());
         assert_eq!(
             message.content,
-            "<@1001> <@1002> <@1003> <@1004> <@1005> <@1006> <@1007> <@1008> <@1009> <@1010>\n\
-             マッチが成立しました → <#31> / <#32>\n\
-             割り当てとルーム設定は各VCのテキストチャットにあります"
+            "<@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
+             <@1006> <@1007> <@1008> <@1009> <@1010> → <#32>\n\
+             マッチが成立しました。割り当てとルーム設定は各VCのテキストチャットにあります"
         );
+        // red が先、blue が後
+        let red = message.content.find("<#31>").unwrap();
+        let blue = message.content.find("<#32>").unwrap();
+        assert!(red < blue, "{}", message.content);
+        // 5 人ずつに分かれ、どちらの行にも相手チームの誰かが混ざらない
+        let lines: Vec<&str> = message.content.lines().collect();
+        assert_eq!(lines.len(), 3, "{}", message.content);
+        for (line, members) in [(lines[0], 1001..=1005), (lines[1], 1006..=1010)] {
+            assert_eq!(line.matches("<@").count(), 5, "{line}");
+            for user in members {
+                assert!(line.contains(&format!("<@{user}>")), "{line}");
+            }
+        }
         assert_eq!(
             message.mention_users,
             (1001..=1010).map(UserId::new).collect::<Vec<_>>()
         );
         assert!(message.buttons.is_empty());
-        for forbidden in ["1500", "レート", "top_carry", "上キャリー", "報告"] {
-            assert!(!message.content.contains(forbidden), "{}", message.content);
+    }
+
+    /// レビュー用に招集の文面をそのまま出す。
+    ///
+    /// `cargo test --lib discord::render -- --ignored --nocapture` で取り出す。
+    #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
+    #[test]
+    fn dump_summon_for_review() {
+        println!("========== 招集チャンネルの文面 ==========");
+        println!("{}", summon(&roster(), &vc()).content);
+    }
+
+    /// 招集チャンネルは全員が見る。**レート・ロール割り当て・報告の情報を出さない**（00 §3-5）。
+    #[test]
+    fn summon_never_leaks_ratings_roles_or_reports() {
+        let message = summon(&roster(), &vc());
+        for forbidden in [
+            "1500",
+            "レート",
+            "25",
+            "top_carry",
+            "上キャリー",
+            "ロール",
+            "報告",
+            "勝",
+        ] {
+            assert!(
+                !message.content.contains(forbidden),
+                "{forbidden} leaked: {}",
+                message.content
+            );
+        }
+        // roster が持っているロール表示名も出ていない
+        for entry in roster() {
+            assert!(
+                !message.content.contains(&entry.role_display_name),
+                "{}",
+                message.content
+            );
+            assert!(
+                !message.content.contains(&entry.role),
+                "{}",
+                message.content
+            );
         }
     }
 

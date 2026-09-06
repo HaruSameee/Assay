@@ -25,6 +25,17 @@ legend { padding: 0; font-weight: 700; }
 .gate-block h2 { margin-bottom: 7px; }
 .destination { margin-top: 16px; padding: 16px 18px; border-left: 3px solid var(--accent); background: var(--surface); }
 .destination strong { display: block; font-size: 1.25rem; }
+/* 成立はブロックではなく朗報。止められている見た目のままにしない（ゲートの判定は同じ） */
+.matched .eyebrow { color: var(--accent); }
+.matched .gate-list { margin-top: 24px; border-top: 0; }
+.matched .gate-block { padding: 0 0 22px; border-bottom: 0; }
+.matched .gate-block h2 { color: var(--muted); font-size: 0.82rem; font-weight: 700; text-transform: uppercase; }
+.matched .destination { margin-top: 20px; padding: 24px; border: 1px solid var(--accent); border-left-width: 4px; background: var(--surface-strong); }
+.matched .destination strong { margin: 6px 0; font-size: 2rem; line-height: 1.2; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .matched .destination { padding: 18px; }
+  .matched .destination strong { font-size: 1.6rem; }
+}
 .poll-status { min-height: 1.5em; margin-top: 14px; color: var(--danger); font-size: 0.875rem; }
 .button-danger { border-color: #7e3d43; background: transparent; color: var(--danger); }
 .button-danger:hover { border-color: var(--danger); background: var(--danger-bg); }
@@ -37,6 +48,13 @@ input[type="range"] { min-height: 40px; padding: 0; accent-color: var(--accent);
 }
 "#;
 
+/// 画面に出すロールの表記。**内部識別子を画面に出さない。**
+///
+/// 変換はここ 1 か所だけ。`<select>`（[`role_options`]）とキュー中の一覧（[`role_label`]）が
+/// 同じ表を引くので、選ぶときと選んだ後で表記が食い違わない。
+///
+/// 並びと表記は Phase 1 マイグレーションの `roles` シードに揃えてある
+/// （`the_role_labels_match_the_migration_seed` が両者の一致を検査する）。
 const ROLE_OPTIONS: [(&str, &str); 5] = [
     ("top_carry", "上キャリー"),
     ("top_support", "サポート"),
@@ -197,10 +215,24 @@ fn blocked_page(status: &StatusView) -> String {
         .as_ref()
         .map(|destination| destination.channel_name.as_str())
         .unwrap_or("");
+    // 成立だけ見た目を分ける。`data-view` とゲートの判定はそのまま
+    let (view_class, eyebrow, lead) = if matched {
+        (
+            " class=\"matched\"",
+            "Match found",
+            "下のVCへ移動してください。試合が終わるまで次のキューには入れません。",
+        )
+    } else {
+        (
+            "",
+            "Queue status",
+            "現在止まっている条件をそれぞれ確認してください。",
+        )
+    };
     let body = format!(
-        "<section id=\"queue-app\" data-view=\"blocked\" data-registration=\"{registration_code}\" data-active=\"{active}\" data-pending=\"{pending}\" data-destination=\"{destination_name}\" aria-labelledby=\"queue-title\">\n\
-         <p class=\"eyebrow\">Queue status</p>\n<h1 id=\"queue-title\">{title}</h1>\n\
-         <p class=\"lead\">現在止まっている条件をそれぞれ確認してください。</p>\n\
+        "<section id=\"queue-app\"{view_class} data-view=\"blocked\" data-registration=\"{registration_code}\" data-active=\"{active}\" data-pending=\"{pending}\" data-destination=\"{destination_name}\" aria-labelledby=\"queue-title\">\n\
+         <p class=\"eyebrow\">{eyebrow}</p>\n<h1 id=\"queue-title\">{title}</h1>\n\
+         <p class=\"lead\">{lead}</p>\n\
          <div class=\"gate-list\">{gates}</div>\n\
          <p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
@@ -485,10 +517,172 @@ mod tests {
         assert!(rendered.contains("報告ボタン"));
     }
 
+    /// 成立は**朗報として見せる**。ゲートの判定も `data-view` も変えず、見た目だけ分ける。
+    #[test]
+    fn a_formed_match_looks_different_from_being_blocked() {
+        let mut matched = status();
+        matched.eligibility.active_formation = Some(Uuid::from_u128(8));
+        matched.destination = Some(DestinationView {
+            formation_id: Uuid::from_u128(8),
+            team: "red".into(),
+            channel_name: "vc3-red".into(),
+            channel_id: "123".into(),
+        });
+        let rendered = queue_page(&matched, 95, Utc::now());
+        assert!(rendered.contains("class=\"matched\""), "{rendered}");
+        // ゲートの側は一切変えていない
+        assert!(rendered.contains("data-view=\"blocked\""));
+        assert!(rendered.contains("data-gate=\"active_formation\""));
+        assert!(rendered.contains("data-active=\"00000000-0000-0000-0000-000000000008\""));
+        // 行き先が目立つ指定になっている
+        assert!(rendered.contains(".matched .destination strong"));
+        assert!(rendered.contains("vc3-red"));
+        // 「止められている」文言を出さない
+        assert!(!rendered.contains("現在止まっている条件"), "{rendered}");
+
+        // 成立していないブロックは従来どおり
+        let mut plain = status();
+        plain.eligibility.pending_reports = vec![Uuid::from_u128(9)];
+        let rendered = queue_page(&plain, 95, Utc::now());
+        assert!(!rendered.contains("class=\"matched\""));
+        assert!(rendered.contains("現在止まっている条件"));
+        assert!(rendered.contains("data-view=\"blocked\""));
+    }
+
+    /// 表記の対応は 1 か所だけ。`<select>` とキュー中の一覧が同じ表を引くこと。
+    ///
+    /// 選ぶときと選んだ後で表記が違うと、同じものを指していると分からない。
+    #[test]
+    fn the_select_and_the_queued_list_use_the_same_labels() {
+        let mut queued = status();
+        queued.queued = true;
+        queued.entry = Some(EntryView {
+            id: Uuid::from_u128(1),
+            player_id: Uuid::from_u128(2),
+            enqueued_at: "2026-09-12T12:00:00+00:00".into(),
+            updated_at: "2026-09-12T12:00:00+00:00".into(),
+            down_range: 95,
+            up_range: 95,
+            roles: ROLE_OPTIONS
+                .iter()
+                .enumerate()
+                .map(|(index, (role, _))| RolePreference {
+                    role: (*role).to_owned(),
+                    priority: index as i16 + 1,
+                })
+                .collect(),
+        });
+        let selecting = queue_page(&status(), 95, Utc::now());
+        let selected = queue_page(&queued, 95, Utc::now());
+        for (role, label) in ROLE_OPTIONS {
+            // 選ぶ側は日本語のラベル。識別子は value 属性の中だけ
+            assert!(
+                selecting.contains(&format!("<option value=\"{role}\">{label}</option>")),
+                "{role}"
+            );
+            // 選んだ後も同じ表記
+            assert_eq!(role_label(role), label);
+            assert!(selected.contains(label), "{label}");
+        }
+        // どちらの画面にも内部識別子が地の文として出ていない
+        for page in [&selecting, &selected] {
+            for (role, _) in ROLE_OPTIONS {
+                assert!(
+                    !page.contains(&format!(">{role}<")),
+                    "internal identifier {role} is visible"
+                );
+            }
+        }
+    }
+
+    /// 表記の正規値はマイグレーションの `roles` シード。片方だけ変わる事故を防ぐ。
+    #[test]
+    fn the_role_labels_match_the_migration_seed() {
+        const SEED: &str =
+            include_str!("../../migrations/20260904141514_formation_lifecycle.up.sql");
+        // `('top_carry',   '上キャリー', 1),` の形の行から、引用符の中だけを取る
+        let seeded: Vec<(String, String)> = SEED
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix('(')?;
+                let quoted: Vec<&str> = rest.split('\'').skip(1).step_by(2).collect();
+                match quoted.as_slice() {
+                    [id, display] => Some(((*id).to_owned(), (*display).to_owned())),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(seeded.len(), ROLE_OPTIONS.len(), "seed rows: {seeded:?}");
+        let expected: Vec<(String, String)> = ROLE_OPTIONS
+            .iter()
+            .map(|(role, label)| ((*role).to_owned(), (*label).to_owned()))
+            .collect();
+        assert_eq!(seeded, expected, "UI の表記と roles シードがずれている");
+    }
+
     #[test]
     fn mobile_layout_is_explicit() {
         let rendered = queue_page(&status(), 95, Utc::now());
         assert!(rendered.contains("@media (max-width: 600px)"));
         assert!(rendered.contains(".role-grid { grid-template-columns: 1fr"));
+    }
+
+    /// レビュー用に各画面の HTML を丸ごと出す。スクリーンショットが撮れないため。
+    ///
+    /// `cargo test --lib queue::html -- --ignored --nocapture` で取り出す。
+    #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
+    #[test]
+    fn dump_every_page_for_review() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
+
+        println!("========== 1. 未投入 (data-view=unqueued) ==========");
+        println!("{}", queue_page(&status(), 150, now));
+
+        let mut queued = status();
+        queued.queued = true;
+        queued.entry = Some(EntryView {
+            id: Uuid::from_u128(1),
+            player_id: Uuid::from_u128(2),
+            enqueued_at: "2026-09-12T12:00:00+00:00".into(),
+            updated_at: "2026-09-12T12:00:00+00:00".into(),
+            down_range: 150,
+            up_range: 95,
+            roles: vec![
+                RolePreference {
+                    role: "jungle".into(),
+                    priority: 1,
+                },
+                RolePreference {
+                    role: "bot_tank".into(),
+                    priority: 2,
+                },
+            ],
+        });
+        println!("========== 2. キュー中 (data-view=queued) ==========");
+        println!("{}", queue_page(&queued, 95, now));
+
+        let mut matched = status();
+        matched.eligibility.active_formation = Some(Uuid::from_u128(8));
+        matched.destination = Some(DestinationView {
+            formation_id: Uuid::from_u128(8),
+            team: "red".into(),
+            channel_name: "vc3-red".into(),
+            channel_id: "123".into(),
+        });
+        println!("========== 3. マッチ成立 ==========");
+        println!("{}", queue_page(&matched, 95, now));
+
+        let mut blocked = status();
+        blocked.eligibility = EligibilityView {
+            registration: Some(RegistrationBlockView {
+                code: "not_registered",
+                message: "登録が済んでいません。".into(),
+                declared: None,
+            }),
+            active_formation: None,
+            pending_reports: vec![Uuid::from_u128(9)],
+        };
+        println!("========== 4. ゲートで停止 ==========");
+        println!("{}", queue_page(&blocked, 95, now));
     }
 }

@@ -512,7 +512,14 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     let summon = fake.message(summon_channel, summon_message_id);
     assert_eq!(summon.mention_users.len(), 10);
     assert!(summon.content.contains("マッチが成立しました"));
-    assert!(summon.content.contains("<#101> / <#102>"));
+    // チームごとに行を分ける。自分がどちらの VC へ行くのかが 1 行で分かること
+    let summon_lines: Vec<&str> = summon.content.lines().collect();
+    assert_eq!(summon_lines.len(), 3, "{}", summon.content);
+    assert!(summon_lines[0].ends_with("→ <#101>"), "{}", summon.content);
+    assert!(summon_lines[1].ends_with("→ <#102>"), "{}", summon.content);
+    for line in &summon_lines[..2] {
+        assert_eq!(line.matches("<@").count(), 5, "{line}");
+    }
     for forbidden in ["レート", "top_carry", "上キャリー", "報告"] {
         assert!(!summon.content.contains(forbidden), "{}", summon.content);
     }
