@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select d.formation_id as \"formation_id!\", d.team as \"team!\", d.outcome as \"outcome!\", d.own_rating as \"own_rating!\", d.delta as \"delta!\", f.created_at as \"played_at!\" from player_match_rating_deltas d join formations f on f.id = d.formation_id where d.player_id = $1 order by f.created_at desc, d.formation_id desc limit $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "formation_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "player_match_rating_deltas",
+            "name": "formation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "team!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_match_rating_deltas",
+            "name": "team"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "outcome!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_match_rating_deltas",
+            "name": "outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "own_rating!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "player_match_rating_deltas",
+            "name": "own_rating"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "delta!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "player_match_rating_deltas",
+            "name": "delta"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "played_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "formations",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "aa80302dc83f35c5c5485b83c849068b243a7caa3733b835d7045e91325d305e"
+}
