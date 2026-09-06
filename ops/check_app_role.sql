@@ -1,7 +1,7 @@
 -- Must return zero rows. Shared between CI and production verification.
 with tables as (
     select c.oid, c.relname,
-        c.relname in ('players', 'roles') as mutable,
+        c.relname in ('players', 'roles', 'queue_entries', 'queue_entry_roles') as mutable,
         has_table_privilege('assay_app', c.oid, 'SELECT') as can_select,
         has_table_privilege('assay_app', c.oid, 'INSERT') as can_insert,
         has_table_privilege('assay_app', c.oid, 'UPDATE') as can_update,

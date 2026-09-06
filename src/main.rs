@@ -15,6 +15,7 @@ use unite_matchsystem::discord::{
 };
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::persistence::FormationRepository;
+use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, router as registration_router,
 };
@@ -55,7 +56,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .connect(&database_url)
         .await?;
     let repo = FormationRepository::new(pool.clone());
-    let auth_pool = pool;
+    let registration_repo = RegistrationRepository::new(pool.clone());
+    let queue_repo = QueueRepository::new(pool);
 
     let handler = Arc::new(Handler::default());
     let mut client = build_client(&discord_config.token, handler.clone()).await?;
@@ -82,7 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let auth = AuthState::new(
         auth_config.clone(),
         Arc::new(HttpOAuthClient::new(&auth_config)?),
-        RegistrationRepository::new(auth_pool),
+        registration_repo.clone(),
     );
     info!(
         redirect_uri = %auth_config.redirect_uri,
@@ -96,7 +98,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         adapter,
         internal_token,
     })
-    .merge(registration_router(auth));
+    .merge(registration_router(auth))
+    .merge(queue_router(QueueState::new(
+        auth_config,
+        registration_repo,
+        queue_repo,
+    )));
 
     let mut discord_task = tokio::spawn(async move { client.start().await });
     let mut http_task = tokio::spawn(async move { axum::serve(listener, app).await });

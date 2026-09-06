@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, enqueued_at, updated_at, down_range from queue_entries where player_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "enqueued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "enqueued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "down_range",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "down_range"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "bd025f0abc8b012f7ca70be9d50d54c5981209c74cef96921dce2f960c7b1a52"
+}

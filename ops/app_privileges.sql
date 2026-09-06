@@ -26,6 +26,10 @@ grant select, insert on all tables in schema public to assay_app;
 grant update, delete on players to assay_app;
 -- roles: mutable display names and presentation order; identifiers stay stable.
 grant update, delete on roles to assay_app;
+-- queue_entries: live queue state, not a log. Entries change settings and disappear on match or leave; the history lives in formations.
+grant update, delete on queue_entries to assay_app;
+-- queue_entry_roles: dependent rows of queue_entries. Role preferences are rewritten in place and cascade away on leave.
+grant update, delete on queue_entry_roles to assay_app;
 revoke all on all sequences in schema public from public, assay_app;
 grant usage, select on all sequences in schema public to assay_app;
 

@@ -192,7 +192,10 @@ async fn the_audit_inspects_every_application_table(owner: sqlx::PgPool) {
 
     for table in &tables {
         // 可変テーブルと追記専用テーブルでは、壊す向きが逆になる
-        let mutable = matches!(table.as_str(), "players" | "roles");
+        let mutable = matches!(
+            table.as_str(),
+            "players" | "roles" | "queue_entries" | "queue_entry_roles"
+        );
         let break_it = if mutable {
             // 可変テーブルに保護トリガーが付いた（＝誤って追記専用にした）
             format!(
