@@ -16,6 +16,8 @@ pub mod keys {
     pub const GUILD_ID: &str = "DISCORD_GUILD_ID";
     /// 係争内容を運営だけに通知するチャンネル。
     pub const DISPUTE_CHANNEL_ID: &str = "DISCORD_DISPUTE_CHANNEL_ID";
+    /// マッチ成立時に参加者10人を呼び出す公開チャンネル。
+    pub const SUMMON_CHANNEL_ID: &str = "DISCORD_SUMMON_CHANNEL_ID";
     /// VC の組の個数。`vc1-red` … `vc<N>-blue` を起動時に名前で引く。
     pub const VC_POOL_SIZE: &str = "DISCORD_VC_POOL_SIZE";
     /// 今シーズンのマップ（ランクマのローテで変わる唯一の項目）。
@@ -59,6 +61,8 @@ pub struct DiscordConfig {
     pub guild_id: GuildId,
     /// `disputed` の詳細を投稿する運営専用チャンネル。
     pub dispute_channel_id: ChannelId,
+    /// マッチ成立時の招集を投稿する公開チャンネル。
+    pub summon_channel_id: ChannelId,
     /// VC の組の個数（`vc1` … `vc<N>`）。
     pub vc_pool_size: usize,
     /// 今シーズンのマップ。チェックリストの先頭に差し込む。CHECK 制約や enum にはしない。
@@ -74,7 +78,13 @@ pub struct DiscordConfig {
 impl DiscordConfig {
     /// 環境変数から読む。
     pub fn from_env() -> Result<Self, ConfigError> {
-        let vc_pool_size: usize = required(keys::VC_POOL_SIZE)?
+        Self::from_source(|name| env::var(name).ok())
+    }
+
+    fn from_source(
+        mut source: impl FnMut(&'static str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let vc_pool_size: usize = required_from(&mut source, keys::VC_POOL_SIZE)?
             .trim()
             .parse()
             .ok()
@@ -83,18 +93,36 @@ impl DiscordConfig {
                 name: keys::VC_POOL_SIZE,
                 reason: "must be a positive integer".into(),
             })?;
+        let dispute_channel_id = ChannelId::new(parse_id(
+            keys::DISPUTE_CHANNEL_ID,
+            &required_from(&mut source, keys::DISPUTE_CHANNEL_ID)?,
+        )?);
+        let summon_channel_id = ChannelId::new(parse_id(
+            keys::SUMMON_CHANNEL_ID,
+            &required_from(&mut source, keys::SUMMON_CHANNEL_ID)?,
+        )?);
+        if summon_channel_id == dispute_channel_id {
+            return Err(ConfigError::Invalid {
+                name: keys::SUMMON_CHANNEL_ID,
+                reason: "must differ from DISCORD_DISPUTE_CHANNEL_ID".into(),
+            });
+        }
         Ok(Self {
-            token: required(keys::TOKEN)?,
-            guild_id: GuildId::new(parse_id(keys::GUILD_ID, &required(keys::GUILD_ID)?)?),
-            dispute_channel_id: ChannelId::new(parse_id(
-                keys::DISPUTE_CHANNEL_ID,
-                &required(keys::DISPUTE_CHANNEL_ID)?,
+            token: required_from(&mut source, keys::TOKEN)?,
+            guild_id: GuildId::new(parse_id(
+                keys::GUILD_ID,
+                &required_from(&mut source, keys::GUILD_ID)?,
             )?),
+            dispute_channel_id,
+            summon_channel_id,
             vc_pool_size,
-            room_map: required(keys::ROOM_MAP)?.trim().to_owned(),
-            room_checklist: parse_checklist(&required(keys::ROOM_CHECKLIST)?),
-            retries: optional_number(keys::RETRIES, defaults::RETRIES)?,
-            retry_backoff: Duration::from_millis(optional_number(
+            room_map: required_from(&mut source, keys::ROOM_MAP)?
+                .trim()
+                .to_owned(),
+            room_checklist: parse_checklist(&required_from(&mut source, keys::ROOM_CHECKLIST)?),
+            retries: optional_number_from(&mut source, keys::RETRIES, defaults::RETRIES)?,
+            retry_backoff: Duration::from_millis(optional_number_from(
+                &mut source,
                 keys::RETRY_BACKOFF_MS,
                 defaults::RETRY_BACKOFF_MS,
             )?),
@@ -102,16 +130,23 @@ impl DiscordConfig {
     }
 }
 
-fn required(name: &'static str) -> Result<String, ConfigError> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
+fn required_from(
+    source: &mut impl FnMut(&'static str) -> Option<String>,
+    name: &'static str,
+) -> Result<String, ConfigError> {
+    match source(name) {
+        Some(value) if !value.trim().is_empty() => Ok(value),
         _ => Err(ConfigError::Missing(name)),
     }
 }
 
-fn optional_number<T: std::str::FromStr>(name: &'static str, default: T) -> Result<T, ConfigError> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => {
+fn optional_number_from<T: std::str::FromStr>(
+    source: &mut impl FnMut(&'static str) -> Option<String>,
+    name: &'static str,
+    default: T,
+) -> Result<T, ConfigError> {
+    match source(name) {
+        Some(value) if !value.trim().is_empty() => {
             value.trim().parse().map_err(|_| ConfigError::Invalid {
                 name,
                 reason: format!("{value:?} is not a number"),
@@ -143,7 +178,21 @@ pub fn parse_checklist(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    fn complete_values() -> HashMap<&'static str, String> {
+        HashMap::from([
+            (keys::TOKEN, "token".into()),
+            (keys::GUILD_ID, "100".into()),
+            (keys::DISPUTE_CHANNEL_ID, "200".into()),
+            (keys::SUMMON_CHANNEL_ID, "300".into()),
+            (keys::VC_POOL_SIZE, "20".into()),
+            (keys::ROOM_MAP, "kyogre".into()),
+            (keys::ROOM_CHECKLIST, "設定 A;設定 B".into()),
+        ])
+    }
 
     #[test]
     fn checklist_drops_empty_items() {
@@ -159,5 +208,28 @@ mod tests {
         assert_eq!(parse_id(keys::GUILD_ID, " 123 "), Ok(123));
         assert!(parse_id(keys::GUILD_ID, "0").is_err());
         assert!(parse_id(keys::GUILD_ID, "abc").is_err());
+    }
+
+    #[test]
+    fn the_summon_channel_is_required_at_startup() {
+        let mut values = complete_values();
+        values.remove(keys::SUMMON_CHANNEL_ID);
+        assert_eq!(
+            DiscordConfig::from_source(|name| values.get(name).cloned()).unwrap_err(),
+            ConfigError::Missing(keys::SUMMON_CHANNEL_ID)
+        );
+    }
+
+    #[test]
+    fn public_summons_cannot_share_the_staff_dispute_channel() {
+        let mut values = complete_values();
+        values.insert(keys::SUMMON_CHANNEL_ID, "200".into());
+        assert!(matches!(
+            DiscordConfig::from_source(|name| values.get(name).cloned()),
+            Err(ConfigError::Invalid {
+                name: keys::SUMMON_CHANNEL_ID,
+                ..
+            })
+        ));
     }
 }

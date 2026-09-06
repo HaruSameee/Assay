@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::lifecycle::{PlayerId, Timestamp};
+use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 
 /// 上方向のマッチング範囲。**固定**。ユーザーは変更できない（07 §3）。
 ///
@@ -66,6 +66,28 @@ pub struct QueueRequest {
     pub roles: Vec<RolePreference>,
 }
 
+/// 成立済み formation で本人に割り当てられた VC。
+///
+/// `vc_assigned` の追記ログから読む表示用の導出値であり、Discord 側を検索しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceDestination {
+    /// 対象 formation。
+    pub formation_id: FormationId,
+    /// `red` / `blue`。
+    pub team: String,
+    /// VC 組のラベル。
+    pub label: String,
+    /// Discord のチャンネル ID。snowflake は文字列のまま扱う。
+    pub channel_id: String,
+}
+
+impl VoiceDestination {
+    /// `vc3-red` 形式の表示名。
+    pub fn channel_name(&self) -> String {
+        format!("vc{}-{}", self.label, self.team)
+    }
+}
+
 /// 投入リクエストが受け付けられない理由。**値そのものはメッセージに載せてよい**
 /// （秘密ではなく、本人が送った設定なので）。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -102,9 +124,7 @@ pub fn validate_request(
     down_range: i32,
     roles: &[RolePreference],
 ) -> Result<QueueRequest, QueueRequestError> {
-    if !(MIN_DOWN_RANGE..=MAX_DOWN_RANGE).contains(&down_range) {
-        return Err(QueueRequestError::DownRangeOutOfBounds(down_range));
-    }
+    validate_down_range(down_range)?;
     if roles.is_empty() {
         return Err(QueueRequestError::NoRoles);
     }
@@ -141,6 +161,15 @@ pub fn validate_request(
             })
             .collect(),
     })
+}
+
+/// プレビューと投入で共通の下方向範囲検証。
+pub fn validate_down_range(down_range: i32) -> Result<(), QueueRequestError> {
+    if (MIN_DOWN_RANGE..=MAX_DOWN_RANGE).contains(&down_range) {
+        Ok(())
+    } else {
+        Err(QueueRequestError::DownRangeOutOfBounds(down_range))
+    }
 }
 
 #[cfg(test)]

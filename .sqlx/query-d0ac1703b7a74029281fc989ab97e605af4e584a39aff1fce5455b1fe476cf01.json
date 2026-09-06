@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select fp.team, latest.payload->'vc'->>'label' as \"label?\", case fp.team when 'red' then latest.payload->'vc'->>'red_channel_id' when 'blue' then latest.payload->'vc'->>'blue_channel_id' end as \"channel_id?\" from formation_players fp left join lateral ( select e.payload from formation_events e where e.formation_id = fp.formation_id and e.kind = 'vc_assigned' and e.payload ? 'vc' order by e.id desc limit 1 ) latest on true where fp.formation_id = $1 and fp.player_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "team",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "team"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "label?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "channel_id?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "d0ac1703b7a74029281fc989ab97e605af4e584a39aff1fce5455b1fe476cf01"
+}

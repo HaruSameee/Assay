@@ -14,7 +14,7 @@
 //! - `/internal/formations` はトークン無しでは到達できない
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ use unite_matchsystem::discord::gateway::{
 use unite_matchsystem::discord::payload::{
     ASSIGNMENT_MESSAGE_IDS_KEY, ATTEMPTS_KEY, CODE_MESSAGE_IDS_KEY, DISCORD_FAILURES_KEY,
     DiscordRecord, HOST_PROMPT_CHANNEL_ID_KEY, HOST_PROMPT_MESSAGE_ID_KEY, OPERATION_KEY,
-    REPORT_MESSAGE_IDS_KEY, TIMEOUT_REASON_KEY,
+    REPORT_MESSAGE_IDS_KEY, SUMMON_CHANNEL_ID_KEY, SUMMON_MESSAGE_ID_KEY, TIMEOUT_REASON_KEY,
 };
 use unite_matchsystem::discord::{
     DiscordConfig, ResolveError, VcPair, VcPoolSetupError, resolve_vc_pool,
@@ -80,6 +80,7 @@ struct FakeInner {
 struct FakeGateway {
     inner: Mutex<FakeInner>,
     fail_sends: AtomicBool,
+    fail_send_channel: AtomicU64,
     fail_responses: AtomicBool,
 }
 
@@ -141,7 +142,9 @@ impl Gateway for FakeGateway {
         channel: ChannelId,
         message: &OutgoingMessage,
     ) -> Result<MessageId, GatewayError> {
-        if self.fail_sends.load(Ordering::SeqCst) {
+        if self.fail_sends.load(Ordering::SeqCst)
+            || self.fail_send_channel.load(Ordering::SeqCst) == channel.get()
+        {
             return Err(GatewayError("simulated send failure".into()));
         }
         let mut inner = self.lock();
@@ -263,6 +266,7 @@ fn config() -> DiscordConfig {
         token: "test".into(),
         guild_id: GUILD,
         dispute_channel_id: ChannelId::new(999),
+        summon_channel_id: ChannelId::new(998),
         vc_pool_size: 1,
         room_map: "kyogre".into(),
         room_checklist: vec!["設定 A".into(), "設定 B".into()],
@@ -498,6 +502,20 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     );
     assert_eq!(fake.sends_in(vc.red)[0], red_assignment);
     assert_eq!(fake.sends_in(vc.blue)[0], blue_assignment);
+    let (summon_channel, summon_message_id) = record.summon_notification.unwrap();
+    assert_eq!(summon_channel, ChannelId::new(998));
+    assert_eq!(vc_payload[SUMMON_CHANNEL_ID_KEY], "998");
+    assert_eq!(
+        vc_payload[SUMMON_MESSAGE_ID_KEY],
+        summon_message_id.get().to_string()
+    );
+    let summon = fake.message(summon_channel, summon_message_id);
+    assert_eq!(summon.mention_users.len(), 10);
+    assert!(summon.content.contains("マッチが成立しました"));
+    assert!(summon.content.contains("<#101> / <#102>"));
+    for forbidden in ["レート", "top_carry", "上キャリー", "報告"] {
+        assert!(!summon.content.contains(forbidden), "{}", summon.content);
+    }
 
     // 2. 割り当て表: 見出し、10 人、VC の案内、マップ + チェックリスト。両 VC で同じ内容
     let assignment = fake.message(vc.red, red_assignment);
@@ -1666,6 +1684,48 @@ async fn a_failed_post_abandons_the_formation_with_the_operation_recorded(owner:
     adapter.start_formation(fid(2)).await.unwrap();
     let (_, _, record) = load(&db, fid(2)).await;
     assert_eq!(record.vc.unwrap().label, "1");
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_failed_summon_is_recorded_without_abandoning_the_formation(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    fake.fail_send_channel.store(998, Ordering::SeqCst);
+    let adapter = adapter(&db, fake.clone(), 1);
+    db.repo.create_formation(&formation(1)).await.unwrap();
+
+    adapter.start_formation(fid(1)).await.unwrap();
+    let (log, state, record) = load(&db, fid(1)).await;
+    assert!(
+        matches!(
+            state,
+            S::AwaitingHost {
+                pending: Some(_),
+                ..
+            }
+        ),
+        "summon failure must not discard the match: {state}"
+    );
+    assert_eq!(
+        kinds(&log),
+        vec![K::VcAssigned, K::VcAssigned, K::HostAssigned]
+    );
+    assert_eq!(record.assignment_message_ids.len(), 2);
+    assert_eq!(record.summon_notification, None);
+    let failures = log.events[1].payload[DISCORD_FAILURES_KEY]
+        .as_array()
+        .unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0][OPERATION_KEY], "send:summon");
+    assert_eq!(failures[0][ATTEMPTS_KEY], 3);
+    assert!(
+        !kinds(&log).contains(&K::Abandoned),
+        "notification failure is not a formation failure"
+    );
     db.done().await;
 }
 

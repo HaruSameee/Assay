@@ -20,6 +20,10 @@ use super::vc_pool::VcPair;
 
 /// `vc_assigned`: 割り当て表のメッセージ ID（`{"red": "...", "blue": "..."}`）。投稿できなかった側は無い。
 pub const ASSIGNMENT_MESSAGE_IDS_KEY: &str = "assignment_message_ids";
+/// `vc_assigned`: 公開招集チャンネル。
+pub const SUMMON_CHANNEL_ID_KEY: &str = "summon_channel_id";
+/// `vc_assigned`: 参加者10人を呼び出したメッセージ。
+pub const SUMMON_MESSAGE_ID_KEY: &str = "summon_message_id";
 /// `host_assigned`: ホスト打診メッセージを投稿したチャンネル（ホスト候補の側の VC）。
 pub const HOST_PROMPT_CHANNEL_ID_KEY: &str = "host_prompt_channel_id";
 /// `host_assigned`: ホスト打診メッセージの ID。同じ側の候補に変わったらこのメッセージを編集する。
@@ -77,6 +81,8 @@ pub struct DiscordRecord {
     pub vc: Option<VcPair>,
     /// 割り当て表のメッセージ（チームごと）。
     pub assignment_message_ids: HashMap<Team, MessageId>,
+    /// 公開招集チャンネルへの通知。
+    pub summon_notification: Option<(ChannelId, MessageId)>,
     /// ホスト打診メッセージ（状態表示を兼ねる）: 投稿先のチャンネルと ID。
     pub host_prompt: Option<(ChannelId, MessageId)>,
     /// ルーム ID を開示したメッセージ（チームごと）。
@@ -102,6 +108,11 @@ impl DiscordRecord {
                             vc: Some(vc),
                             assignment_message_ids: per_team_ids(
                                 payload.get(ASSIGNMENT_MESSAGE_IDS_KEY),
+                            ),
+                            summon_notification: notification(
+                                payload,
+                                SUMMON_CHANNEL_ID_KEY,
+                                SUMMON_MESSAGE_ID_KEY,
                             ),
                             host_prompt: None,
                             code_message_ids: HashMap::new(),
@@ -156,6 +167,16 @@ fn id_field(payload: &Value, key: &str) -> Option<u64> {
 
 fn id_string(id: u64) -> Value {
     Value::String(id.to_string())
+}
+
+fn notification(
+    payload: &Value,
+    channel_key: &str,
+    message_key: &str,
+) -> Option<(ChannelId, MessageId)> {
+    let channel = id_field(payload, channel_key)?;
+    let message = id_field(payload, message_key)?;
+    Some((ChannelId::new(channel), MessageId::new(message)))
 }
 
 /// `{"red": "...", "blue": "..."}` を読む。
@@ -217,6 +238,7 @@ pub fn vc_from_json(value: Option<&Value>) -> Option<VcPair> {
 pub fn vc_assigned(
     vc: &VcPair,
     assignment_message_ids: &HashMap<Team, MessageId>,
+    summon_notification: Option<(ChannelId, MessageId)>,
     failures: &[DiscordFailure],
 ) -> Value {
     let mut map = Map::new();
@@ -225,6 +247,10 @@ pub fn vc_assigned(
         ASSIGNMENT_MESSAGE_IDS_KEY.into(),
         per_team_json(assignment_message_ids),
     );
+    if let Some((channel, message)) = summon_notification {
+        map.insert(SUMMON_CHANNEL_ID_KEY.into(), id_string(channel.get()));
+        map.insert(SUMMON_MESSAGE_ID_KEY.into(), id_string(message.get()));
+    }
     with_failures(map, failures)
 }
 
@@ -378,7 +404,16 @@ mod tests {
     #[test]
     fn record_is_derived_from_the_latest_assignment_and_its_messages() {
         let events = vec![
-            stored(1, K::VcAssigned, vc_assigned(&pair(), &ids(101, 102), &[])),
+            stored(
+                1,
+                K::VcAssigned,
+                vc_assigned(
+                    &pair(),
+                    &ids(101, 102),
+                    Some((ChannelId::new(90), MessageId::new(100))),
+                    &[],
+                ),
+            ),
             stored(
                 2,
                 K::HostAssigned,
@@ -397,6 +432,7 @@ mod tests {
             DiscordRecord {
                 vc: Some(pair()),
                 assignment_message_ids: ids(101, 102),
+                summon_notification: Some((ChannelId::new(90), MessageId::new(100))),
                 host_prompt: Some((ChannelId::new(31), MessageId::new(103))),
                 code_message_ids: ids(104, 105),
                 report_message_ids: ids(106, 107),
@@ -410,13 +446,21 @@ mod tests {
         let mut other = pair();
         other.label = "4".into();
         let events = vec![
-            stored(1, K::VcAssigned, vc_assigned(&pair(), &ids(101, 102), &[])),
+            stored(
+                1,
+                K::VcAssigned,
+                vc_assigned(&pair(), &ids(101, 102), None, &[]),
+            ),
             stored(
                 2,
                 K::HostAssigned,
                 host_assigned(ChannelId::new(31), MessageId::new(103), 1001, &[]),
             ),
-            stored(3, K::VcAssigned, vc_assigned(&other, &ids(201, 202), &[])),
+            stored(
+                3,
+                K::VcAssigned,
+                vc_assigned(&other, &ids(201, 202), None, &[]),
+            ),
         ];
         let record = DiscordRecord::from_log(&log(events));
         assert_eq!(record.vc.unwrap().label, "4");

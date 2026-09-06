@@ -1,4 +1,4 @@
-//! キューのエンドポイント。JSON。
+//! キューの画面と JSON API。
 //!
 //! - `GET    /queue` 自分のエントリと「範囲内でキュー中の人数」
 //! - `POST   /queue` 投入 / 設定の更新
@@ -14,9 +14,9 @@
 //! CSRF: セッション Cookie は `SameSite=Lax` なので、他サイトからの POST / DELETE には
 //! 送られない。登録トラックのフォームと同じ前提に拠る。
 
-use axum::extract::{FromRef, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::extract::{FromRef, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
@@ -33,7 +33,8 @@ use crate::registration::{
 };
 
 use super::model::{
-    MIN_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, UP_RANGE, validate_request,
+    MIN_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, UP_RANGE, VoiceDestination,
+    validate_down_range, validate_request,
 };
 use super::repository::{QueueError, QueueRepository};
 
@@ -107,20 +108,27 @@ struct JoinRequest {
     roles: Vec<RolePreference>,
 }
 
+/// 未投入時の人数プレビュー。
+#[derive(Debug, Default, Deserialize)]
+struct ShowQuery {
+    /// 指定があると、その下方向範囲で人数を数えて JSON を返す。
+    down_range: Option<i32>,
+}
+
 fn default_down_range() -> i32 {
     MIN_DOWN_RANGE
 }
 
 /// 登録ゲートの理由。**報告ゲートとは別のフィールドで返す。**
 #[derive(Debug, Serialize)]
-struct RegistrationBlockView {
+pub(super) struct RegistrationBlockView {
     /// 機械可読な理由。
-    code: &'static str,
+    pub(super) code: &'static str,
     /// 画面に出す説明。
-    message: String,
+    pub(super) message: String,
     /// 直近の申告ランク（`rank_below_entry` のときだけ）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    declared: Option<&'static str>,
+    pub(super) declared: Option<&'static str>,
 }
 
 impl From<&RegistrationBlock> for RegistrationBlockView {
@@ -143,13 +151,13 @@ impl From<&RegistrationBlock> for RegistrationBlockView {
 
 /// 3つのゲートの状態。畳まない。
 #[derive(Debug, Serialize)]
-struct EligibilityView {
+pub(super) struct EligibilityView {
     /// 登録ゲート。通っていれば `null`。
-    registration: Option<RegistrationBlockView>,
+    pub(super) registration: Option<RegistrationBlockView>,
     /// 進行中ゲート。成立済みでまだ始まっていない formation。無ければ `null`。
-    active_formation: Option<Uuid>,
+    pub(super) active_formation: Option<Uuid>,
     /// 報告ゲート。未報告の formation。空なら通過。
-    pending_reports: Vec<Uuid>,
+    pub(super) pending_reports: Vec<Uuid>,
 }
 
 impl From<&QueueEligibility> for EligibilityView {
@@ -168,21 +176,21 @@ impl From<&QueueEligibility> for EligibilityView {
 
 /// 自分のエントリ。識別子は素の UUID にする（ドメインの newtype に serde を足さない）。
 #[derive(Debug, Serialize)]
-struct EntryView {
+pub(super) struct EntryView {
     /// `queue_entries.id`。
-    id: Uuid,
+    pub(super) id: Uuid,
     /// 所有者。常にセッションのプレイヤー。
-    player_id: Uuid,
+    pub(super) player_id: Uuid,
     /// 最初にキューへ入った時刻。設定変更では動かない。RFC 3339。
-    enqueued_at: String,
+    pub(super) enqueued_at: String,
     /// 設定を最後に変えた時刻。RFC 3339。
-    updated_at: String,
+    pub(super) updated_at: String,
     /// 下方向のマッチング範囲。
-    down_range: i32,
+    pub(super) down_range: i32,
     /// 上方向のマッチング範囲。**固定値**を毎回返す（UI が定数を持たないで済むように）。
-    up_range: i32,
+    pub(super) up_range: i32,
     /// 希望ロール。`priority` の昇順。
-    roles: Vec<RolePreference>,
+    pub(super) roles: Vec<RolePreference>,
 }
 
 impl From<QueueEntry> for EntryView {
@@ -201,17 +209,41 @@ impl From<QueueEntry> for EntryView {
 
 /// キューの状態。
 #[derive(Debug, Serialize)]
-struct StatusView {
+pub(super) struct StatusView {
     /// キュー中か。
-    queued: bool,
+    pub(super) queued: bool,
     /// 自分のエントリ。キュー中でなければ `null`。
-    entry: Option<EntryView>,
+    pub(super) entry: Option<EntryView>,
     /// 自分の範囲内でキュー中の人数（相互条件、07 §3-1）。
     ///
     /// 範囲は本人の設定なので、キューに入る前は決まらない。そのときは `null`。
-    in_range: Option<usize>,
+    pub(super) in_range: Option<usize>,
     /// 3つのゲートの現在の状態。キュー中でも進行中・報告ゲートは後から立ちうる。
-    eligibility: EligibilityView,
+    pub(super) eligibility: EligibilityView,
+    /// 成立済みなら、`vc_assigned` のログから読んだ本人側の集合先。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) destination: Option<DestinationView>,
+}
+
+/// キュー画面に出す本人側の集合先。
+#[derive(Debug, Serialize)]
+pub(super) struct DestinationView {
+    pub(super) formation_id: Uuid,
+    pub(super) team: String,
+    pub(super) channel_name: String,
+    pub(super) channel_id: String,
+}
+
+impl From<VoiceDestination> for DestinationView {
+    fn from(destination: VoiceDestination) -> Self {
+        let channel_name = destination.channel_name();
+        Self {
+            formation_id: destination.formation_id.0,
+            team: destination.team,
+            channel_name,
+            channel_id: destination.channel_id,
+        }
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -219,11 +251,43 @@ struct StatusView {
 // ----------------------------------------------------------------------
 
 /// 状態取得。
-async fn show_queue(State(app): State<QueueState>, session: Option<CurrentSession>) -> Response {
+async fn show_queue(
+    State(app): State<QueueState>,
+    session: Option<CurrentSession>,
+    Query(query): Query<ShowQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let html = accepts_html(&headers);
     let Some(player_id) = player(session) else {
-        return unauthenticated();
+        return if html {
+            (
+                StatusCode::UNAUTHORIZED,
+                Html(crate::registration::html::error_page(
+                    "ログインが必要です",
+                    "セッションが切れているか、まだログインしていません。入口からDiscordでログインしてください。",
+                )),
+            )
+                .into_response()
+        } else {
+            unauthenticated()
+        };
     };
-    match status(&app, player_id).await {
+    let preview_down_range = query.down_range.or_else(|| html.then_some(MIN_DOWN_RANGE));
+    if let Some(down_range) = preview_down_range
+        && let Err(error) = validate_down_range(down_range)
+    {
+        return invalid_request(&error);
+    }
+    match status(&app, player_id, preview_down_range).await {
+        Some(status) if html => (
+            StatusCode::OK,
+            Html(super::html::queue_page(
+                &status,
+                preview_down_range.unwrap_or(MIN_DOWN_RANGE),
+                Utc::now(),
+            )),
+        )
+            .into_response(),
         Some(status) => (StatusCode::OK, Json(status)).into_response(),
         None => internal_error(),
     }
@@ -284,7 +348,7 @@ async fn join_queue(
         }
     }
 
-    match status(&app, player_id).await {
+    match status(&app, player_id, None).await {
         Some(status) => (StatusCode::OK, Json(status)).into_response(),
         None => internal_error(),
     }
@@ -320,31 +384,64 @@ fn player(session: Option<CurrentSession>) -> Option<PlayerId> {
 
 /// 状態を組み立てる。
 /// 失敗の詳細はログにだけ残し、呼び出し側は 500 を返す。
-async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
+async fn status(
+    app: &QueueState,
+    player_id: PlayerId,
+    preview_down_range: Option<i32>,
+) -> Option<StatusView> {
     let entry = app
         .queue
         .find(player_id)
         .await
         .inspect_err(|error| error!(%error, "could not read the queue entry"))
         .ok()?;
-    let in_range = app
-        .queue
-        .in_range_count(player_id)
-        .await
-        .inspect_err(|error| error!(%error, "could not count the players in range"))
-        .ok()?;
+    let in_range = if entry.is_some() {
+        app.queue.in_range_count(player_id).await
+    } else if let Some(down_range) = preview_down_range {
+        app.queue
+            .preview_in_range_count(player_id, down_range)
+            .await
+            .map(Some)
+    } else {
+        Ok(None)
+    }
+    .inspect_err(|error| error!(%error, "could not count the players in range"))
+    .ok()?;
     let eligibility = app
         .registration
         .queue_eligibility(player_id)
         .await
         .inspect_err(|error| error!(%error, "could not evaluate the queue gates"))
         .ok()?;
+    let destination = if let Some(FormationId(formation_id)) = eligibility.active_formation {
+        app.queue
+            .voice_destination(FormationId(formation_id), player_id)
+            .await
+            .inspect_err(|error| error!(%error, "could not read the assigned voice channel"))
+            .ok()?
+            .map(Into::into)
+    } else {
+        None
+    };
     Some(StatusView {
         queued: entry.is_some(),
         entry: entry.map(EntryView::from),
         in_range,
         eligibility: EligibilityView::from(&eligibility),
+        destination,
     })
+}
+
+/// Browser navigation asks for HTML; fetch/tests without that Accept value keep the JSON API.
+fn accepts_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|item| item.trim().starts_with("text/html"))
+        })
 }
 
 fn unauthenticated() -> Response {

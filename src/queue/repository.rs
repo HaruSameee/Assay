@@ -18,10 +18,10 @@
 
 use sqlx::PgPool;
 
-use crate::lifecycle::{PlayerId, Timestamp};
+use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 use crate::rating::DEFAULT_DISPLAY_MU;
 
-use super::model::{QueueEntry, QueueEntryId, QueueRequest, RolePreference};
+use super::model::{QueueEntry, QueueEntryId, QueueRequest, RolePreference, VoiceDestination};
 use super::range::QueuedPlayer;
 
 /// PostgreSQL の SQLSTATE。
@@ -214,6 +214,99 @@ impl QueueRepository {
             return Ok(None);
         };
         Ok(Some(super::range::count_in_range(me, &queue)))
+    }
+
+    /// 未投入時のプレビュー。指定した下方向範囲で相互に成立する人数を返す。
+    ///
+    /// 本人のレートもキュー中のレートも追記ログから毎回導出する。プレビューのために
+    /// `queue_entries` を一時作成したり、現在レートを保存したりしない。
+    pub async fn preview_in_range_count(
+        &self,
+        player_id: PlayerId,
+        down_range: i32,
+    ) -> Result<usize, QueueError> {
+        let queue = self.queued_players().await?;
+        let Some(rating) = self.player_rating(player_id).await? else {
+            return Err(QueueError::PlayerNotFound(player_id));
+        };
+        let me = QueuedPlayer {
+            player_id,
+            rating,
+            down_range,
+        };
+        Ok(super::range::count_in_range(&me, &queue))
+    }
+
+    /// `vc_assigned` の永久ログから、成立済み formation で本人が向かう VC を読む。
+    /// Discord 側のチャンネル検索は行わない。
+    pub async fn voice_destination(
+        &self,
+        formation_id: FormationId,
+        player_id: PlayerId,
+    ) -> Result<Option<VoiceDestination>, QueueError> {
+        let row = sqlx::query!(
+            "select fp.team, latest.payload->'vc'->>'label' as \"label?\", \
+                    case fp.team \
+                        when 'red' then latest.payload->'vc'->>'red_channel_id' \
+                        when 'blue' then latest.payload->'vc'->>'blue_channel_id' \
+                    end as \"channel_id?\" \
+             from formation_players fp \
+             left join lateral ( \
+                 select e.payload \
+                 from formation_events e \
+                 where e.formation_id = fp.formation_id and e.kind = 'vc_assigned' \
+                   and e.payload ? 'vc' \
+                 order by e.id desc \
+                 limit 1 \
+             ) latest on true \
+             where fp.formation_id = $1 and fp.player_id = $2",
+            formation_id.0,
+            player_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let (Some(label), Some(channel_id)) = (row.label, row.channel_id) else {
+            return Ok(None);
+        };
+        let label = label.trim();
+        let channel_id = channel_id.trim();
+        if label.is_empty()
+            || channel_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(VoiceDestination {
+            formation_id,
+            team: row.team,
+            label: label.to_owned(),
+            channel_id: channel_id.to_owned(),
+        }))
+    }
+
+    /// 表示スケールの現在レート。現在値テーブルを作らず追記ログから導出する。
+    async fn player_rating(&self, player_id: PlayerId) -> Result<Option<f64>, QueueError> {
+        let row = sqlx::query!(
+            "select $2::double precision \
+                    + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                                where a.player_id = p.id), 0::double precision) \
+                    + coalesce(m.delta, 0::double precision) \
+                    as \"rating!\" \
+             from players p \
+             left join player_match_ratings m on m.player_id = p.id \
+             where p.id = $1",
+            player_id.0,
+            DEFAULT_DISPLAY_MU,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| row.rating))
     }
 }
 

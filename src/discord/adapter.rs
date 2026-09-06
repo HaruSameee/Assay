@@ -425,6 +425,36 @@ impl Adapter {
                 Err(failure) => failures.push(failure),
             }
         }
+        let assignment_failed = !failures.is_empty();
+        let summon = if assignment_failed {
+            None
+        } else if let Some(existing) = record.summon_notification {
+            Some(existing)
+        } else {
+            let message = render::summon(&roster, vc);
+            match self
+                .retry("send:summon", || {
+                    self.gateway
+                        .send_message(self.config.summon_channel_id, &message)
+                })
+                .await
+            {
+                Ok(message_id) => {
+                    info!(
+                        formation = %id,
+                        channel = %self.config.summon_channel_id,
+                        %message_id,
+                        "match summon posted"
+                    );
+                    Some((self.config.summon_channel_id, message_id))
+                }
+                Err(failure) => {
+                    error!(formation = %id, error = %failure.error, "match summon failed; formation continues");
+                    failures.push(failure);
+                    None
+                }
+            }
+        };
         let event = NewEvent::new(
             FormationEventKind::VcAssigned,
             None,
@@ -435,11 +465,11 @@ impl Adapter {
                 Utc::now().timestamp_micros()
             ),
         )
-        .with_payload(payload::vc_assigned(vc, &ids, &failures));
+        .with_payload(payload::vc_assigned(vc, &ids, summon, &failures));
         if !self.record(id, &event).await? {
             return Ok(false);
         }
-        if failures.is_empty() {
+        if !assignment_failed {
             return Ok(true);
         }
         error!(formation = %id, count = failures.len(), "assignment table could not be posted; abandoning");

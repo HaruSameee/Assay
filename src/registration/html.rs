@@ -195,11 +195,16 @@ pub fn escape(value: &str) -> String {
 
 /// ページの外枠。
 pub fn page(title: &str, body: &str) -> String {
+    page_with_styles(title, body, "")
+}
+
+/// 登録画面と同じシェルに、画面固有の CSS を追加する。
+pub fn page_with_styles(title: &str, body: &str, extra_styles: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"theme-color\" content=\"#101114\">\n\
-         <title>{title} | Assay</title>\n<style>{STYLES}</style>\n</head>\n<body>\n\
+         <title>{title} | Assay</title>\n<style>{STYLES}{extra_styles}</style>\n</head>\n<body>\n\
          <div class=\"shell\">\n<header class=\"site-header\">\n\
          <a class=\"brand\" href=\"/\">Assay</a>\n\
          <span class=\"context\">Pokemon UNITE community match</span>\n</header>\n\
@@ -207,6 +212,7 @@ pub fn page(title: &str, body: &str) -> String {
          <footer class=\"site-footer\">Assay は非公式のコミュニティ運営サービスです。</footer>\n\
          </div>\n</body>\n</html>\n",
         title = escape(title),
+        extra_styles = extra_styles,
     )
 }
 

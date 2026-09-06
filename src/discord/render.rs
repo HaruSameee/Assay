@@ -115,6 +115,31 @@ pub fn assignment(
     }
 }
 
+/// 公開招集チャンネルに出す、成立通知と行き先だけのメッセージ。
+///
+/// レート、ロール、報告内容は全員が見る場所へ出さない。本文のメンションと
+/// `mention_users` は同じ10人に揃える。
+pub fn summon(roster: &[RosterEntry], vc: &VcPair) -> OutgoingMessage {
+    let mut users: Vec<UserId> = roster.iter().filter_map(user_of).collect();
+    users.sort_unstable();
+    users.dedup();
+    let mentions = users
+        .iter()
+        .map(|user| mention(*user))
+        .collect::<Vec<_>>()
+        .join(" ");
+    OutgoingMessage {
+        content: format!(
+            "{mentions}\nマッチが成立しました → <#{}> / <#{}>\n\
+             割り当てとルーム設定は各VCのテキストチャットにあります",
+            vc.red.get(),
+            vc.blue.get(),
+        ),
+        buttons: Vec::new(),
+        mention_users: users,
+    }
+}
+
 /// ホスト候補への打診（[ 部屋を作る ] [ 今回はパスする ]）。候補の側の VC チャットにだけ投稿する。
 ///
 /// 同じ側の候補に変わったらこのメッセージを編集する。新しいメッセージを積まない。
@@ -540,6 +565,25 @@ mod tests {
         let first_red = message.content[red..blue].find("<@1005>").unwrap();
         let second_red = message.content[red..blue].find("<@1001>").unwrap();
         assert!(first_red < second_red);
+    }
+
+    #[test]
+    fn summon_mentions_only_the_participants_and_destinations() {
+        let message = summon(&roster(), &vc());
+        assert_eq!(
+            message.content,
+            "<@1001> <@1002> <@1003> <@1004> <@1005> <@1006> <@1007> <@1008> <@1009> <@1010>\n\
+             マッチが成立しました → <#31> / <#32>\n\
+             割り当てとルーム設定は各VCのテキストチャットにあります"
+        );
+        assert_eq!(
+            message.mention_users,
+            (1001..=1010).map(UserId::new).collect::<Vec<_>>()
+        );
+        assert!(message.buttons.is_empty());
+        for forbidden in ["1500", "レート", "top_carry", "上キャリー", "報告"] {
+            assert!(!message.content.contains(forbidden), "{}", message.content);
+        }
     }
 
     #[test]

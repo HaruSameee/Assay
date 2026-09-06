@@ -152,6 +152,22 @@ async fn get_queue(app: &Router, as_player: Option<PlayerId>) -> (StatusCode, Va
     json_body(response).await
 }
 
+async fn get_queue_html(app: &Router, as_player: PlayerId, path: &str) -> (StatusCode, String) {
+    let request = Request::get(path)
+        .header(header::COOKIE, session_cookie(as_player))
+        .header(header::ACCEPT, "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let response = send(app, request).await;
+    let status = response.status();
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
 async fn post_queue(app: &Router, as_player: PlayerId, body: Value) -> (StatusCode, Value) {
     let request = Request::post("/queue")
         .header(header::COOKIE, session_cookie(as_player))
@@ -449,6 +465,56 @@ async fn role_preferences_are_unique_per_entry(owner: PgPool) {
 // ----------------------------------------------------------------------
 // エンドポイント
 // ----------------------------------------------------------------------
+
+/// ブラウザ向けの同じ `/queue` が、ログから導出した状態に応じて画面を切り替える。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+
+    let (status, unqueued) = get_queue_html(&app, me, "/queue?down_range=150").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(unqueued.contains("data-view=\"unqueued\""), "{unqueued}");
+    assert!(unqueued.contains("value=\"150\""), "{unqueued}");
+    assert!(unqueued.contains("top_carry"), "{unqueued}");
+    assert!(unqueued.contains("document.hidden"), "{unqueued}");
+
+    let (status, joined) = post_queue(
+        &app,
+        me,
+        json!({
+            "down_range": 150,
+            "roles": [wish("jungle", 1), wish("top_support", 2)]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{joined}");
+    let (status, queued) = get_queue_html(&app, me, "/queue").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(queued.contains("data-view=\"queued\""), "{queued}");
+    assert!(queued.contains("第1希望: 中央"), "{queued}");
+    assert!(queued.contains("第2希望: サポート"), "{queued}");
+    assert!(queued.contains("-150"), "{queued}");
+
+    let (status, _) = delete_queue(&app, me).await;
+    assert_eq!(status, StatusCode::OK);
+    formation_at(&db, 0xd1, me, Stage::AwaitingHost).await;
+    let (status, matched) = get_queue_html(&app, me, "/queue").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(matched.contains("data-view=\"blocked\""), "{matched}");
+    assert!(
+        matched.contains("data-gate=\"active_formation\""),
+        "{matched}"
+    );
+    assert!(matched.contains("vc1-red"), "{matched}");
+
+    db.done().await;
+}
 
 /// **2つのゲートを畳まない。**それぞれ単独でも、両方同時でも、理由が別々に返る。
 #[sqlx::test(
