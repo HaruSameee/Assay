@@ -655,6 +655,69 @@ async fn the_report_gate_takes_over_once_the_match_starts(owner: PgPool) {
     db.done().await;
 }
 
+/// **報告ゲートを切っても、試合中の人はキューに入れない。**
+///
+/// `REPORT_GATE_DISABLED` は報告フローが壊れたときの縮退用だが、切ると `in_progress` を
+/// 塞ぐものが無くなる。そのまま通すと試合中の人が二重割当され、**一番混乱している最中に
+/// 一番分かりにくいバグが出る**。フラグ有効時は進行中ゲートが `in_progress` まで広がる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_disabled_report_gate_hands_in_progress_to_the_active_gate(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+    formation_at(&db, 0xc1, me, Stage::InProgress).await;
+
+    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+
+    // 通常時: 報告ゲートが塞ぐ
+    let (status, denied) = post_queue(&db.router(), me, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied["active_formation"], Value::Null, "{denied}");
+    assert_eq!(denied["pending_reports"].as_array().unwrap().len(), 1);
+
+    // 縮退時: 報告ゲートは空になるが、進行中ゲートが受け取る
+    let degraded = QueueState::new(
+        config(),
+        db.registration.clone().with_report_gate_disabled(true),
+        db.queue.clone(),
+    );
+    let degraded = router(degraded);
+    let (status, denied) = post_queue(&degraded, me, body.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a live match must still block: {denied}"
+    );
+    assert_eq!(
+        denied["active_formation"],
+        Value::String(fid(0xc1).0.to_string()),
+        "{denied}"
+    );
+    assert_eq!(
+        denied["pending_reports"],
+        json!([]),
+        "the report gate is off, as asked: {denied}"
+    );
+    assert!(db.queue.find(me).await.unwrap().is_none());
+
+    // 試合が終われば、縮退時は報告を待たずに入れる（フラグの目的そのもの）
+    db.formations
+        .append_event(
+            fid(0xc1),
+            &NewEvent::new(K::Voided, None, at(60), "voided-c1"),
+        )
+        .await
+        .unwrap();
+    let (status, allowed) = post_queue(&degraded, me, body).await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["queued"], true);
+
+    db.done().await;
+}
+
 /// 投入・状態取得・離脱の一周。
 #[sqlx::test(
     fixtures("reference", "app_role"),

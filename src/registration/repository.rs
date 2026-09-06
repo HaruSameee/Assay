@@ -15,7 +15,7 @@ use sqlx::PgPool;
 use crate::lifecycle::{FormationId, FormationState, PlayerId, Timestamp};
 use crate::persistence::{FormationRepository, RepositoryError};
 
-use super::gate::{QueueEligibility, formation_blocks_queue, formation_blocks_queue_before_start};
+use super::gate::{QueueEligibility, active_formation_blocks_queue, formation_blocks_queue};
 use super::model::{Declaration, NewDeclaration, PlayerProfile, PlayerStatus};
 
 /// 登録トラックのエラー。
@@ -53,10 +53,13 @@ fn snowflake_to_i64(discord_user_id: &str) -> Result<i64, RegistrationError> {
 /// `formations_without_report_from` は `created_at` 昇順で返るので、最も古いものが選ばれる。
 /// 同時に 2 つ持てる状態は作らない設計だが、万一あっても 1 つを理由として返せばよい
 /// （どれか 1 つでも進行中なら塞ぐ、という判定は同じ）。
-fn active_formation_of(candidates: &[(FormationId, FormationState)]) -> Option<FormationId> {
+fn active_formation_of(
+    candidates: &[(FormationId, FormationState)],
+    report_gate_disabled: bool,
+) -> Option<FormationId> {
     candidates
         .iter()
-        .find(|(_, state)| formation_blocks_queue_before_start(state))
+        .find(|(_, state)| active_formation_blocks_queue(state, report_gate_disabled))
         .map(|(id, _)| *id)
 }
 
@@ -249,7 +252,7 @@ impl RegistrationRepository {
             .collect())
     }
 
-    /// 進行中ゲートを塞いでいる formation（成立済みで、まだ試合が始まっていないもの）。
+    /// 進行中ゲートを塞いでいる formation（まだ試合が終わっていないもの）。
     ///
     /// 1 プレイヤーが同時に持てるのは 1 つだけなので、最初に見つかったものを返す。
     pub async fn active_formation(
@@ -260,14 +263,17 @@ impl RegistrationRepository {
             .formations
             .formations_without_report_from(player_id)
             .await?;
-        Ok(active_formation_of(&candidates))
+        Ok(active_formation_of(&candidates, self.report_gate_disabled))
     }
 
     /// キューの 3 つのゲートをまとめて評価する（畳まずに理由を保ったまま返す）。
     ///
     /// 進行中ゲートと報告ゲートは同じ一覧から導出する（往復を 1 回で済ませる）。
-    /// **`REPORT_GATE_DISABLED` は報告ゲートだけを無効化する。**進行中ゲートは縮退させない
-    /// ——無効にすると、同じ人が 2 つの formation に割り当てられる状態がそのまま戻る。
+    ///
+    /// **`REPORT_GATE_DISABLED` は報告ゲートだけを無効化する。**進行中ゲートは縮退させず、
+    /// むしろ `in_progress` まで広がる（[`super::gate::active_formation_blocks_queue`]）。
+    /// 報告ゲートを切ったまま `in_progress` を素通しにすると、試合中の人がキューに入って
+    /// 二重割当される——縮退運用の最中に一番分かりにくい形で出る。
     pub async fn queue_eligibility(
         &self,
         player_id: PlayerId,
@@ -280,7 +286,7 @@ impl RegistrationRepository {
             .formations
             .formations_without_report_from(player_id)
             .await?;
-        let active = active_formation_of(&candidates);
+        let active = active_formation_of(&candidates, self.report_gate_disabled);
         let pending = if self.report_gate_disabled {
             Vec::new()
         } else {

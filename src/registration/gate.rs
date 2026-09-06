@@ -20,10 +20,18 @@
 //! |---|---|
 //! | `matched` / `awaiting_host` / `awaiting_code` | 進行中ゲート（報告ボタンがまだ無い） |
 //! | `in_progress` 以降 | 報告ゲート（プレイヤー単位。報告すれば解除） |
+//! | `in_progress`（`REPORT_GATE_DISABLED` 有効時のみ） | 進行中ゲート（報告ゲートが切れているため） |
 //!
 //! **`in_progress` 以降に進行中ゲートを被せないこと。**報告を済ませた人が formation の確定を
 //! 待たされることになり、00 §5 の「報告ゲートの解除条件を『確定』にしない —— 他 9 人に
 //! 人質を取られる」がそのまま復活する。
+//!
+//! **例外は `REPORT_GATE_DISABLED` が有効なときだけ。**報告ゲートを切ると `in_progress` を
+//! 塞ぐものが無くなり、試合中の人がキューに入って二重割当される。フラグを使うのは
+//! 「報告フローが壊れて縮退運用している最中」なので、そこで一番分かりにくいバグを出さない
+//! ために、そのときだけ進行中ゲートを `in_progress` まで広げる
+//! （[`active_formation_blocks_queue`]）。人質問題は起きない——報告ゲート自体が切れており、
+//! 塞いでいるのは「まだ試合が終わっていない」ことだけだからである。
 //!
 //! 進行中ゲートが要る理由: マッチメイカは成立時に 10 人をキューから外すが、`awaiting_host`
 //! （候補 1 人あたり 90 秒 × 最大 3 人）と `awaiting_code`（180 秒）の間、本人は再投入できて
@@ -134,18 +142,30 @@ pub fn formation_blocks_queue(state: &FormationState, player_reported: bool) -> 
 
 /// その formation が、このプレイヤーのキューを**進行中ゲート**で塞ぐか。
 ///
-/// 成立済みで、まだ試合が始まっていない状態。報告する手段がまだ無いので、報告ゲートでは
-/// 塞げない。`in_progress` 以降は**含めない**（そこからは報告ゲートがプレイヤー単位で
-/// 解除する。モジュール冒頭の表を読むこと）。
+/// 通常は「成立済みで、まだ試合が始まっていない」3 状態だけ。報告する手段がまだ無いので、
+/// 報告ゲートでは塞げない。`in_progress` 以降は**含めない**（そこからは報告ゲートが
+/// プレイヤー単位で解除する。モジュール冒頭の表を読むこと）。
+///
+/// **`report_gate_disabled` が真のときだけ `in_progress` まで広げる。**報告ゲートを切ると
+/// `in_progress` を塞ぐものが無くなり、試合中の人がキューに入って二重割当される。縮退運用は
+/// 「報告フローが壊れている最中」に使うものなので、そこで一番分かりにくいバグを出さない。
+/// 逆に、通常時に `in_progress` を被せてはならない（00 §5 の人質問題が復活する）。
+///
+/// 広げるのは `in_progress` までで、`confirmed` / `disputed` / `nullified` は含めない。
+/// 試合は終わっているので二重割当は起きず、そこまで塞ぐとフラグの目的（報告フローが壊れても
+/// キューを回す）を潰してしまう。
 ///
 /// 本人の報告の有無を見ないので、他人の報告にも依存しない。
-pub fn formation_blocks_queue_before_start(state: &FormationState) -> bool {
-    matches!(
+pub fn active_formation_blocks_queue(state: &FormationState, report_gate_disabled: bool) -> bool {
+    let before_start = matches!(
         state,
         FormationState::Matched
             | FormationState::AwaitingHost { .. }
             | FormationState::AwaitingCode { .. }
-    )
+    );
+    let unreportable_in_progress =
+        report_gate_disabled && matches!(state, FormationState::InProgress { .. });
+    before_start || unreportable_in_progress
 }
 
 /// 登録ゲート。プロフィールが無い（一度もログインしていない）場合も未登録として扱う。
@@ -171,10 +191,11 @@ pub fn registration_gate(profile: Option<&PlayerProfile>) -> Option<Registration
 
 /// 3つのゲートをまとめて評価する。**畳まない**——それぞれの理由を保ったまま返す。
 ///
-/// - `active_formation` は [`formation_blocks_queue_before_start`] が真になった formation。
+/// - `active_formation` は [`active_formation_blocks_queue`] が真になった formation。
 /// - `pending_reports` は [`formation_blocks_queue`] が真になった formation の一覧。
 ///
-/// 2つは重ならないので、同じ formation が両方に現れることはない。
+/// 2つは重ならないので、同じ formation が両方に現れることはない
+/// （`REPORT_GATE_DISABLED` で重なりうる `in_progress` は、そのとき報告ゲート側が空になる）。
 pub fn evaluate(
     profile: Option<&PlayerProfile>,
     active_formation: Option<FormationId>,
@@ -307,7 +328,7 @@ mod tests {
             },
         ] {
             assert!(
-                formation_blocks_queue_before_start(&state),
+                active_formation_blocks_queue(&state, false),
                 "{state} must block: the player has no way to report yet"
             );
         }
@@ -323,7 +344,7 @@ mod tests {
             FormationState::Voided,
             FormationState::Abandoned,
         ] {
-            assert!(!formation_blocks_queue_before_start(&state), "{state}");
+            assert!(!active_formation_blocks_queue(&state, false), "{state}");
         }
     }
 
@@ -354,7 +375,7 @@ mod tests {
             FormationState::Abandoned,
         ] {
             assert!(
-                !(formation_blocks_queue_before_start(&state)
+                !(active_formation_blocks_queue(&state, false)
                     && formation_blocks_queue(&state, false)),
                 "{state} is claimed by both gates"
             );
@@ -368,10 +389,59 @@ mod tests {
             host: host(),
             tried: 1,
         };
-        assert!(formation_blocks_queue_before_start(&state));
+        assert!(active_formation_blocks_queue(&state, false));
         // 始まる前は報告そのものができないので、報告ゲートは両方の値で通す
         assert!(!formation_blocks_queue(&state, false));
         assert!(!formation_blocks_queue(&state, true));
+    }
+
+    /// **報告ゲートを切ったときだけ、進行中ゲートが `in_progress` まで広がる。**
+    ///
+    /// 広げないと、縮退運用の最中に試合中の人がキューへ入って二重割当される。
+    #[test]
+    fn disabling_the_report_gate_extends_the_active_gate_to_in_progress() {
+        let in_progress = FormationState::InProgress {
+            host: host(),
+            room_code: "1234".into(),
+        };
+        assert!(
+            !active_formation_blocks_queue(&in_progress, false),
+            "normally the report gate owns in_progress"
+        );
+        assert!(
+            active_formation_blocks_queue(&in_progress, true),
+            "with the report gate off, nothing else would block a live match"
+        );
+
+        // 始まる前の 3 状態はフラグに関係なく塞ぐ
+        for state in [
+            FormationState::Matched,
+            FormationState::AwaitingHost {
+                pending: None,
+                tried: 0,
+            },
+            FormationState::AwaitingCode {
+                host: host(),
+                tried: 1,
+            },
+        ] {
+            assert!(active_formation_blocks_queue(&state, false), "{state}");
+            assert!(active_formation_blocks_queue(&state, true), "{state}");
+        }
+
+        // 試合が終わった後まで広げない。ここまで塞ぐとフラグの目的を潰す
+        for state in [
+            FormationState::Confirmed,
+            FormationState::Disputed,
+            FormationState::Nullified,
+            FormationState::Voided,
+            FormationState::Abandoned,
+        ] {
+            assert!(
+                !active_formation_blocks_queue(&state, true),
+                "{state}: the match is over, so there is nothing to double-book"
+            );
+        }
     }
 
     // ---- 登録ゲート ----

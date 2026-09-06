@@ -30,8 +30,8 @@ pub mod session;
 
 pub use config::{AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env};
 pub use gate::{
-    QueueEligibility, RegistrationBlock, evaluate, formation_blocks_queue,
-    formation_blocks_queue_before_start,
+    QueueEligibility, RegistrationBlock, active_formation_blocks_queue, evaluate,
+    formation_blocks_queue,
 };
 pub use model::{Declaration, NewDeclaration, PlayerProfile, PlayerStatus, Rank};
 pub use oauth::{DiscordUser, HttpOAuthClient, OAuthClient, OAuthError};
