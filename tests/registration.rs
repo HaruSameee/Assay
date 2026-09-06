@@ -491,13 +491,15 @@ async fn the_session_cookie_carries_only_an_identifier_and_a_timestamp(owner: Pg
     assert_eq!(profile.status, Some(PlayerStatus::Active));
     assert_eq!(profile.latest_declaration, None);
 
-    // ログアウトで Cookie が消え、フォームは入口に戻される
+    // ログアウトで Cookie が消え、フォームには再ログインが必要な理由が出る
     let logout = browser.post_form("/auth/logout", "").await;
     assert_eq!(logout.status(), StatusCode::SEE_OTHER);
     assert!(!browser.cookies.contains_key(SESSION_COOKIE));
     let after = browser.get("/register").await;
-    assert_eq!(after.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&after), "/");
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    let page = body_text(after).await;
+    assert!(page.contains("セッションの有効期限が切れました"));
+    assert!(page.contains("入口に戻る"));
     db.done().await;
 }
 
@@ -567,6 +569,19 @@ async fn registering_appends_a_declaration_and_every_resubmit_appends_another(ow
     assert_eq!(declaration.rating, Some(1500));
     assert_eq!(declaration_count(&db, player).await, 1);
     let registered_at = profile.registered_at.unwrap();
+
+    // 登録内容を変更する画面には、現在の最新値がプリフィルされる
+    let edit_form = body_text(browser.get("/register").await).await;
+    assert!(edit_form.contains("value=\"トレーナー\""), "{edit_form}");
+    assert!(
+        edit_form.contains("value=\"legend\" selected"),
+        "{edit_form}"
+    );
+    assert!(edit_form.contains("value=\"1500\""), "{edit_form}");
+    assert!(
+        edit_form.contains("Assay のレートには自動反映されず"),
+        "{edit_form}"
+    );
 
     // 申告し直し: 内容が同じでも新しい行になる（状態ベースの冪等にしない）
     browser
@@ -643,17 +658,25 @@ async fn an_invalid_form_is_rejected_without_writing_anything(owner: PgPool) {
     let mut browser = Browser::new(router(AuthState::new(config(), oauth, db.repo.clone())));
     let player = sign_in(&mut browser, &db, discord_id).await;
 
-    for (body, expected) in [
-        (form_body("", "legend", "1500"), "トレーナー名"),
-        (form_body("トレーナー", "", "1500"), "ランク"),
-        (form_body("トレーナー", "legend", ""), "本家レート"),
-        (form_body("トレーナー", "legend", "つよい"), "本家レート"),
+    for (body, field_id) in [
+        (form_body("", "legend", "1500"), "trainer_name-error"),
+        (form_body("トレーナー", "", "1500"), "rank-error"),
+        (form_body("トレーナー", "legend", ""), "rating-error"),
+        (form_body("トレーナー", "legend", "つよい"), "rating-error"),
     ] {
         let response = browser.post_form("/register", &body).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
         let page = body_text(response).await;
-        assert!(page.contains(expected), "{body}: {page}");
+        assert!(page.contains(field_id), "{body}: {page}");
+        assert!(page.contains("aria-invalid=\"true\""), "{body}: {page}");
     }
+
+    let response = browser
+        .post_form("/register", &form_body("入力中", "legend", "つよい"))
+        .await;
+    let page = body_text(response).await;
+    assert!(page.contains("value=\"入力中\""), "{page}");
+    assert!(page.contains("value=\"つよい\""), "{page}");
     assert_eq!(declaration_count(&db, player).await, 0);
     let profile = db.repo.find_by_player_id(player).await.unwrap().unwrap();
     assert!(!profile.is_registered());
@@ -670,14 +693,17 @@ async fn the_form_requires_a_session(owner: PgPool) {
     let mut browser = Browser::new(router(AuthState::new(config(), oauth, db.repo.clone())));
 
     let form = browser.get("/register").await;
-    assert_eq!(form.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&form), "/");
+    assert_eq!(form.status(), StatusCode::UNAUTHORIZED);
+    let form_page = body_text(form).await;
+    assert!(form_page.contains("セッションの有効期限が切れました"));
+    assert!(form_page.contains("入口に戻る"));
 
     let submit = browser
         .post_form("/register", &form_body("トレーナー", "legend", "1500"))
         .await;
-    assert_eq!(submit.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&submit), "/");
+    assert_eq!(submit.status(), StatusCode::UNAUTHORIZED);
+    let submit_page = body_text(submit).await;
+    assert!(submit_page.contains("セッションの有効期限が切れました"));
 
     // 入口はログインページ
     let index = body_text(browser.get("/").await).await;
