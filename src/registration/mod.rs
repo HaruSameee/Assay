@@ -16,7 +16,7 @@
 //! - Cookie に入れるのは **player の識別子と発行時刻だけ**。権限もロールも入れない。
 //! - 申告レートは可変列に置かない。`player_declarations` に追記し、現在値は最新行から導出する。
 //! - 追記専用テーブルに UPDATE / DELETE を書かない。`SELECT ... FOR UPDATE` も使わない。
-//! - キューのゲートは**2つに分けたまま**返す（[`gate`]）。1つのフラグに畳むと、
+//! - キューのゲートは**3つに分けたまま**返す（[`gate`]）。1つのフラグに畳むと、
 //!   キュー画面で「なぜ入れないのか」を説明できなくなる。
 
 pub mod config;
@@ -29,7 +29,10 @@ pub mod routes;
 pub mod session;
 
 pub use config::{AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env};
-pub use gate::{QueueEligibility, RegistrationBlock, evaluate, formation_blocks_queue};
+pub use gate::{
+    QueueEligibility, RegistrationBlock, evaluate, formation_blocks_queue,
+    formation_blocks_queue_before_start,
+};
 pub use model::{Declaration, NewDeclaration, PlayerProfile, PlayerStatus, Rank};
 pub use oauth::{DiscordUser, HttpOAuthClient, OAuthClient, OAuthError};
 pub use repository::{RegistrationError, RegistrationRepository};

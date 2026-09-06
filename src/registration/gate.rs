@@ -1,9 +1,10 @@
 //! キューのゲート。純粋関数。
 //!
-//! ゲートは**2つに分ける**（05-登録トラック仕様 §4）。1つのフラグに畳むと、キュー画面で
+//! ゲートは**3つに分ける**（05-登録トラック仕様 §4）。1つのフラグに畳むと、キュー画面で
 //! 「なぜ入れないのか」を説明できなくなる。
 //!
 //! - **登録ゲート**: 未登録 / `status = 'suspended'` / 直近の申告がレジェンド未満
+//! - **進行中ゲート**: マッチが成立していて、まだ試合が始まっていない
 //! - **報告ゲート**: 未報告の formation を持つ
 //!
 //! 報告ゲートの解除条件は「**自分が報告したこと**」だけ（02 D-3）。「確定したこと」を条件に
@@ -12,6 +13,22 @@
 //!
 //! 未報告かどうかは**自分の報告の有無だけ**で決める。他人の報告の内容・件数は読まない
 //! （報告のブラインドは API レベルの制約であり、ここもその内側にある）。
+//!
+//! **進行中ゲートと報告ゲートは重ならない。**境界は「報告する手段があるか」である。
+//!
+//! | 状態 | 塞ぐゲート |
+//! |---|---|
+//! | `matched` / `awaiting_host` / `awaiting_code` | 進行中ゲート（報告ボタンがまだ無い） |
+//! | `in_progress` 以降 | 報告ゲート（プレイヤー単位。報告すれば解除） |
+//!
+//! **`in_progress` 以降に進行中ゲートを被せないこと。**報告を済ませた人が formation の確定を
+//! 待たされることになり、00 §5 の「報告ゲートの解除条件を『確定』にしない —— 他 9 人に
+//! 人質を取られる」がそのまま復活する。
+//!
+//! 進行中ゲートが要る理由: マッチメイカは成立時に 10 人をキューから外すが、`awaiting_host`
+//! （候補 1 人あたり 90 秒 × 最大 3 人）と `awaiting_code`（180 秒）の間、本人は再投入できて
+//! しまう。マッチメイカは 3 分ごとに走るので、この窓は複数回のティックをまたぐ。塞がないと
+//! 同じ人が 2 つの formation に割り当てられ、VC の組も 2 つ占有する。
 
 use crate::lifecycle::{FormationId, FormationState};
 
@@ -57,19 +74,28 @@ impl RegistrationBlock {
     }
 }
 
-/// キューに入れるかどうかの判定。2つのゲートを**別々に**持つ。
+/// キューに入れるかどうかの判定。3つのゲートを**別々に**持つ。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueEligibility {
     /// 登録ゲート。通っていれば `None`。
     pub registration: Option<RegistrationBlock>,
+    /// 進行中ゲート。成立済みでまだ始まっていない formation。無ければ通過。
+    pub active_formation: Option<FormationId>,
     /// 報告ゲート。未報告の formation。空なら通過。
     pub pending_reports: Vec<FormationId>,
 }
 
 impl QueueEligibility {
-    /// 両方のゲートを通ったか。
+    /// 3つとも通ったか。
     pub fn is_allowed(&self) -> bool {
-        self.registration.is_none() && self.pending_reports.is_empty()
+        self.registration.is_none()
+            && self.active_formation.is_none()
+            && self.pending_reports.is_empty()
+    }
+
+    /// 進行中ゲートに引っかかっているか。
+    pub fn is_active_formation_blocked(&self) -> bool {
+        self.active_formation.is_some()
     }
 
     /// 報告ゲートに引っかかっているか。
@@ -83,6 +109,12 @@ impl QueueEligibility {
         if let Some(block) = &self.registration {
             messages.push(block.message());
         }
+        if self.active_formation.is_some() {
+            messages.push(
+                "マッチが成立しています。Discord の案内に従ってください。この試合が終わるまでキューには入れません。"
+                    .into(),
+            );
+        }
         if let Some(count) = std::num::NonZeroUsize::new(self.pending_reports.len()) {
             messages.push(format!(
                 "未報告の試合が{count}件あります。結果を報告するとキューに入れます。"
@@ -92,12 +124,28 @@ impl QueueEligibility {
     }
 }
 
-/// その formation が、このプレイヤーのキューを塞ぐか。
+/// その formation が、このプレイヤーのキューを**報告ゲート**で塞ぐか。
 ///
 /// 塞ぐのは「報告義務のある状態」かつ「本人がまだ報告していない」とき。
 /// `player_reported` は**本人の報告の有無**だけで、他人の報告は見ない。
 pub fn formation_blocks_queue(state: &FormationState, player_reported: bool) -> bool {
     state.requires_reports() && !player_reported
+}
+
+/// その formation が、このプレイヤーのキューを**進行中ゲート**で塞ぐか。
+///
+/// 成立済みで、まだ試合が始まっていない状態。報告する手段がまだ無いので、報告ゲートでは
+/// 塞げない。`in_progress` 以降は**含めない**（そこからは報告ゲートがプレイヤー単位で
+/// 解除する。モジュール冒頭の表を読むこと）。
+///
+/// 本人の報告の有無を見ないので、他人の報告にも依存しない。
+pub fn formation_blocks_queue_before_start(state: &FormationState) -> bool {
+    matches!(
+        state,
+        FormationState::Matched
+            | FormationState::AwaitingHost { .. }
+            | FormationState::AwaitingCode { .. }
+    )
 }
 
 /// 登録ゲート。プロフィールが無い（一度もログインしていない）場合も未登録として扱う。
@@ -121,11 +169,15 @@ pub fn registration_gate(profile: Option<&PlayerProfile>) -> Option<Registration
     }
 }
 
-/// 2つのゲートをまとめて評価する。**畳まない**——それぞれの理由を保ったまま返す。
+/// 3つのゲートをまとめて評価する。**畳まない**——それぞれの理由を保ったまま返す。
 ///
-/// `pending_reports` は [`formation_blocks_queue`] が真になった formation の一覧。
+/// - `active_formation` は [`formation_blocks_queue_before_start`] が真になった formation。
+/// - `pending_reports` は [`formation_blocks_queue`] が真になった formation の一覧。
+///
+/// 2つは重ならないので、同じ formation が両方に現れることはない。
 pub fn evaluate(
     profile: Option<&PlayerProfile>,
+    active_formation: Option<FormationId>,
     pending_reports: Vec<FormationId>,
 ) -> QueueEligibility {
     QueueEligibility {
@@ -135,6 +187,7 @@ pub fn evaluate(
                 .is_none()
                 .then_some(RegistrationBlock::NotRegistered)
         }),
+        active_formation,
         pending_reports,
     }
 }
@@ -233,6 +286,94 @@ mod tests {
         }
     }
 
+    // ---- 進行中ゲート ----
+
+    /// 成立済みでまだ始まっていない 3 状態だけを塞ぐ。
+    #[test]
+    fn only_states_before_the_match_starts_raise_the_active_gate() {
+        for state in [
+            FormationState::Matched,
+            FormationState::AwaitingHost {
+                pending: None,
+                tried: 0,
+            },
+            FormationState::AwaitingHost {
+                pending: Some(host()),
+                tried: 2,
+            },
+            FormationState::AwaitingCode {
+                host: host(),
+                tried: 1,
+            },
+        ] {
+            assert!(
+                formation_blocks_queue_before_start(&state),
+                "{state} must block: the player has no way to report yet"
+            );
+        }
+        // 始まった後と、終わった後は塞がない
+        for state in [
+            FormationState::InProgress {
+                host: host(),
+                room_code: "1234".into(),
+            },
+            FormationState::Confirmed,
+            FormationState::Disputed,
+            FormationState::Nullified,
+            FormationState::Voided,
+            FormationState::Abandoned,
+        ] {
+            assert!(!formation_blocks_queue_before_start(&state), "{state}");
+        }
+    }
+
+    /// **2つのゲートは重ならない。**どの状態も、塞ぐとしてもどちらか一方だけ。
+    ///
+    /// `in_progress` 以降に進行中ゲートが被ると、報告を済ませた人が formation の確定を
+    /// 待たされる（00 §5 の「解除条件を『確定』にしない」が壊れる）。
+    #[test]
+    fn the_active_and_report_gates_never_overlap() {
+        for state in [
+            FormationState::Matched,
+            FormationState::AwaitingHost {
+                pending: None,
+                tried: 0,
+            },
+            FormationState::AwaitingCode {
+                host: host(),
+                tried: 1,
+            },
+            FormationState::InProgress {
+                host: host(),
+                room_code: "1234".into(),
+            },
+            FormationState::Confirmed,
+            FormationState::Disputed,
+            FormationState::Nullified,
+            FormationState::Voided,
+            FormationState::Abandoned,
+        ] {
+            assert!(
+                !(formation_blocks_queue_before_start(&state)
+                    && formation_blocks_queue(&state, false)),
+                "{state} is claimed by both gates"
+            );
+        }
+    }
+
+    /// 報告しても進行中ゲートは変わらない（本人の報告を見ないゲートなので）。
+    #[test]
+    fn reporting_does_not_affect_the_active_gate() {
+        let state = FormationState::AwaitingCode {
+            host: host(),
+            tried: 1,
+        };
+        assert!(formation_blocks_queue_before_start(&state));
+        // 始まる前は報告そのものができないので、報告ゲートは両方の値で通す
+        assert!(!formation_blocks_queue(&state, false));
+        assert!(!formation_blocks_queue(&state, true));
+    }
+
     // ---- 登録ゲート ----
 
     #[test]
@@ -302,32 +443,35 @@ mod tests {
         );
     }
 
-    // ---- 2つを畳まないこと ----
+    // ---- 3つを畳まないこと ----
 
     #[test]
-    fn the_two_gates_stay_separate() {
+    fn the_three_gates_stay_separate() {
         let profile = registered(Some(Rank::Master));
-        let eligibility = evaluate(Some(&profile), vec![fid(1), fid(2)]);
+        let eligibility = evaluate(Some(&profile), Some(fid(3)), vec![fid(1), fid(2)]);
         assert!(!eligibility.is_allowed());
-        // どちらの理由も残っている
+        // 3つとも理由が残っている
         assert_eq!(
             eligibility.registration,
             Some(RegistrationBlock::RankBelowEntry {
                 declared: Some(Rank::Master)
             })
         );
+        assert_eq!(eligibility.active_formation, Some(fid(3)));
         assert_eq!(eligibility.pending_reports, vec![fid(1), fid(2)]);
+        assert!(eligibility.is_active_formation_blocked());
         assert!(eligibility.is_report_blocked());
         let messages = eligibility.messages();
-        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages.len(), 3, "{messages:?}");
         assert!(messages[0].contains("レジェンド"), "{messages:?}");
-        assert!(messages[1].contains('2'), "{messages:?}");
+        assert!(messages[1].contains("マッチが成立"), "{messages:?}");
+        assert!(messages[2].contains('2'), "{messages:?}");
     }
 
     #[test]
     fn a_registered_legend_with_no_pending_reports_may_queue() {
         let profile = registered(Some(Rank::Legend));
-        let eligibility = evaluate(Some(&profile), Vec::new());
+        let eligibility = evaluate(Some(&profile), None, Vec::new());
         assert!(eligibility.is_allowed());
         assert!(eligibility.messages().is_empty());
         assert_eq!(eligibility, QueueEligibility::default());
@@ -337,23 +481,33 @@ mod tests {
     fn each_gate_can_block_on_its_own() {
         // 報告ゲートだけ
         let profile = registered(Some(Rank::Legend));
-        let report_only = evaluate(Some(&profile), vec![fid(1)]);
+        let report_only = evaluate(Some(&profile), None, vec![fid(1)]);
         assert!(!report_only.is_allowed());
         assert_eq!(report_only.registration, None);
+        assert!(!report_only.is_active_formation_blocked());
         assert_eq!(report_only.messages().len(), 1);
+
+        // 進行中ゲートだけ
+        let active_only = evaluate(Some(&profile), Some(fid(5)), Vec::new());
+        assert!(!active_only.is_allowed());
+        assert_eq!(active_only.registration, None);
+        assert!(!active_only.is_report_blocked());
+        assert_eq!(active_only.messages().len(), 1);
+        assert!(active_only.messages()[0].contains("マッチが成立"));
 
         // 登録ゲートだけ
         let mut profile = registered(Some(Rank::Legend));
         profile.registered_at = None;
-        let registration_only = evaluate(Some(&profile), Vec::new());
+        let registration_only = evaluate(Some(&profile), None, Vec::new());
         assert!(!registration_only.is_allowed());
+        assert!(!registration_only.is_active_formation_blocked());
         assert!(!registration_only.is_report_blocked());
         assert_eq!(registration_only.messages().len(), 1);
     }
 
     #[test]
     fn a_player_who_never_logged_in_is_not_registered() {
-        let eligibility = evaluate(None, Vec::new());
+        let eligibility = evaluate(None, None, Vec::new());
         assert!(!eligibility.is_allowed());
         assert_eq!(
             eligibility.registration,

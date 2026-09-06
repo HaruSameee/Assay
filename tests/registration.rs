@@ -865,6 +865,10 @@ async fn a_disputed_formation_does_not_re_block_a_player_who_reported(owner: PgP
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
+/// 解散した formation は報告義務を残さないので、どのゲートも塞がない。
+///
+/// **まだ始まっていない formation は別**で、そちらは進行中ゲートが塞ぐ（05 §4）。報告ゲートの
+/// 担当ではない——始まる前は報告する手段が無いためである。
 async fn formations_that_never_happened_do_not_block_the_queue(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let player = PlayerId(Uuid::from_u128(1));
@@ -897,7 +901,11 @@ async fn formations_that_never_happened_do_not_block_the_queue(owner: PgPool) {
         .await
         .unwrap();
 
-    // まだホストを待っている formation（コード未開示）
+    // 解散した formation だけなら、どのゲートも立たない
+    let eligibility = db.repo.queue_eligibility(player).await.unwrap();
+    assert!(eligibility.is_allowed(), "{eligibility:?}");
+
+    // まだホストを待っている formation（コード未開示）は**進行中ゲート**が塞ぐ
     db.formations
         .create_formation(&formation(2, player))
         .await
@@ -908,7 +916,17 @@ async fn formations_that_never_happened_do_not_block_the_queue(owner: PgPool) {
         .unwrap();
 
     let eligibility = db.repo.queue_eligibility(player).await.unwrap();
-    assert!(eligibility.is_allowed(), "{eligibility:?}");
+    assert!(!eligibility.is_allowed(), "{eligibility:?}");
+    assert_eq!(
+        eligibility.active_formation,
+        Some(fid(2)),
+        "a match that has not started yet blocks the queue"
+    );
+    assert_eq!(
+        eligibility.pending_reports,
+        Vec::new(),
+        "nothing to report yet: the report gate must stay clear"
+    );
     db.done().await;
 }
 

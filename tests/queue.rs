@@ -8,7 +8,8 @@
 //! 検証すること:
 //! - 二重キューを `queue_entries.player_id` の unique が拒否する
 //! - 下方向のマッチング範囲が 95〜200 の外なら CHECK が拒否する
-//! - 登録ゲートと報告ゲートの拒否が**畳まれず別々に**返る
+//! - 登録ゲート・進行中ゲート・報告ゲートの拒否が**畳まれず別々に**返る
+//! - 成立済みでまだ始まっていない formation を持つ人はキューに入れない（二重割当を防ぐ）
 //! - 「範囲内で N 人」が**相互条件**で数えられる（片方向なら通ってしまうケースを含む）
 //! - 既にキュー中なら新規作成ではなく設定の更新。`enqueued_at` は動かない
 //! - 他人のエントリを操作できない
@@ -30,7 +31,8 @@ use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerI
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
 };
-use unite_matchsystem::queue::{QueueRepository, QueueState, router};
+use unite_matchsystem::queue::model::{QueueRequest, RolePreference};
+use unite_matchsystem::queue::{QueueError, QueueRepository, QueueState, router};
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
 use unite_matchsystem::registration::{AuthConfig, NewDeclaration, Rank, RegistrationRepository};
 use uuid::Uuid;
@@ -246,21 +248,72 @@ fn formation(n: u128, subject: PlayerId) -> NewFormation {
     }
 }
 
-/// 報告義務のある状態（`in_progress`）まで進めて、報告ゲートを立てる。
-async fn unreported_formation(db: &AppDb, n: u128, subject: PlayerId) {
+/// formation をどこまで進めるか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// 成立した直後。VC 割当待ち。
+    Matched,
+    /// VC 割当済み。ホストの承諾待ち。
+    AwaitingHost,
+    /// ホストが承諾。部屋コード待ち。
+    AwaitingCode,
+    /// コード開示済み。ここから報告できる。
+    InProgress,
+}
+
+/// formation を作って `stage` まで進める。
+async fn formation_at(db: &AppDb, n: u128, subject: PlayerId, stage: Stage) {
     db.formations
         .create_formation(&formation(n, subject))
         .await
         .unwrap();
     let host = player(2);
-    for event in [
-        NewEvent::vc_assigned("1", 101, 102, at(0), format!("vc-{n}")),
-        NewEvent::new(K::HostAssigned, Some(host), at(1), format!("assign-{n}")),
-        NewEvent::new(K::HostAccepted, Some(host), at(2), format!("accept-{n}")),
-        NewEvent::code_posted(host, "1234", at(3), format!("code-{n}")),
-    ] {
+    let events = [
+        (
+            Stage::AwaitingHost,
+            NewEvent::vc_assigned("1", 101, 102, at(0), format!("vc-{n}")),
+        ),
+        (
+            Stage::AwaitingCode,
+            NewEvent::new(K::HostAssigned, Some(host), at(1), format!("assign-{n}")),
+        ),
+        (
+            Stage::AwaitingCode,
+            NewEvent::new(K::HostAccepted, Some(host), at(2), format!("accept-{n}")),
+        ),
+        (
+            Stage::InProgress,
+            NewEvent::code_posted(host, "1234", at(3), format!("code-{n}")),
+        ),
+    ];
+    for (needed, event) in events {
+        if stage < needed {
+            break;
+        }
         db.formations.append_event(fid(n), &event).await.unwrap();
     }
+}
+
+impl PartialOrd for Stage {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.rank().cmp(&other.rank()))
+    }
+}
+
+impl Stage {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Matched => 0,
+            Self::AwaitingHost => 1,
+            Self::AwaitingCode => 2,
+            Self::InProgress => 3,
+        }
+    }
+}
+
+/// 報告義務のある状態（`in_progress`）まで進めて、報告ゲートを立てる。
+async fn unreported_formation(db: &AppDb, n: u128, subject: PlayerId) {
+    formation_at(db, n, subject, Stage::InProgress).await;
 }
 
 // ----------------------------------------------------------------------
@@ -480,6 +533,128 @@ async fn the_registration_and_report_gates_are_reported_separately(owner: PgPool
     db.done().await;
 }
 
+/// **マッチが成立していて、まだ始まっていない人はキューに入れない。**
+///
+/// マッチメイカは成立時に 10 人をキューから外すが、`awaiting_host`（候補 1 人あたり 90 秒 ×
+/// 最大 3 人）と `awaiting_code`（180 秒）の間は本人が再投入できてしまう。マッチメイカは
+/// 3 分ごとに走るので、この窓は複数回のティックをまたぐ。塞がないと同じ人が 2 つの formation に
+/// 割り当てられ、VC の組も 2 つ占有する。
+///
+/// 報告ゲートではこれを塞げない。始まる前は報告する手段が無いためである。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_formation_that_has_not_started_blocks_the_queue(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+
+    // fixture の players は 1〜12。formation の頭数（2〜10）と重ならない 3 人を用意する
+    sqlx::query("insert into players (id, discord_user_id, created_at) values ($1, 1013, now())")
+        .bind(player(13).0)
+        .execute(&db.pool)
+        .await
+        .expect("seed a third bystander");
+
+    // 3 状態それぞれで塞がること。プレイヤーごとに formation を 1 つ持たせる
+    for (index, stage) in [Stage::Matched, Stage::AwaitingHost, Stage::AwaitingCode]
+        .into_iter()
+        .enumerate()
+    {
+        let me = player(index as u128 + 11);
+        register(&db, me, Rank::Legend).await;
+        formation_at(&db, 0xa0 + index as u128, me, stage).await;
+
+        let (status, denied) = post_queue(&app, me, body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{stage:?}: {denied}");
+        assert_eq!(denied["error"], "queue_blocked");
+        assert!(
+            denied["active_formation"].is_string(),
+            "{stage:?}: the active-formation gate must name the formation: {denied}"
+        );
+        // **報告ゲートとは別のフィールド。**畳まれていないこと
+        assert_eq!(
+            denied["pending_reports"],
+            json!([]),
+            "{stage:?}: nothing to report yet: {denied}"
+        );
+        assert_eq!(denied["registration"], Value::Null, "{stage:?}");
+        let messages = denied["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "{stage:?}: {denied}");
+        assert!(
+            messages[0].as_str().unwrap().contains("マッチが成立"),
+            "{stage:?}: {denied}"
+        );
+        assert!(
+            db.queue.find(me).await.unwrap().is_none(),
+            "{stage:?}: nothing was written"
+        );
+    }
+
+    db.done().await;
+}
+
+/// 試合が始まったら、担当は進行中ゲートから報告ゲートへ移る。**両方が同時に塞がない。**
+///
+/// ここを重ねると、報告を済ませた人が formation の確定を待たされる（00 §5 の
+/// 「報告ゲートの解除条件を『確定』にしない —— 他 9 人に人質を取られる」が壊れる）。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_report_gate_takes_over_once_the_match_starts(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+
+    // 始まる前は進行中ゲート
+    formation_at(&db, 0xb1, me, Stage::AwaitingCode).await;
+    let (status, denied) = post_queue(&app, me, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(denied["active_formation"].is_string(), "{denied}");
+    assert_eq!(denied["pending_reports"], json!([]));
+
+    // コードが出て試合が始まると、進行中ゲートは降りて報告ゲートが立つ
+    db.formations
+        .append_event(
+            fid(0xb1),
+            &NewEvent::code_posted(player(2), "1234", at(3), "code-b1"),
+        )
+        .await
+        .unwrap();
+    let (status, denied) = post_queue(&app, me, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied["active_formation"],
+        Value::Null,
+        "the active gate must let go once reporting is possible: {denied}"
+    );
+    assert_eq!(denied["pending_reports"].as_array().unwrap().len(), 1);
+    assert_eq!(denied["messages"].as_array().unwrap().len(), 1, "{denied}");
+
+    // 本人が報告すれば、確定を待たずにキューへ戻れる
+    db.formations
+        .append_report(&NewReport {
+            formation_id: fid(0xb1),
+            player_id: me,
+            reported_at: at(10),
+            outcome: Outcome::Win(Team::Red),
+            raw_result: json!({ "outcome": "red" }),
+            idempotency_key: "report-b1".into(),
+            supersedes_id: None,
+        })
+        .await
+        .unwrap();
+    let (status, allowed) = post_queue(&app, me, body).await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["queued"], true);
+
+    db.done().await;
+}
+
 /// 投入・状態取得・離脱の一周。
 #[sqlx::test(
     fixtures("reference", "app_role"),
@@ -590,6 +765,86 @@ async fn queueing_again_updates_the_settings_without_resetting_the_wait(owner: P
         .await
         .unwrap();
     assert_eq!(entries, 1, "an update, not a second entry");
+
+    db.done().await;
+}
+
+/// **設定の更新が途中で落ちても、エントリは元のまま残る。**
+///
+/// `queue_entries` の upsert と `queue_entry_roles` の入れ替え（DELETE + INSERT）が同じ
+/// トランザクションに入っていないと、失敗した瞬間に「エントリはあるが希望ロールが 0 件」の
+/// 行が残る。マッチメイカから見ると辺が張れないので黙って除外され、本人はキューにいるつもりで
+/// 永久に待つことになる。当日いちばん原因が分かりにくい形なので、ここで固定しておく。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_failed_update_leaves_the_entry_and_its_roles_untouched(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let me = player(1);
+    let request = |down_range: i32, roles: Vec<RolePreference>| QueueRequest { down_range, roles };
+
+    db.queue
+        .enqueue(
+            me,
+            &request(
+                95,
+                vec![
+                    RolePreference {
+                        role: "jungle".into(),
+                        priority: 1,
+                    },
+                    RolePreference {
+                        role: "bot_tank".into(),
+                        priority: 2,
+                    },
+                ],
+            ),
+            at(0),
+        )
+        .await
+        .expect("the first enqueue succeeds");
+
+    // 入れ替えの INSERT が FK で落ちる（roles に無いロール）
+    let failed = db
+        .queue
+        .enqueue(
+            me,
+            &request(
+                200,
+                vec![RolePreference {
+                    role: "midlane".into(),
+                    priority: 1,
+                }],
+            ),
+            at(60),
+        )
+        .await;
+    assert!(
+        matches!(failed, Err(QueueError::UnknownRole)),
+        "{:?}",
+        failed.err()
+    );
+
+    let entry = db
+        .queue
+        .find(me)
+        .await
+        .unwrap()
+        .expect("the entry survives");
+    assert_eq!(entry.down_range, 95, "the upsert rolled back too");
+    let roles: Vec<&str> = entry.roles.iter().map(|role| role.role.as_str()).collect();
+    assert_eq!(roles, ["jungle", "bot_tank"], "the old wishes are intact");
+
+    // 希望ロールが 0 件のエントリは存在しない
+    let orphans: i64 = sqlx::query_scalar(
+        "select count(*) from queue_entries q \
+         where not exists (select 1 from queue_entry_roles r where r.entry_id = q.id)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orphans, 0, "no entry may exist without a role preference");
 
     db.done().await;
 }

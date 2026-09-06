@@ -7,8 +7,8 @@
 //! **他人のエントリは触れない。**対象の `player_id` はすべてセッション
 //! （[`CurrentSession`]）から取り、リクエストボディからは読まない。
 //!
-//! **2つのゲートは畳まない。**拒否のレスポンスは `registration` と `pending_reports` を
-//! 別々のフィールドで返す（05 §4 / 07 §4-5）。1つの真偽値にすると、キュー画面で
+//! **3つのゲートは畳まない。**拒否のレスポンスは `registration` / `active_formation` /
+//! `pending_reports` を別々のフィールドで返す（05 §4 / 07 §4-5）。1つの真偽値にすると、キュー画面で
 //! 「なぜ入れないのか」を説明できなくなる。
 //!
 //! CSRF: セッション Cookie は `SameSite=Lax` なので、他サイトからの POST / DELETE には
@@ -45,7 +45,7 @@ const QUEUE_PATH: &str = "/queue";
 pub struct QueueState {
     /// セッション Cookie を読むための設定。
     pub config: AuthConfig,
-    /// 2つのゲートの評価に使う。
+    /// 3つのゲートの評価に使う。
     pub registration: RegistrationRepository,
     /// キューの永続化。
     pub queue: QueueRepository,
@@ -141,11 +141,13 @@ impl From<&RegistrationBlock> for RegistrationBlockView {
     }
 }
 
-/// 2つのゲートの状態。畳まない。
+/// 3つのゲートの状態。畳まない。
 #[derive(Debug, Serialize)]
 struct EligibilityView {
     /// 登録ゲート。通っていれば `null`。
     registration: Option<RegistrationBlockView>,
+    /// 進行中ゲート。成立済みでまだ始まっていない formation。無ければ `null`。
+    active_formation: Option<Uuid>,
     /// 報告ゲート。未報告の formation。空なら通過。
     pending_reports: Vec<Uuid>,
 }
@@ -154,6 +156,7 @@ impl From<&QueueEligibility> for EligibilityView {
     fn from(eligibility: &QueueEligibility) -> Self {
         Self {
             registration: eligibility.registration.as_ref().map(Into::into),
+            active_formation: eligibility.active_formation.map(|FormationId(id)| id),
             pending_reports: eligibility
                 .pending_reports
                 .iter()
@@ -207,7 +210,7 @@ struct StatusView {
     ///
     /// 範囲は本人の設定なので、キューに入る前は決まらない。そのときは `null`。
     in_range: Option<usize>,
-    /// 2つのゲートの現在の状態。キュー中でも報告ゲートは後から立ちうる。
+    /// 3つのゲートの現在の状態。キュー中でも進行中・報告ゲートは後から立ちうる。
     eligibility: EligibilityView,
 }
 
@@ -245,7 +248,7 @@ async fn join_queue(
         Err(error) => return invalid_request(&error),
     };
 
-    // 2つのゲート。どちらかに引っかかっていれば投入しない
+    // 3つのゲート。どれかに引っかかっていれば投入しない
     let eligibility = match app.registration.queue_eligibility(player_id).await {
         Ok(eligibility) => eligibility,
         Err(error) => {
@@ -259,8 +262,9 @@ async fn join_queue(
             StatusCode::FORBIDDEN,
             Json(json!({
                 "error": "queue_blocked",
-                // 2つのゲートは別々のフィールド。畳んで1つの理由にしない
+                // 3つのゲートは別々のフィールド。畳んで1つの理由にしない
                 "registration": view.registration,
+                "active_formation": view.active_formation,
                 "pending_reports": view.pending_reports,
                 "messages": eligibility.messages(),
             })),

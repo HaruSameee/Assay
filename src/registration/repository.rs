@@ -12,10 +12,10 @@
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::lifecycle::{FormationId, PlayerId, Timestamp};
+use crate::lifecycle::{FormationId, FormationState, PlayerId, Timestamp};
 use crate::persistence::{FormationRepository, RepositoryError};
 
-use super::gate::{QueueEligibility, formation_blocks_queue};
+use super::gate::{QueueEligibility, formation_blocks_queue, formation_blocks_queue_before_start};
 use super::model::{Declaration, NewDeclaration, PlayerProfile, PlayerStatus};
 
 /// 登録トラックのエラー。
@@ -46,6 +46,18 @@ fn snowflake_to_i64(discord_user_id: &str) -> Result<i64, RegistrationError> {
         .filter(|id| *id != 0)
         .and_then(|id| i64::try_from(id).ok())
         .ok_or(RegistrationError::InvalidDiscordUserId)
+}
+
+/// 候補一覧から、進行中ゲートを立てる formation を選ぶ。
+///
+/// `formations_without_report_from` は `created_at` 昇順で返るので、最も古いものが選ばれる。
+/// 同時に 2 つ持てる状態は作らない設計だが、万一あっても 1 つを理由として返せばよい
+/// （どれか 1 つでも進行中なら塞ぐ、という判定は同じ）。
+fn active_formation_of(candidates: &[(FormationId, FormationState)]) -> Option<FormationId> {
+    candidates
+        .iter()
+        .find(|(_, state)| formation_blocks_queue_before_start(state))
+        .map(|(id, _)| *id)
 }
 
 /// 登録・認証の永続化。
@@ -237,18 +249,49 @@ impl RegistrationRepository {
             .collect())
     }
 
-    /// キューの 2 つのゲートをまとめて評価する（畳まずに両方の理由を返す）。
+    /// 進行中ゲートを塞いでいる formation（成立済みで、まだ試合が始まっていないもの）。
+    ///
+    /// 1 プレイヤーが同時に持てるのは 1 つだけなので、最初に見つかったものを返す。
+    pub async fn active_formation(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Option<FormationId>, RegistrationError> {
+        let candidates = self
+            .formations
+            .formations_without_report_from(player_id)
+            .await?;
+        Ok(active_formation_of(&candidates))
+    }
+
+    /// キューの 3 つのゲートをまとめて評価する（畳まずに理由を保ったまま返す）。
+    ///
+    /// 進行中ゲートと報告ゲートは同じ一覧から導出する（往復を 1 回で済ませる）。
+    /// **`REPORT_GATE_DISABLED` は報告ゲートだけを無効化する。**進行中ゲートは縮退させない
+    /// ——無効にすると、同じ人が 2 つの formation に割り当てられる状態がそのまま戻る。
     pub async fn queue_eligibility(
         &self,
         player_id: PlayerId,
     ) -> Result<QueueEligibility, RegistrationError> {
         let profile = self.find_by_player_id(player_id).await?;
-        let pending = match &profile {
-            Some(_) if !self.report_gate_disabled => self.pending_reports(player_id).await?,
-            None => Vec::new(),
-            Some(_) => Vec::new(),
+        if profile.is_none() {
+            return Ok(super::gate::evaluate(None, None, Vec::new()));
+        }
+        let candidates = self
+            .formations
+            .formations_without_report_from(player_id)
+            .await?;
+        let active = active_formation_of(&candidates);
+        let pending = if self.report_gate_disabled {
+            Vec::new()
+        } else {
+            candidates
+                .iter()
+                // 本人が報告していない候補だけが返るので、reported = false で判定する
+                .filter(|(_, state)| formation_blocks_queue(state, false))
+                .map(|(id, _)| *id)
+                .collect()
         };
-        Ok(super::gate::evaluate(profile.as_ref(), pending))
+        Ok(super::gate::evaluate(profile.as_ref(), active, pending))
     }
 
     /// 生の申告 JSON を作る補助（フォームの値をそのまま入れる）。

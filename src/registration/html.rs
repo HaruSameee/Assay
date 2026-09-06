@@ -125,7 +125,7 @@ pub fn registration_form(
     )
 }
 
-/// 登録後の確認ページ。キューに入れるかどうかを、2つのゲートごとに説明する。
+/// 登録後の確認ページ。キューに入れるかどうかを、3つのゲートごとに説明する。
 pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibility) -> String {
     let trainer = profile.trainer_name.as_deref().unwrap_or("(未設定)");
     let declared = profile
@@ -271,12 +271,28 @@ mod tests {
             registration: Some(RegistrationBlock::RankBelowEntry {
                 declared: Some(Rank::Master),
             }),
+            active_formation: Some(crate::lifecycle::FormationId(Uuid::from_u128(8))),
             pending_reports: vec![crate::lifecycle::FormationId(Uuid::from_u128(9))],
         };
         let rendered = registration_result(&profile("トレーナー"), &eligibility);
         assert!(rendered.contains("いまはキューに入れません"));
         assert!(rendered.contains("参加資格は"), "{rendered}");
+        assert!(rendered.contains("マッチが成立しています"), "{rendered}");
         assert!(rendered.contains("未報告の試合が1件"), "{rendered}");
+
+        // 進行中ゲートだけでも、その理由だけが出る
+        let active_only = registration_result(
+            &profile("トレーナー"),
+            &QueueEligibility {
+                active_formation: Some(crate::lifecycle::FormationId(Uuid::from_u128(8))),
+                ..QueueEligibility::default()
+            },
+        );
+        assert!(
+            active_only.contains("マッチが成立しています"),
+            "{active_only}"
+        );
+        assert!(!active_only.contains("未報告の試合"), "{active_only}");
 
         let allowed = registration_result(&profile("トレーナー"), &QueueEligibility::default());
         assert!(allowed.contains("キューに参加できます"));
