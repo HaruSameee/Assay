@@ -50,7 +50,10 @@ const ADMIN_ID: i64 = 900000000000000001;
 /// 通したもの。未設定・空は `None` = マウントしない）
 /// 土台の登録ルートはログイン（セッション確立）に必要なだけ。
 fn app_with_admin(db: &AppDb, oauth: Arc<FakeOAuth>, ids: Option<AdminIds>) -> Router {
-    let base = registration_router(AuthState::new(config(), oauth, db.registration.clone()));
+    // `main.rs` と同じく、リストは登録トラックにも配る（共通ヘッダーの導線の判定に使う）
+    let base = registration_router(
+        AuthState::new(config(), oauth, db.registration.clone()).with_admins(ids.clone()),
+    );
     match ids {
         Some(ids) => base.merge(admin_router(AdminState::new(
             config(),
@@ -576,6 +579,53 @@ async fn players_are_found_by_trainer_name_or_discord_id(owner: PgPool) {
     assert_eq!(by_id[0].player_id, player(3).0);
 
     assert!(db.store.search_players("zzz", 10).await.unwrap().is_empty());
+
+    db.done().await;
+}
+
+/// 管理パネルの導線は**リストに載っている人にだけ**出す。
+///
+/// リンクを消すことはアクセス制御ではない（`/admin` は非管理者に 404 を返し続ける）。
+/// 出さない理由は、パネルの存在自体を知らせないという 404 の方針に揃えるため。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_header_offers_the_admin_panel_only_to_a_listed_admin(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 3).await;
+    let ids = || parse_admin_ids(Some(&ADMIN_ID.to_string())).unwrap();
+    let oauth = Arc::new(FakeOAuth::new("1002"));
+
+    // 管理者: パネル本体にも、登録画面にも導線が出る
+    let mut admin = admin_browser(&db, &oauth, ids()).await;
+    let panel = body_text(admin.get("/admin").await).await;
+    assert!(panel.contains("レート調整パネル"), "{panel}");
+    assert!(panel.contains("<a href=\"/admin\">管理</a>"), "{panel}");
+    assert!(panel.contains("<a href=\"/status\">戦績</a>"), "{panel}");
+    let elsewhere = body_text(admin.get("/register").await).await;
+    assert!(
+        elsewhere.contains("<a href=\"/admin\">管理</a>"),
+        "{elsewhere}"
+    );
+
+    // 一般プレイヤー: 同じ構成でも導線は出ない。/admin は 404 のまま
+    let mut nope = player_browser(&db, &oauth, ids(), 2).await;
+    let page = body_text(nope.get("/register").await).await;
+    assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
+    assert!(page.contains("action=\"/auth/logout\""), "{page}");
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!page.contains("管理"), "{page}");
+
+    let denied = nope.get("/admin").await;
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    // 404 の画面はログイン前と同じ見た目。ここからもパネルの存在は読めない
+    let denied = body_text(denied).await;
+    assert!(!denied.contains("href=\"/admin\""), "{denied}");
+    assert!(!denied.contains("href=\"/status\""), "{denied}");
+
+    // リスト未設定（パネル未マウント）の構成では、管理者本人にも出さない
+    let mut unset = admin_browser(&db, &oauth, None).await;
+    let page = body_text(unset.get("/register").await).await;
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert_eq!(unset.get("/admin").await.status(), StatusCode::NOT_FOUND);
 
     db.done().await;
 }

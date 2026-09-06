@@ -1,11 +1,17 @@
 //! 登録・認証画面の HTML。テンプレートエンジンや外部 CSS は使わない。
 //!
 //! ユーザー由来の値（トレーナー名、Discord の表示名）は必ず [`escape`] を通す。
+//!
+//! **共通ヘッダーはここ 1 か所にしかない**（[`site_header`]）。キュー・戦績・管理の
+//! 各画面も [`page`] / [`page_with_styles`] を通るので、ヘッダーを直すと全画面が直る。
+//! 画面ごとに `<header>` を書かないこと（片方だけ直る事故を防ぐ）。
+//! 出す導線は [`Viewer`] だけで決まり、未ログインには何も出さない。
 
 use crate::lifecycle::FormationId;
 
 use super::gate::QueueEligibility;
 use super::model::{PlayerProfile, Rank};
+use super::viewer::Viewer;
 
 const STYLES: &str = r#"
 :root {
@@ -48,6 +54,25 @@ a:hover { color: #8ce8c2; }
 .brand { color: var(--text); font-size: 1.2rem; font-weight: 750; text-decoration: none; }
 .brand:hover { color: var(--text); }
 .context { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; }
+/* ヘッダーの導線。375px でも 1 行に収める。JS のメニューは作らない */
+.site-nav { display: flex; min-width: 0; align-items: center; gap: 18px; }
+.site-nav form { margin: 0; }
+.site-nav a,
+.site-nav button {
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.92rem;
+  font-weight: 650;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+}
+.site-nav a:hover, .site-nav button:hover { background: none; color: var(--text); }
 main { padding: 48px 0 64px; }
 .eyebrow { margin: 0 0 8px; color: var(--accent); font-size: 0.78rem; font-weight: 700; text-transform: uppercase; }
 h1 { margin: 0 0 16px; font-size: 2rem; line-height: 1.25; }
@@ -130,6 +155,8 @@ input[aria-invalid="true"], select[aria-invalid="true"] { border-color: var(--da
   .shell { width: min(100% - 24px, 680px); }
   .site-header { min-height: 60px; }
   .context { display: none; }
+  .site-nav { gap: 14px; }
+  .site-nav a, .site-nav button { font-size: 0.85rem; }
   main { padding: 34px 0 48px; }
   h1 { font-size: 1.7rem; }
   .actions { display: grid; grid-template-columns: 1fr; }
@@ -193,32 +220,65 @@ pub fn escape(value: &str) -> String {
     escaped
 }
 
+/// 全画面共通のヘッダー。**定義はここだけ。**画面ごとに複製しないこと。
+///
+/// - 左: サービス名。ログイン済みならキュー画面へ、未ログインなら入口へ。
+/// - 右: 戦績とログアウト。**管理者にだけ**管理パネルを足す。
+///
+/// 未ログインには導線をひとつも出さない（行き先がどれもログインを要求するため）。
+/// 代わりに、これまでどおりサービスの説明だけを添える。
+fn site_header(viewer: Viewer) -> String {
+    if !viewer.signed_in() {
+        return String::from(
+            "<header class=\"site-header\">\n\
+             <a class=\"brand\" href=\"/\">Assay</a>\n\
+             <span class=\"context\">Pokemon UNITE community match</span>\n</header>\n",
+        );
+    }
+    // 管理パネルはリンクを消すだけ。アクセス制御は /admin 側の照合が正（非管理者には 404）
+    let admin = if viewer.is_admin() {
+        "<a href=\"/admin\">管理</a>\n"
+    } else {
+        ""
+    };
+    format!(
+        "<header class=\"site-header\">\n\
+         <a class=\"brand\" href=\"/queue\">Assay</a>\n\
+         <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
+         <a href=\"/status\">戦績</a>\n{admin}\
+         <form method=\"post\" action=\"/auth/logout\">\
+         <button type=\"submit\">ログアウト</button></form>\n\
+         </nav>\n</header>\n"
+    )
+}
+
 /// ページの外枠。
-pub fn page(title: &str, body: &str) -> String {
-    page_with_styles(title, body, "")
+pub fn page(viewer: Viewer, title: &str, body: &str) -> String {
+    page_with_styles(viewer, title, body, "")
 }
 
 /// 登録画面と同じシェルに、画面固有の CSS を追加する。
-pub fn page_with_styles(title: &str, body: &str, extra_styles: &str) -> String {
+pub fn page_with_styles(viewer: Viewer, title: &str, body: &str, extra_styles: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"theme-color\" content=\"#101114\">\n\
          <title>{title} | Assay</title>\n<style>{STYLES}{extra_styles}</style>\n</head>\n<body>\n\
-         <div class=\"shell\">\n<header class=\"site-header\">\n\
-         <a class=\"brand\" href=\"/\">Assay</a>\n\
-         <span class=\"context\">Pokemon UNITE community match</span>\n</header>\n\
+         <div class=\"shell\">\n{header}\
          <main>{body}</main>\n\
          <footer class=\"site-footer\">Assay は非公式のコミュニティ運営サービスです。</footer>\n\
          </div>\n</body>\n</html>\n",
         title = escape(title),
+        header = site_header(viewer),
         extra_styles = extra_styles,
     )
 }
 
 /// 未ログインのときの入口。
 pub fn login_page(login_path: &str) -> String {
+    // ここは定義上いつも未ログイン
     page(
+        Viewer::ANONYMOUS,
         "ログイン",
         &format!(
             "<section aria-labelledby=\"login-title\">\n\
@@ -257,6 +317,7 @@ fn field_attributes(id: &str, message: Option<&str>, help_id: &str) -> String {
 
 /// 登録フォーム。既存値を初期表示し、エラー時には送信値を保持する。
 pub fn registration_form(
+    viewer: Viewer,
     action: &str,
     profile: &PlayerProfile,
     values: &RegistrationFormValues,
@@ -311,6 +372,7 @@ pub fn registration_form(
     let rating_attributes = field_attributes("rating", errors.rating, "rating-help");
 
     page(
+        viewer,
         heading,
         &format!(
             "<section aria-labelledby=\"registration-title\">\n\
@@ -341,8 +403,6 @@ pub fn registration_form(
              {rating_error}</div>\n\
              <div class=\"actions\"><button type=\"submit\">{submit_label}</button></div>\n\
              </form>\n\
-             <form class=\"section\" method=\"post\" action=\"/auth/logout\">\n\
-             <button class=\"button-secondary\" type=\"submit\">ログアウト</button>\n</form>\n\
              </section>\n",
             heading = heading,
             registration_note = registration_note,
@@ -363,7 +423,11 @@ pub fn registration_form(
 }
 
 /// 登録後の確認ページ。キューに入れるかどうかを、3つのゲートごとに説明する。
-pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibility) -> String {
+pub fn registration_result(
+    viewer: Viewer,
+    profile: &PlayerProfile,
+    eligibility: &QueueEligibility,
+) -> String {
     let trainer = profile.trainer_name.as_deref().unwrap_or("(未設定)");
     let declared = profile
         .latest_declaration
@@ -396,6 +460,7 @@ pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibili
     };
 
     page(
+        viewer,
         "登録内容",
         &format!(
             "<section aria-labelledby=\"result-title\">\n\
@@ -411,8 +476,6 @@ pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibili
              <a class=\"button button-primary\" href=\"/queue\">キュー画面へ</a>\n\
              <a class=\"button button-secondary\" href=\"/register\">登録内容を変更</a>\n\
              </div>\n\
-             <form class=\"section\" method=\"post\" action=\"/auth/logout\">\n\
-             <button class=\"button-secondary\" type=\"submit\">ログアウト</button>\n</form>\n\
              </section>\n",
             trainer = escape(trainer),
             declared = escape(&declared),
@@ -421,8 +484,12 @@ pub fn registration_result(profile: &PlayerProfile, eligibility: &QueueEligibili
 }
 
 /// 失敗ページ。理由は短く、内部情報は載せない。
-pub fn error_page(title: &str, message: &str) -> String {
+///
+/// ヘッダーはわかっている範囲で出す。セッションを確認できなかった経路（ログイン失敗、
+/// 期限切れ）は [`Viewer::ANONYMOUS`] で呼ぶこと。
+pub fn error_page(viewer: Viewer, title: &str, message: &str) -> String {
     page(
+        viewer,
         title,
         &format!(
             "<section aria-labelledby=\"error-title\">\n\
@@ -501,6 +568,7 @@ mod tests {
         let hostile = r#"" onfocus="alert(1)"#;
         let profile = profile(hostile);
         let rendered = registration_form(
+            Viewer::MEMBER,
             "/register",
             &profile,
             &values(&profile),
@@ -517,6 +585,7 @@ mod tests {
     fn the_form_lists_every_rank_and_preselects_the_latest_declaration() {
         let profile = profile("トレーナー");
         let rendered = registration_form(
+            Viewer::MEMBER,
             "/register",
             &profile,
             &values(&profile),
@@ -547,7 +616,8 @@ mod tests {
             rating: Some("本家レートを数字で入力してください。"),
             ..RegistrationFormErrors::default()
         };
-        let rendered = registration_form("/register", &profile, &submitted, &errors);
+        let rendered =
+            registration_form(Viewer::MEMBER, "/register", &profile, &submitted, &errors);
         assert!(rendered.contains("本家レートを数字で入力してください。"));
         assert!(rendered.contains("value=\"入力中\""));
         assert!(rendered.contains("value=\"not-a-number\""));
@@ -560,6 +630,7 @@ mod tests {
     fn the_form_discloses_trainer_name_visibility() {
         let profile = profile("トレーナー");
         let rendered = registration_form(
+            Viewer::MEMBER,
             "/register",
             &profile,
             &values(&profile),
@@ -579,7 +650,7 @@ mod tests {
             active_formation: Some(crate::lifecycle::FormationId(Uuid::from_u128(8))),
             pending_reports: vec![crate::lifecycle::FormationId(Uuid::from_u128(9))],
         };
-        let rendered = registration_result(&profile("トレーナー"), &eligibility);
+        let rendered = registration_result(Viewer::MEMBER, &profile("トレーナー"), &eligibility);
         assert!(rendered.contains("いまはキューに入れません"));
         assert!(rendered.contains("参加資格は"), "{rendered}");
         assert!(rendered.contains("マッチが成立しています"), "{rendered}");
@@ -588,6 +659,7 @@ mod tests {
 
         // 進行中ゲートだけでも、その理由だけが出る
         let active_only = registration_result(
+            Viewer::MEMBER,
             &profile("トレーナー"),
             &QueueEligibility {
                 active_formation: Some(crate::lifecycle::FormationId(Uuid::from_u128(8))),
@@ -600,7 +672,11 @@ mod tests {
         );
         assert!(!active_only.contains("未報告の試合"), "{active_only}");
 
-        let allowed = registration_result(&profile("トレーナー"), &QueueEligibility::default());
+        let allowed = registration_result(
+            Viewer::MEMBER,
+            &profile("トレーナー"),
+            &QueueEligibility::default(),
+        );
         assert!(allowed.contains("キューに参加できます"));
         assert!(!allowed.contains("入れません"));
         assert!(allowed.contains("Assay のレートには自動反映されず"));
@@ -621,13 +697,14 @@ mod tests {
         for rendered in [
             login_page("/auth/login"),
             registration_form(
+                Viewer::MEMBER,
                 "/register",
                 &profile,
                 &values(&profile),
                 &RegistrationFormErrors::default(),
             ),
-            registration_result(&profile, &QueueEligibility::default()),
-            error_page("エラー", "やり直してください"),
+            registration_result(Viewer::MEMBER, &profile, &QueueEligibility::default()),
+            error_page(Viewer::MEMBER, "エラー", "やり直してください"),
         ] {
             assert!(rendered.starts_with("<!doctype html>"), "{rendered}");
             assert!(rendered.contains("<meta charset=\"utf-8\">"));
@@ -640,5 +717,196 @@ mod tests {
     fn the_pending_list_escapes_its_entries() {
         let rendered = pending_reports_list(&[crate::lifecycle::FormationId(Uuid::from_u128(1))]);
         assert!(rendered.contains("00000000-0000-0000-0000-000000000001"));
+    }
+
+    // ------------------------------------------------------------------
+    // 共通ヘッダー
+    // ------------------------------------------------------------------
+
+    /// 描画済みのページからヘッダーだけを切り出す。
+    fn header_of(rendered: &str) -> &str {
+        let start = rendered
+            .find("<header class=\"site-header\">")
+            .unwrap_or_else(|| panic!("no header in {rendered}"));
+        let end = rendered[start..]
+            .find("</header>")
+            .expect("the header is closed")
+            + start
+            + "</header>".len();
+        assert!(
+            !rendered[end..].contains("<header"),
+            "ヘッダーは 1 ページに 1 つ: {rendered}"
+        );
+        &rendered[start..end]
+    }
+
+    #[test]
+    fn a_signed_out_visitor_gets_no_links_in_the_header() {
+        for rendered in [
+            login_page("/auth/login"),
+            error_page(Viewer::ANONYMOUS, "エラー", "やり直してください"),
+        ] {
+            let header = header_of(&rendered);
+            assert!(!header.contains("href=\"/status\""), "{header}");
+            assert!(!header.contains("href=\"/admin\""), "{header}");
+            assert!(!header.contains("/auth/logout"), "{header}");
+            assert!(!header.contains("href=\"/queue\""), "{header}");
+            // 入口へのリンクだけは残す（ログインの導線であって、画面間の移動ではない）
+            assert!(
+                header.contains("<a class=\"brand\" href=\"/\">Assay</a>"),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_signed_in_member_gets_status_and_logout_but_not_the_admin_panel() {
+        let page = error_page(Viewer::MEMBER, "エラー", "やり直してください");
+        let header = header_of(&page);
+        assert!(
+            header.contains("<a class=\"brand\" href=\"/queue\">Assay</a>"),
+            "{header}"
+        );
+        assert!(header.contains("href=\"/status\""), "{header}");
+        assert!(header.contains("action=\"/auth/logout\""), "{header}");
+        // 非管理者にはパネルの存在を知らせない（/admin 自体も 404 を返す）
+        assert!(!header.contains("href=\"/admin\""), "{header}");
+        assert!(!header.contains("管理"), "{header}");
+    }
+
+    #[test]
+    fn only_an_admin_gets_the_admin_panel_link() {
+        let page = error_page(Viewer::ADMIN, "エラー", "やり直してください");
+        let header = header_of(&page);
+        assert!(header.contains("href=\"/admin\""), "{header}");
+        assert!(header.contains("href=\"/status\""), "{header}");
+        assert!(header.contains("action=\"/auth/logout\""), "{header}");
+    }
+
+    /// **ヘッダーの定義が 1 か所であることの検査。**
+    ///
+    /// 登録・戦績・管理の各画面から切り出したヘッダーが文字単位で一致すること。
+    /// どれかの画面が自前のヘッダーを持ち始めたら、ここで落ちる
+    /// （キュー画面の同じ検査は `queue::html` 側にある）。
+    #[test]
+    fn every_screen_renders_the_same_header() {
+        use crate::admin::html::{SearchView, search_page};
+        use crate::status::StatusSummary;
+        use crate::status::html::{StatusView, status_page};
+
+        let profile = profile("トレーナー");
+        let member = [
+            registration_form(
+                Viewer::MEMBER,
+                "/register",
+                &profile,
+                &values(&profile),
+                &RegistrationFormErrors::default(),
+            ),
+            registration_result(Viewer::MEMBER, &profile, &QueueEligibility::default()),
+            error_page(Viewer::MEMBER, "エラー", "やり直してください"),
+            status_page(
+                Viewer::MEMBER,
+                &StatusView {
+                    rating: 1500.0,
+                    summary: StatusSummary::default(),
+                    history: Vec::new(),
+                },
+            ),
+        ];
+        let expected = header_of(&member[0]).to_owned();
+        for rendered in &member {
+            assert_eq!(header_of(rendered), expected, "{rendered}");
+        }
+
+        // 管理パネルも同じ外枠を通る。違うのは管理者向けの 1 リンクだけ
+        let admin = search_page(&SearchView {
+            query: "",
+            players: &[],
+            recent: &[],
+            notice: None,
+        });
+        assert_eq!(
+            header_of(&admin),
+            header_of(&error_page(Viewer::ADMIN, "エラー", "やり直してください")),
+        );
+        assert_eq!(
+            header_of(&admin).replace("<a href=\"/admin\">管理</a>\n", ""),
+            expected,
+            "管理者のヘッダーは一般参加者のものに管理リンクを足しただけ",
+        );
+    }
+
+    #[test]
+    fn the_header_survives_a_narrow_screen_without_a_menu_script() {
+        let rendered = error_page(Viewer::ADMIN, "エラー", "やり直してください");
+        // 375px でも 1 行に収める前提。折りたたみの JS は持たない
+        assert!(rendered.contains(".site-nav a, .site-nav button { font-size: 0.85rem; }"));
+        assert!(rendered.contains("white-space: nowrap"));
+        assert!(!rendered.contains("<script"), "{rendered}");
+    }
+
+    /// レビュー用に各画面の HTML を丸ごと出す（`queue::html` の同名テストと対）。
+    ///
+    /// `cargo test --lib registration::html -- --ignored --nocapture` で取り出す。
+    #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
+    #[test]
+    fn dump_every_page_for_review() {
+        use crate::admin::html::{SearchView, search_page};
+        use crate::status::StatusSummary;
+        use crate::status::html::{StatusView, status_page};
+
+        let profile = profile("トレーナー");
+
+        println!("========== 1. 入口 / 未ログイン ==========");
+        println!("{}", login_page("/auth/login"));
+
+        println!("========== 2. 登録フォーム（登録済み・プリフィル） ==========");
+        println!(
+            "{}",
+            registration_form(
+                Viewer::MEMBER,
+                "/register",
+                &profile,
+                &values(&profile),
+                &RegistrationFormErrors::default(),
+            )
+        );
+
+        println!("========== 3. 登録内容（保存後） ==========");
+        println!(
+            "{}",
+            registration_result(Viewer::MEMBER, &profile, &QueueEligibility::default())
+        );
+
+        println!("========== 4. 戦績 ==========");
+        println!(
+            "{}",
+            status_page(
+                Viewer::MEMBER,
+                &StatusView {
+                    rating: 1522.0,
+                    summary: StatusSummary::default(),
+                    history: Vec::new(),
+                },
+            )
+        );
+
+        println!("========== 5. 管理パネル（管理者のみ） ==========");
+        println!(
+            "{}",
+            search_page(&SearchView {
+                query: "",
+                players: &[],
+                recent: &[],
+                notice: None,
+            })
+        );
+
+        println!("========== 6. エラー（未ログイン扱い） ==========");
+        println!(
+            "{}",
+            error_page(Viewer::ANONYMOUS, "エラー", "やり直してください")
+        );
     }
 }

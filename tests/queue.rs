@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
+use unite_matchsystem::admin::parse_admin_ids;
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
@@ -1147,5 +1148,68 @@ async fn the_in_range_count_requires_both_directions(owner: PgPool) {
         "the upward cap cannot be widened by either side: {still}"
     );
 
+    db.done().await;
+}
+
+/// キュー画面のヘッダーも共通のもの。管理者リストの有無だけで管理の導線が変わる。
+///
+/// `player(11)` は `reference` フィクスチャの discord_user_id を持つ。判定に使うのは
+/// その ID だけで、キューの状態やゲートの結果は一切見ない。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_queue_page_carries_the_shared_header(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+    let discord_user_id =
+        sqlx::query_scalar!("select discord_user_id from players where id = $1", me.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .to_string();
+
+    // 管理者リスト未設定: 戦績とログアウトだけ
+    let (status, page) = get_queue_html(&db.router(), me, "/queue").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains("<a class=\"brand\" href=\"/queue\">Assay</a>"),
+        "{page}"
+    );
+    assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
+    assert!(page.contains("action=\"/auth/logout\""), "{page}");
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+
+    // 別人だけが管理者: 出さない
+    let others = router(
+        QueueState::new(config(), db.registration.clone(), db.queue.clone())
+            .with_admins(parse_admin_ids(Some("900000000000000001")).unwrap()),
+    );
+    let (_, page) = get_queue_html(&others, me, "/queue").await;
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+
+    // 本人が管理者: ヘッダーにだけ 1 リンク増える
+    let mine = router(
+        QueueState::new(config(), db.registration.clone(), db.queue.clone())
+            .with_admins(parse_admin_ids(Some(&discord_user_id)).unwrap()),
+    );
+    let (_, page) = get_queue_html(&mine, me, "/queue").await;
+    assert!(page.contains("<a href=\"/admin\">管理</a>"), "{page}");
+
+    // 未ログインの 401 画面には導線を出さない
+    let response = send(
+        &db.router(),
+        Request::get("/queue")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let page = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!page.contains("href=\"/status\""), "{page}");
+    assert!(!page.contains("/auth/logout"), "{page}");
     db.done().await;
 }

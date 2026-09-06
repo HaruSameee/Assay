@@ -34,6 +34,15 @@ impl AdminIds {
         self.0.contains(&discord_user_id)
     }
 
+    /// snowflake（文字列）で照合する。DB から読んだ ID はこの形で来る。
+    ///
+    /// 数字として読めない値は**照合せず false**。「読めないから通す」にはしない。
+    pub fn contains_snowflake(&self, discord_user_id: &str) -> bool {
+        discord_user_id
+            .parse::<i64>()
+            .is_ok_and(|id| self.contains(id))
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }

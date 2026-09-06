@@ -46,6 +46,22 @@ impl StatusRepository {
         Self { pool }
     }
 
+    /// 共通ヘッダーの判定に使う Discord ID。**表示のためだけ**の読み取りで、
+    /// 管理者かどうかを決めるのは [`crate::registration::Audience`] の照合。
+    /// snowflake は文字列で持つ（DB は Phase 1 の bigint）。
+    pub async fn discord_user_id(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query!(
+            "select discord_user_id from players where id = $1",
+            player_id.0
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| row.discord_user_id.to_string()))
+    }
+
     /// 確定した試合を新しい順に `limit` 件。`player_id` は呼び出し側（セッション）からしか取らない。
     ///
     /// ビューは `confirmed` イベントを持つ formation しか出さない。したがって

@@ -23,6 +23,7 @@ use common::{
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use unite_matchsystem::admin::parse_admin_ids;
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId};
 use unite_matchsystem::matchmaker::ROLES;
 use unite_matchsystem::persistence::{
@@ -336,5 +337,56 @@ async fn the_status_page_requires_a_session(owner: PgPool) {
         .await;
     assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
 
+    db.done().await;
+}
+
+/// 戦績画面も共通ヘッダーを出す。管理者リストに載っていなければ管理の導線は出さない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_status_page_carries_the_shared_header(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 1).await;
+    let oauth = Arc::new(FakeOAuth::new("1001"));
+
+    let mut browser = signed_in(&db, &oauth, "1001").await;
+    let page = body_text(browser.get("/status").await).await;
+    assert!(page.contains("<header class=\"site-header\">"), "{page}");
+    assert!(
+        page.contains("<a class=\"brand\" href=\"/queue\">Assay</a>"),
+        "{page}"
+    );
+    assert!(page.contains("action=\"/auth/logout\""), "{page}");
+    // 管理者リストを渡していない構成では誰にも出さない
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+
+    // 401 の画面は未ログイン扱い。導線を出さない
+    let mut anonymous = Browser::new(app(&db, oauth));
+    let denied = anonymous.get("/status").await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let page = body_text(denied).await;
+    assert!(!page.contains("href=\"/status\""), "{page}");
+    assert!(!page.contains("/auth/logout"), "{page}");
+    db.done().await;
+}
+
+/// 管理者リストに載っているセッションには、戦績画面のヘッダーにも管理の導線が出る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn an_admin_sees_the_panel_link_on_the_status_page(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 1).await;
+    let oauth = Arc::new(FakeOAuth::new("1001"));
+    let admins = parse_admin_ids(Some("1001")).unwrap();
+    let app = registration_router(AuthState::new(
+        config(),
+        oauth.clone(),
+        db.registration.clone(),
+    ))
+    .merge(status_router(
+        StatusState::new(config(), db.ratings.clone(), db.status.clone()).with_admins(admins),
+    ));
+
+    let mut browser = Browser::new(app);
+    sign_in(&mut browser, &db.registration, "1001").await;
+    let page = body_text(browser.get("/status").await).await;
+    assert!(page.contains("<a href=\"/admin\">管理</a>"), "{page}");
     db.done().await;
 }

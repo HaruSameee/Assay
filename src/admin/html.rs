@@ -4,6 +4,7 @@
 //! 打ち消しは行ごとの POST フォーム（`/admin/revert`）で、ボタンは**未打ち消しの
 //! 通常行にだけ**出す（権威は DB の unique index とトリガー。ここは表示の面倒だけ）。
 
+use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
@@ -202,7 +203,9 @@ pub fn search_page(view: &SearchView<'_>) -> String {
         )
     };
 
+    // この画面は管理者しか到達しない（非管理者は 404）。ヘッダーも管理者のもの
     page(
+        Viewer::ADMIN,
         "管理 / レート調整",
         &format!(
             "{ADMIN_STYLES}\
@@ -231,7 +234,9 @@ pub fn search_page(view: &SearchView<'_>) -> String {
 
 /// プレイヤー 1 件の調整画面（`/admin/player`）。
 pub fn player_page(view: &PlayerView<'_>) -> String {
+    // この画面は管理者しか到達しない（非管理者は 404）。ヘッダーも管理者のもの
     page(
+        Viewer::ADMIN,
         "管理 / レート調整",
         &format!(
             "{ADMIN_STYLES}\

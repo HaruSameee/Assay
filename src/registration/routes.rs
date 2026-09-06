@@ -1,11 +1,15 @@
 //! 登録・認証のエンドポイント。
 //!
-//! - `GET  /`              入口。ログイン済みなら登録フォームへ
+//! - `GET  /`              入口。ログイン済みなら [`landing_path`] の行き先へ
 //! - `GET  /auth/login`    state を発行して Discord の認可画面へ
 //! - `GET  /auth/callback` state を検証して**即座に破棄**し、コードを交換してセッションを張る
 //! - `POST /auth/logout`   セッション Cookie を消す
-//! - `GET  /register`      登録フォーム
-//! - `POST /register`      申告を 1 行追記し、2つのゲートの結果を返す
+//! - `GET  /register`      登録フォーム（登録済みなら現在の値が入った状態で編集できる）
+//! - `POST /register`      申告を 1 行追記し、3つのゲートの結果を返す
+//!
+//! **登録済みの人に空のフォームを見せない。**ログイン直後の行き先は
+//! [`landing_path`] が `registered_at` だけで決める（未登録はフォーム、登録済みは
+//! キュー画面）。登録内容の変更は `/register` を自分で開けばいつでもできる。
 //!
 //! CSRF: セッション Cookie は `SameSite=Lax` なので、他サイトからの POST には送られない。
 //! `POST /register` と `POST /auth/logout` の保護はこれに拠る。
@@ -24,6 +28,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
+use crate::admin::AdminIds;
+use crate::lifecycle::PlayerId;
+
 use super::config::AuthConfig;
 use super::html;
 use super::model::{NewDeclaration, Rank};
@@ -32,6 +39,7 @@ use super::repository::{RegistrationError, RegistrationRepository};
 use super::session::{
     CurrentSession, STATE_COOKIE, Session, clear_session, clear_state, set_session, set_state,
 };
+use super::viewer::{Audience, Viewer};
 
 /// パス。リダイレクト URI 側のパスは設定（`OAUTH_REDIRECT_URI`）と一致させること。
 const LOGIN_PATH: &str = "/auth/login";
@@ -39,6 +47,8 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const LOGOUT_PATH: &str = "/auth/logout";
 const REGISTER_PATH: &str = "/register";
 const ROOT_PATH: &str = "/";
+/// キュー画面。ルーターは [`crate::queue`] 側だが、登録済みの行き先として参照する。
+const QUEUE_PATH: &str = "/queue";
 
 /// トレーナー名の最大長。DB は text だが、表示と入力欄に合わせて上限を設ける。
 const TRAINER_NAME_MAX_CHARS: usize = 64;
@@ -56,6 +66,8 @@ pub struct AuthState {
     pub repo: RegistrationRepository,
     /// Cookie の署名鍵（`config` から導出したものを保持する）。
     key: Key,
+    /// ヘッダーに管理パネルの導線を出す相手の判定。既定は「管理者なし」。
+    audience: Audience,
 }
 
 impl AuthState {
@@ -71,7 +83,14 @@ impl AuthState {
             oauth,
             repo,
             key,
+            audience: Audience::default(),
         }
+    }
+
+    /// 管理者リストを渡す。**渡さなければ誰にも管理パネルの導線を出さない。**
+    pub fn with_admins(mut self, admins: Option<AdminIds>) -> Self {
+        self.audience = Audience::new(admins);
+        self
     }
 }
 
@@ -98,10 +117,31 @@ pub fn router(state: AuthState) -> Router {
         .with_state(state)
 }
 
+/// ログイン済みの人を送る先。
+///
+/// **登録済みなら登録フォームを見せない。**同じ内容を毎回入力させないための分岐で、
+/// 判定は `registered_at` が非 NULL かどうかだけ（ゲートの判定は一切見ない。
+/// キューに入れるかどうかはキュー画面が3つのゲートで説明する）。
+///
+/// プロフィールが読めないときは安全側にフォームへ送る（フォームは現在の値を出すので、
+/// 登録済みの人が誤って来ても失うものが無い）。
+async fn landing_path(app: &AuthState, player_id: PlayerId) -> &'static str {
+    match app.repo.find_by_player_id(player_id).await {
+        Ok(Some(profile)) if profile.is_registered() => QUEUE_PATH,
+        Ok(_) => REGISTER_PATH,
+        Err(error) => {
+            error!(%error, "could not decide where to send the player after sign-in");
+            REGISTER_PATH
+        }
+    }
+}
+
 /// 入口。
-async fn index(session: Option<CurrentSession>) -> Response {
+async fn index(State(app): State<AuthState>, session: Option<CurrentSession>) -> Response {
     match session {
-        Some(_) => Redirect::to(REGISTER_PATH).into_response(),
+        Some(CurrentSession(session)) => {
+            Redirect::to(landing_path(&app, session.player_id).await).into_response()
+        }
         None => Html(html::login_page(LOGIN_PATH)).into_response(),
     }
 }
@@ -141,10 +181,15 @@ async fn callback(
 
     let fail = |jar: SignedCookieJar, status: StatusCode, message: &str| {
         // ステータスを先に置く（axum の IntoResponse は (StatusCode, parts.., body) の順を要求する）
+        // ログインが成立していないので、ヘッダーは未ログインのまま
         (
             status,
             jar,
-            Html(html::error_page("ログインできませんでした", message)),
+            Html(html::error_page(
+                Viewer::ANONYMOUS,
+                "ログインできませんでした",
+                message,
+            )),
         )
             .into_response()
     };
@@ -217,7 +262,9 @@ async fn callback(
     };
     info!(%player_id, "signed in");
     let jar = set_session(jar, &Session::issue(player_id), &app.config);
-    (jar, Redirect::to(REGISTER_PATH)).into_response()
+    // 登録済みならフォームを飛ばしてキューへ。ここで初めてセッションが張られる
+    let destination = landing_path(&app, player_id).await;
+    (jar, Redirect::to(destination)).into_response()
 }
 
 /// ログアウト。セッション Cookie を消すだけ（ストアが無いので失効管理も無い）。
@@ -232,8 +279,10 @@ async fn show_form(State(app): State<AuthState>, session: Option<CurrentSession>
     };
     match app.repo.find_by_player_id(session.player_id).await {
         Ok(Some(profile)) => {
+            // 登録済みなら現在の値がそのまま入る（空のフォームを出さない）
             let values = html::RegistrationFormValues::from_profile(&profile);
             Html(html::registration_form(
+                app.audience.viewer_of(Some(&profile)),
                 REGISTER_PATH,
                 &profile,
                 &values,
@@ -352,6 +401,7 @@ async fn submit_form(
             return (
                 StatusCode::BAD_REQUEST,
                 Html(html::registration_form(
+                    app.audience.viewer_of(Some(&profile)),
                     REGISTER_PATH,
                     &profile,
                     &values,
@@ -385,15 +435,24 @@ async fn submit_form(
         (Err(error), _) | (_, Err(error)) => return internal_error(error),
         (Ok(None), _) => return Redirect::to(ROOT_PATH).into_response(),
     };
-    Html(html::registration_result(&profile, &eligibility)).into_response()
+    Html(html::registration_result(
+        app.audience.viewer_of(Some(&profile)),
+        &profile,
+        &eligibility,
+    ))
+    .into_response()
 }
 
 /// 内部エラー。詳細はログに残し、画面には出さない。
+///
+/// ここは DB が読めていない経路なので、管理者かどうかも確かめられない。
+/// ヘッダーは未ログイン扱いで出す（導線を出さない方に倒す）。
 fn internal_error(error: RegistrationError) -> Response {
     error!(%error, "registration request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Html(html::error_page(
+            Viewer::ANONYMOUS,
             "エラー",
             "処理に失敗しました。時間をおいてお試しください。",
         )),
@@ -405,6 +464,7 @@ fn session_expired() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Html(html::error_page(
+            Viewer::ANONYMOUS,
             "セッションの有効期限が切れました",
             "ログイン状態を確認できませんでした。入口に戻って、Discord で再度ログインしてください。",
         )),

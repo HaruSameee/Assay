@@ -25,6 +25,7 @@ use serenity::async_trait;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
+use unite_matchsystem::admin::parse_admin_ids;
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
@@ -247,7 +248,20 @@ fn state_from_redirect(response: &Response<Body>) -> String {
 }
 
 /// ログインを通してセッションを張り、`players.id` を返す。
+///
+/// **初回ログインは必ず未登録**なので、行き先は登録フォーム。登録済みの人が
+/// ログインし直す経路は [`sign_in_landing_on`] で行き先ごと確かめる。
 async fn sign_in(browser: &mut Browser, db: &AppDb, discord_user_id: &str) -> PlayerId {
+    sign_in_landing_on(browser, db, discord_user_id, "/register").await
+}
+
+/// ログインを通し、コールバックの行き先が `expected` であることも確かめる。
+async fn sign_in_landing_on(
+    browser: &mut Browser,
+    db: &AppDb,
+    discord_user_id: &str,
+    expected: &str,
+) -> PlayerId {
     let login = browser.get("/auth/login").await;
     assert_eq!(login.status(), StatusCode::SEE_OTHER);
     assert!(
@@ -263,7 +277,7 @@ async fn sign_in(browser: &mut Browser, db: &AppDb, discord_user_id: &str) -> Pl
         StatusCode::SEE_OTHER,
         "callback redirects"
     );
-    assert_eq!(location(&callback), "/register");
+    assert_eq!(location(&callback), expected);
     assert!(browser.cookies.contains_key(SESSION_COOKIE));
     assert!(
         !browser.cookies.contains_key(STATE_COOKIE),
@@ -1032,5 +1046,118 @@ async fn disabling_the_report_gate_does_not_disable_the_registration_gate(owner:
         !eligibility.is_allowed(),
         "registration gate must remain active"
     );
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// ログイン後の行き先と共通ヘッダー
+// ----------------------------------------------------------------------
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_registered_player_never_sees_the_form_again_on_sign_in(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let discord_id = "900000000000000005";
+    let oauth = std::sync::Arc::new(FakeOAuth::new(discord_id));
+    let app = router(AuthState::new(config(), oauth.clone(), db.repo.clone()));
+
+    // 未登録: ログインの行き先も、入口の行き先も登録フォーム
+    let mut browser = Browser::new(app.clone());
+    let player = sign_in(&mut browser, &db, discord_id).await;
+    let entrance = browser.get("/").await;
+    assert_eq!(entrance.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&entrance), "/register", "未登録はフォームへ");
+
+    browser
+        .post_form("/register", &form_body("トレーナー", "legend", "1500"))
+        .await;
+    assert!(
+        db.repo
+            .find_by_player_id(player)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_registered()
+    );
+
+    // 登録済み: 入口はキュー画面へ直行する
+    let entrance = browser.get("/").await;
+    assert_eq!(entrance.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&entrance), "/queue", "登録済みはキューへ");
+
+    // ログインし直しても同じ。ランクの再入力を求めない
+    let logout = browser.post_form("/auth/logout", "").await;
+    assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    let again = sign_in_landing_on(&mut browser, &db, discord_id, "/queue").await;
+    assert_eq!(again, player);
+
+    // それでも `/register` を自分で開けば、現在の値が入った状態で編集できる
+    let form = browser.get("/register").await;
+    assert_eq!(form.status(), StatusCode::OK);
+    let form = body_text(form).await;
+    assert!(form.contains("value=\"トレーナー\""), "{form}");
+    assert!(form.contains("value=\"legend\" selected"), "{form}");
+    assert!(form.contains("value=\"1500\""), "{form}");
+    assert!(form.contains("登録内容を変更"), "{form}");
+    // 申告は上書きされない。開いただけでは行も増えない
+    assert_eq!(declaration_count(&db, player).await, 1);
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_header_offers_nothing_until_you_are_signed_in(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let oauth = std::sync::Arc::new(FakeOAuth::new("900000000000000005"));
+    let mut browser = Browser::new(router(AuthState::new(config(), oauth, db.repo.clone())));
+
+    let entrance = body_text(browser.get("/").await).await;
+    assert!(entrance.contains("Discord でログイン"), "{entrance}");
+    // 未ログインには導線を出さない（行き先がどれもログインを要求するため）
+    assert!(!entrance.contains("href=\"/status\""), "{entrance}");
+    assert!(!entrance.contains("href=\"/queue\""), "{entrance}");
+    assert!(!entrance.contains("href=\"/admin\""), "{entrance}");
+    assert!(!entrance.contains("/auth/logout"), "{entrance}");
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn only_a_listed_admin_sees_the_admin_link_in_the_header(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let discord_id = "900000000000000005";
+    let other_admin = parse_admin_ids(Some("900000000000000001")).unwrap();
+    let this_player_is_admin = parse_admin_ids(Some(discord_id)).unwrap();
+
+    // 1. 管理者リストに載っていないセッション
+    let oauth = std::sync::Arc::new(FakeOAuth::new(discord_id));
+    let mut browser = Browser::new(router(
+        AuthState::new(config(), oauth.clone(), db.repo.clone()).with_admins(other_admin),
+    ));
+    sign_in(&mut browser, &db, discord_id).await;
+    let page = body_text(browser.get("/register").await).await;
+    assert!(page.contains("href=\"/status\""), "{page}");
+    assert!(page.contains("action=\"/auth/logout\""), "{page}");
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+
+    // 2. 同じ画面でも、リストに載っていれば導線が出る
+    let mut browser = Browser::new(router(
+        AuthState::new(config(), oauth.clone(), db.repo.clone()).with_admins(this_player_is_admin),
+    ));
+    sign_in(&mut browser, &db, discord_id).await;
+    let page = body_text(browser.get("/register").await).await;
+    assert!(page.contains("href=\"/admin\""), "{page}");
+
+    // 3. リスト未設定（パネル自体がマウントされない構成）では誰にも出さない
+    let mut browser = Browser::new(router(AuthState::new(config(), oauth, db.repo.clone())));
+    sign_in(&mut browser, &db, discord_id).await;
+    let page = body_text(browser.get("/register").await).await;
+    assert!(!page.contains("href=\"/admin\""), "{page}");
     db.done().await;
 }

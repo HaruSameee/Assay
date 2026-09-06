@@ -14,9 +14,11 @@ use axum::routing::get;
 use axum_extra::extract::cookie::Key;
 use tracing::error;
 
+use crate::admin::AdminIds;
+use crate::lifecycle::PlayerId;
 use crate::rating::RatingAdjustmentRepository;
 use crate::registration::html::error_page;
-use crate::registration::{AuthConfig, CurrentSession};
+use crate::registration::{Audience, AuthConfig, CurrentSession, Viewer};
 
 use super::html::{HISTORY_LIMIT, StatusView, status_page};
 use super::repository::StatusRepository;
@@ -32,6 +34,8 @@ pub struct StatusState {
     pub ratings: RatingAdjustmentRepository,
     /// 履歴の読み取り。
     pub history: StatusRepository,
+    /// 共通ヘッダーに管理パネルの導線を出す相手の判定。既定は「管理者なし」。
+    audience: Audience,
 }
 
 impl StatusState {
@@ -46,7 +50,14 @@ impl StatusState {
             key,
             ratings,
             history,
+            audience: Audience::default(),
         }
+    }
+
+    /// 管理者リストを渡す。**渡さなければ誰にも管理パネルの導線を出さない。**
+    pub fn with_admins(mut self, admins: Option<AdminIds>) -> Self {
+        self.audience = Audience::new(admins);
+        self
     }
 }
 
@@ -75,6 +86,7 @@ async fn show_status(State(app): State<StatusState>, session: Option<CurrentSess
         return (
             StatusCode::UNAUTHORIZED,
             Html(error_page(
+                Viewer::ANONYMOUS,
                 "セッションの有効期限が切れました",
                 "ログイン状態を確認できませんでした。入口に戻って、Discord で再度ログインしてください。",
             )),
@@ -94,6 +106,7 @@ async fn show_status(State(app): State<StatusState>, session: Option<CurrentSess
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Html(error_page(
+                    Viewer::ANONYMOUS,
                     "エラー",
                     "戦績の取得に失敗しました。時間をおいてお試しください。",
                 )),
@@ -102,10 +115,25 @@ async fn show_status(State(app): State<StatusState>, session: Option<CurrentSess
         }
     };
 
-    Html(status_page(&StatusView {
-        rating,
-        summary,
-        history,
-    }))
+    Html(status_page(
+        viewer(&app, session.player_id).await,
+        &StatusView {
+            rating,
+            summary,
+            history,
+        },
+    ))
     .into_response()
+}
+
+/// 共通ヘッダー用の見ている人。読めなければ導線を出さない側へ倒す。
+async fn viewer(app: &StatusState, player_id: PlayerId) -> Viewer {
+    match app.history.discord_user_id(player_id).await {
+        Ok(Some(discord_user_id)) => app.audience.viewer_for(&discord_user_id),
+        Ok(None) => Viewer::MEMBER,
+        Err(error) => {
+            error!(%error, "could not read the discord id for the header");
+            Viewer::MEMBER
+        }
+    }
 }

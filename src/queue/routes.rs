@@ -27,9 +27,11 @@ use tracing::error;
 
 use uuid::Uuid;
 
+use crate::admin::AdminIds;
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::registration::{
-    AuthConfig, CurrentSession, QueueEligibility, RegistrationBlock, RegistrationRepository,
+    Audience, AuthConfig, CurrentSession, QueueEligibility, RegistrationBlock,
+    RegistrationRepository, Viewer,
 };
 
 use super::model::{
@@ -52,6 +54,8 @@ pub struct QueueState {
     pub queue: QueueRepository,
     /// Cookie の署名鍵（`config` から導出したものを保持する）。
     key: Key,
+    /// 共通ヘッダーに管理パネルの導線を出す相手の判定。既定は「管理者なし」。
+    audience: Audience,
 }
 
 impl QueueState {
@@ -67,7 +71,14 @@ impl QueueState {
             registration,
             queue,
             key,
+            audience: Audience::default(),
         }
+    }
+
+    /// 管理者リストを渡す。**渡さなければ誰にも管理パネルの導線を出さない。**
+    pub fn with_admins(mut self, admins: Option<AdminIds>) -> Self {
+        self.audience = Audience::new(admins);
+        self
     }
 }
 
@@ -263,6 +274,7 @@ async fn show_queue(
             (
                 StatusCode::UNAUTHORIZED,
                 Html(crate::registration::html::error_page(
+                    Viewer::ANONYMOUS,
                     "ログインが必要です",
                     "セッションが切れているか、まだログインしていません。入口からDiscordでログインしてください。",
                 )),
@@ -282,6 +294,8 @@ async fn show_queue(
         Some(status) if html => (
             StatusCode::OK,
             Html(super::html::queue_page(
+                // ヘッダーの描画にだけ必要。ポーリングされる JSON 側では引かない
+                viewer(&app, player_id).await,
                 &status,
                 preview_down_range.unwrap_or(MIN_DOWN_RANGE),
                 Utc::now(),
@@ -290,6 +304,17 @@ async fn show_queue(
             .into_response(),
         Some(status) => (StatusCode::OK, Json(status)).into_response(),
         None => internal_error(),
+    }
+}
+
+/// 共通ヘッダー用の見ている人。プロフィールが読めなければ導線を出さない側へ倒す。
+async fn viewer(app: &QueueState, player_id: PlayerId) -> Viewer {
+    match app.registration.find_by_player_id(player_id).await {
+        Ok(profile) => app.audience.viewer_of(profile.as_ref()),
+        Err(error) => {
+            error!(%error, "could not read the profile for the header");
+            Viewer::MEMBER
+        }
     }
 }
 

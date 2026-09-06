@@ -23,7 +23,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::registration::html::error_page;
-use crate::registration::{AuthConfig, CurrentSession};
+use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
 use super::config::AdminIds;
 use super::html::{Notice, NoticeKind, PlayerView, SearchView, player_page, search_page};
@@ -123,6 +123,8 @@ fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
         Html(error_page(
+            // 存在を教えない。ヘッダーの導線も出さない
+            Viewer::ANONYMOUS,
             "見つかりません",
             "お探しのページは見つかりませんでした。",
         )),
@@ -134,6 +136,7 @@ fn internal_error() -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Html(error_page(
+            Viewer::ADMIN,
             "エラー",
             "管理パネルを利用できません。時間をおいてお試しください。",
         )),

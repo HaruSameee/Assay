@@ -113,11 +113,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let matchmaker_log_adapter = adapter.clone();
 
     // 認証設定が欠けていたら起動しない（本番で「ログインだけ無い」状態を作らない）
+    //
+    // 管理者リストは全トラックの State に配る。共通ヘッダーが管理パネルの導線を
+    // 出すかどうかの判定に使うだけで、`/admin` のアクセス制御は admin ルート側の
+    // 照合が正（リンクが無くても 404 は 404）。
     let auth = AuthState::new(
         auth_config.clone(),
         Arc::new(HttpOAuthClient::new(&auth_config)?),
         registration_repo.clone(),
-    );
+    )
+    .with_admins(admin_ids.clone());
     info!(
         redirect_uri = %auth_config.redirect_uri,
         cookie_domain = %auth_config.cookie_domain,
@@ -131,16 +136,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         internal_token,
     })
     .merge(registration_router(auth))
-    .merge(queue_router(QueueState::new(
-        auth_config.clone(),
-        registration_repo,
-        queue_repo,
-    )))
-    .merge(status_router(StatusState::new(
-        auth_config.clone(),
-        ratings_repo,
-        status_repo,
-    )));
+    .merge(queue_router(
+        QueueState::new(auth_config.clone(), registration_repo, queue_repo)
+            .with_admins(admin_ids.clone()),
+    ))
+    .merge(status_router(
+        StatusState::new(auth_config.clone(), ratings_repo, status_repo)
+            .with_admins(admin_ids.clone()),
+    ));
     info!("status routes mounted");
     // fail-closed: 管理者 ID が未設定ならルート自体をマウントしない
     // （INTERNAL_API_TOKEN と同じ方針。設定してもセッションの Discord ID 照合が正）

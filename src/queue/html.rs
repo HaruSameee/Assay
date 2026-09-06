@@ -1,6 +1,9 @@
 //! キュー画面の HTML。登録画面と同じシェルとダークテーマを使う。
+//!
+//! ヘッダーは共有のシェル（[`page_with_styles`]）が出す。ここでは書かない。
 
 use crate::lifecycle::Timestamp;
+use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
 
 use super::model::{MAX_DOWN_RANGE, MIN_DOWN_RANGE};
@@ -63,16 +66,21 @@ const ROLE_OPTIONS: [(&str, &str); 5] = [
     ("bot_tank", "タンク"),
 ];
 
-pub(super) fn queue_page(status: &StatusView, preview_down_range: i32, now: Timestamp) -> String {
+pub(super) fn queue_page(
+    viewer: Viewer,
+    status: &StatusView,
+    preview_down_range: i32,
+    now: Timestamp,
+) -> String {
     if status.eligibility.registration.is_some()
         || status.eligibility.active_formation.is_some()
         || !status.eligibility.pending_reports.is_empty()
     {
-        blocked_page(status)
+        blocked_page(viewer, status)
     } else if let Some(entry) = &status.entry {
-        queued_page(status, entry, now)
+        queued_page(viewer, status, entry, now)
     } else {
-        unqueued_page(status, preview_down_range)
+        unqueued_page(viewer, status, preview_down_range)
     }
 }
 
@@ -91,7 +99,7 @@ fn role_options(selected: Option<&str>) -> String {
     output
 }
 
-fn unqueued_page(status: &StatusView, down_range: i32) -> String {
+fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String {
     let in_range = status.in_range.unwrap_or(0);
     let first = role_options(None);
     let second = role_options(None);
@@ -122,10 +130,10 @@ fn unqueued_page(status: &StatusView, down_range: i32) -> String {
         max = MAX_DOWN_RANGE,
         script = UNQUEUED_SCRIPT,
     );
-    page_with_styles("キュー", &body, QUEUE_STYLES)
+    page_with_styles(viewer, "キュー", &body, QUEUE_STYLES)
 }
 
-fn queued_page(status: &StatusView, entry: &EntryView, now: Timestamp) -> String {
+fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Timestamp) -> String {
     let roles = entry
         .roles
         .iter()
@@ -157,10 +165,10 @@ fn queued_page(status: &StatusView, entry: &EntryView, now: Timestamp) -> String
         down_range = entry.down_range,
         script = QUEUED_SCRIPT,
     );
-    page_with_styles("キュー参加中", &body, QUEUE_STYLES)
+    page_with_styles(viewer, "キュー参加中", &body, QUEUE_STYLES)
 }
 
-fn blocked_page(status: &StatusView) -> String {
+fn blocked_page(viewer: Viewer, status: &StatusView) -> String {
     let matched = status.eligibility.active_formation.is_some();
     let title = if matched {
         "マッチが成立しました"
@@ -243,7 +251,7 @@ fn blocked_page(status: &StatusView) -> String {
         title = escape(title),
         script = BLOCKED_SCRIPT,
     );
-    page_with_styles(title, &body, QUEUE_STYLES)
+    page_with_styles(viewer, title, &body, QUEUE_STYLES)
 }
 
 fn registration_gate(block: &RegistrationBlockView) -> String {
@@ -450,7 +458,7 @@ mod tests {
 
     #[test]
     fn the_unqueued_page_has_all_roles_range_and_resilient_polling() {
-        let rendered = queue_page(&status(), 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &status(), 95, Utc::now());
         for (role, label) in ROLE_OPTIONS {
             assert!(rendered.contains(&format!("value=\"{role}\"")));
             assert!(rendered.contains(label));
@@ -479,6 +487,7 @@ mod tests {
             }],
         });
         let rendered = queue_page(
+            Viewer::MEMBER,
             &queued,
             95,
             Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap(),
@@ -508,7 +517,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(&blocked, 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &blocked, 95, Utc::now());
         for gate in ["registration", "active_formation", "pending_reports"] {
             assert!(rendered.contains(&format!("data-gate=\"{gate}\"")));
         }
@@ -528,7 +537,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(&matched, 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &matched, 95, Utc::now());
         assert!(rendered.contains("class=\"matched\""), "{rendered}");
         // ゲートの側は一切変えていない
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -543,7 +552,7 @@ mod tests {
         // 成立していないブロックは従来どおり
         let mut plain = status();
         plain.eligibility.pending_reports = vec![Uuid::from_u128(9)];
-        let rendered = queue_page(&plain, 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &plain, 95, Utc::now());
         assert!(!rendered.contains("class=\"matched\""));
         assert!(rendered.contains("現在止まっている条件"));
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -572,8 +581,8 @@ mod tests {
                 })
                 .collect(),
         });
-        let selecting = queue_page(&status(), 95, Utc::now());
-        let selected = queue_page(&queued, 95, Utc::now());
+        let selecting = queue_page(Viewer::MEMBER, &status(), 95, Utc::now());
+        let selected = queue_page(Viewer::MEMBER, &queued, 95, Utc::now());
         for (role, label) in ROLE_OPTIONS {
             // 選ぶ側は日本語のラベル。識別子は value 属性の中だけ
             assert!(
@@ -622,9 +631,54 @@ mod tests {
 
     #[test]
     fn mobile_layout_is_explicit() {
-        let rendered = queue_page(&status(), 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &status(), 95, Utc::now());
         assert!(rendered.contains("@media (max-width: 600px)"));
         assert!(rendered.contains(".role-grid { grid-template-columns: 1fr"));
+    }
+
+    /// キュー画面も共通ヘッダーをそのまま出す（自前の `<header>` を持たない）。
+    ///
+    /// 3 つの表示（未投入・キュー中・ブロック / 成立）すべてで同じもの。
+    /// 登録画面側の `every_screen_renders_the_same_header` と対になる検査。
+    #[test]
+    fn every_queue_view_renders_the_shared_header() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
+        let mut queued = status();
+        queued.queued = true;
+        queued.entry = Some(EntryView {
+            id: Uuid::from_u128(1),
+            player_id: Uuid::from_u128(2),
+            enqueued_at: "2026-09-12T12:00:00+00:00".into(),
+            updated_at: "2026-09-12T12:00:00+00:00".into(),
+            down_range: 95,
+            up_range: 95,
+            roles: vec![RolePreference {
+                role: "jungle".into(),
+                priority: 1,
+            }],
+        });
+        let mut blocked = status();
+        blocked.eligibility.pending_reports = vec![Uuid::from_u128(9)];
+
+        let expected = "<header class=\"site-header\">\n\
+             <a class=\"brand\" href=\"/queue\">Assay</a>\n\
+             <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
+             <a href=\"/status\">戦績</a>\n\
+             <form method=\"post\" action=\"/auth/logout\">\
+             <button type=\"submit\">ログアウト</button></form>\n\
+             </nav>\n</header>\n";
+        for rendered in [
+            queue_page(Viewer::MEMBER, &status(), 95, now),
+            queue_page(Viewer::MEMBER, &queued, 95, now),
+            queue_page(Viewer::MEMBER, &blocked, 95, now),
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+            // 非管理者にパネルの存在を知らせない
+            assert!(!rendered.contains("href=\"/admin\""), "{rendered}");
+        }
+        // 管理者にはヘッダーにだけ管理リンクが増える
+        let admin = queue_page(Viewer::ADMIN, &status(), 95, now);
+        assert!(admin.contains("<a href=\"/admin\">管理</a>"), "{admin}");
     }
 
     /// レビュー用に各画面の HTML を丸ごと出す。スクリーンショットが撮れないため。
@@ -636,7 +690,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
 
         println!("========== 1. 未投入 (data-view=unqueued) ==========");
-        println!("{}", queue_page(&status(), 150, now));
+        println!("{}", queue_page(Viewer::MEMBER, &status(), 150, now));
 
         let mut queued = status();
         queued.queued = true;
@@ -659,7 +713,7 @@ mod tests {
             ],
         });
         println!("========== 2. キュー中 (data-view=queued) ==========");
-        println!("{}", queue_page(&queued, 95, now));
+        println!("{}", queue_page(Viewer::MEMBER, &queued, 95, now));
 
         let mut matched = status();
         matched.eligibility.active_formation = Some(Uuid::from_u128(8));
@@ -670,7 +724,7 @@ mod tests {
             channel_id: "123".into(),
         });
         println!("========== 3. マッチ成立 ==========");
-        println!("{}", queue_page(&matched, 95, now));
+        println!("{}", queue_page(Viewer::MEMBER, &matched, 95, now));
 
         let mut blocked = status();
         blocked.eligibility = EligibilityView {
@@ -683,6 +737,6 @@ mod tests {
             pending_reports: vec![Uuid::from_u128(9)],
         };
         println!("========== 4. ゲートで停止 ==========");
-        println!("{}", queue_page(&blocked, 95, now));
+        println!("{}", queue_page(Viewer::MEMBER, &blocked, 95, now));
     }
 }

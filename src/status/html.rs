@@ -7,6 +7,7 @@
 use chrono::{FixedOffset, Utc};
 
 use crate::rating::MatchResult;
+use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
 
 use super::repository::{MatchHistoryEntry, StatusSummary};
@@ -95,7 +96,7 @@ table.history td { border-bottom: 1px solid var(--border); padding: 8px 10px;
 "#;
 
 /// 戦績画面。
-pub fn status_page(view: &StatusView) -> String {
+pub fn status_page(viewer: Viewer, view: &StatusView) -> String {
     let mut rows = String::new();
     for entry in &view.history {
         let played_at = entry.played_at.with_timezone(&JST).format("%Y-%m-%d %H:%M");
@@ -133,6 +134,7 @@ pub fn status_page(view: &StatusView) -> String {
     };
 
     page(
+        viewer,
         "自分の戦績",
         &format!(
             "{TABLE_STYLES}\
@@ -216,11 +218,14 @@ mod tests {
 
     #[test]
     fn the_page_shows_rating_counts_and_rows() {
-        let rendered = status_page(&view(vec![
-            entry(120, "red", MatchResult::Won, 11.0),
-            entry(60, "blue", MatchResult::Lost, -12.0),
-            entry(0, "red", MatchResult::Drawn, 0.0),
-        ]));
+        let rendered = status_page(
+            Viewer::MEMBER,
+            &view(vec![
+                entry(120, "red", MatchResult::Won, 11.0),
+                entry(60, "blue", MatchResult::Lost, -12.0),
+                entry(0, "red", MatchResult::Drawn, 0.0),
+            ]),
+        );
         assert!(rendered.starts_with("<!doctype html>"));
         assert!(rendered.contains("1522"));
         assert!(rendered.contains(">+11<"));
@@ -236,14 +241,14 @@ mod tests {
 
     #[test]
     fn an_empty_history_says_so_without_a_table() {
-        let rendered = status_page(&view(vec![]));
+        let rendered = status_page(Viewer::MEMBER, &view(vec![]));
         assert!(rendered.contains("まだ確定した試合がありません"));
         assert!(!rendered.contains("<table"));
     }
 
     #[test]
     fn the_page_keeps_the_shared_dark_theme_and_mobile_layout() {
-        let rendered = status_page(&view(vec![]));
+        let rendered = status_page(Viewer::MEMBER, &view(vec![]));
         // 登録画面と同じ外枠・配色
         assert!(rendered.contains("color-scheme: dark"));
         assert!(rendered.contains("var(--accent)"));
@@ -256,7 +261,10 @@ mod tests {
     fn the_page_never_shows_other_players() {
         // 画面に入るのは数値と日付とチームだけ。プレイヤー名の差し込み口が無いこと
         // （`--discord` は共有 CSS の変数名なので文字列検査からは除く）
-        let rendered = status_page(&view(vec![entry(0, "red", MatchResult::Won, 11.0)]));
+        let rendered = status_page(
+            Viewer::MEMBER,
+            &view(vec![entry(0, "red", MatchResult::Won, 11.0)]),
+        );
         assert!(!rendered.contains("trainer"), "{rendered}");
         assert!(!rendered.contains("trainer_name"), "{rendered}");
         assert!(!rendered.contains("global_name"), "{rendered}");

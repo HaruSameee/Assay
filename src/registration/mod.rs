@@ -18,6 +18,9 @@
 //! - 追記専用テーブルに UPDATE / DELETE を書かない。`SELECT ... FOR UPDATE` も使わない。
 //! - キューのゲートは**3つに分けたまま**返す（[`gate`]）。1つのフラグに畳むと、
 //!   キュー画面で「なぜ入れないのか」を説明できなくなる。
+//! - **共通ヘッダーは [`html::page`] の 1 か所だけ**。キュー・戦績・管理も同じ外枠を通る。
+//!   画面ごとに `<header>` を書かない。出す導線は [`Viewer`] だけで決まり、
+//!   管理パネルの導線は `ADMIN_DISCORD_USER_IDS` に載っている人にしか出さない。
 
 pub mod config;
 pub mod gate;
@@ -27,6 +30,7 @@ pub mod oauth;
 pub mod repository;
 pub mod routes;
 pub mod session;
+pub mod viewer;
 
 pub use config::{AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env};
 pub use gate::{
@@ -38,3 +42,4 @@ pub use oauth::{DiscordUser, HttpOAuthClient, OAuthClient, OAuthError};
 pub use repository::{RegistrationError, RegistrationRepository};
 pub use routes::{AuthState, router};
 pub use session::{CurrentSession, Session, SessionError};
+pub use viewer::{Audience, Viewer};
