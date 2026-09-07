@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(distinct formation_id)::bigint as \"count!\" from formation_events where kind = $1 and occurred_at >= $2 and occurred_at <= $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8567d41c2b926fa68fdbd5b30d1fe475fd69bce966a53974ba3bd39082d3acdb"
+}

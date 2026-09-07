@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select role, count(*)::bigint as \"count!\" from queue_entry_roles where priority = 1 group by role",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "queue_entry_roles",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "c8748d24d540f3032f49f919fafd22f96f13decd757c43be749816ef610fea34"
+}

@@ -16,7 +16,7 @@ use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use unite_matchsystem::lifecycle::{
-    FormationEventKind as K, FormationId, FormationState, PlayerId, Timestamp,
+    AbandonReason, FormationEventKind as K, FormationId, FormationState, PlayerId, Timestamp,
 };
 use unite_matchsystem::matchmaker::{
     Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
@@ -154,6 +154,17 @@ async fn count(db: &AppDb, table: &str) -> i64 {
 
 /// 未終了の formation を 1 つ作り、`vc1` を占有させる。
 async fn occupy_vc(db: &AppDb, formation: u128, label: &str) {
+    create_formation(db, formation, at(-600)).await;
+    db.formations
+        .append_event(
+            fid(formation),
+            &NewEvent::vc_assigned(label, 1, 2, at(-600), format!("vc_assigned:{label}")),
+        )
+        .await
+        .expect("occupy the pair");
+}
+
+async fn create_formation(db: &AppDb, formation: u128, created_at: Timestamp) {
     let players: Vec<NewFormationPlayer> = (1..=10u128)
         .map(|n| NewFormationPlayer {
             player_id: player(n),
@@ -167,20 +178,64 @@ async fn occupy_vc(db: &AppDb, formation: u128, label: &str) {
     db.formations
         .create_formation(&NewFormation {
             id: fid(formation),
-            created_at: at(-600),
+            created_at,
             matchmaking_params_version: 1,
             predicted_win_prob: 0.5,
             players,
         })
         .await
-        .expect("create the blocking formation");
+        .expect("create formation");
+}
+
+async fn advance_to_code_wait(db: &AppDb, formation: u128, label: &str, occurred_at: Timestamp) {
+    create_formation(db, formation, occurred_at).await;
     db.formations
         .append_event(
             fid(formation),
-            &NewEvent::vc_assigned(label, 1, 2, at(-600), format!("vc_assigned:{label}")),
+            &NewEvent::vc_assigned(label, 1, 2, occurred_at, format!("vc_assigned:{formation}")),
         )
         .await
-        .expect("occupy the pair");
+        .expect("assign VC");
+    db.formations
+        .append_event(
+            fid(formation),
+            &NewEvent::new(
+                K::HostAssigned,
+                Some(player(1)),
+                occurred_at,
+                format!("host_assigned:{formation}"),
+            ),
+        )
+        .await
+        .expect("assign host");
+    db.formations
+        .append_event(
+            fid(formation),
+            &NewEvent::new(
+                K::HostAccepted,
+                Some(player(1)),
+                occurred_at,
+                format!("host_accepted:{formation}"),
+            ),
+        )
+        .await
+        .expect("accept host");
+}
+
+async fn advance_to_in_progress(db: &AppDb, formation: u128, label: &str, occurred_at: Timestamp) {
+    advance_to_code_wait(db, formation, label, occurred_at).await;
+    db.formations
+        .append_event(
+            fid(formation),
+            &NewEvent::code_posted(
+                player(1),
+                "1234",
+                occurred_at,
+                format!("code_posted:{formation}"),
+            ),
+        )
+        .await
+        .expect("post code");
 }
 
 // ----------------------------------------------------------------------
@@ -214,6 +269,7 @@ async fn the_role_constants_match_the_roles_table(owner: PgPool) {
 async fn a_run_forms_a_match_assigns_a_vc_and_clears_the_queue(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 10).await;
+    adjust_rating(&db, player(1), 20.0).await;
     enqueue_full_rosters(&db, 10, at(0)).await;
 
     let outcome = db
@@ -224,6 +280,17 @@ async fn a_run_forms_a_match_assigns_a_vc_and_clears_the_queue(owner: PgPool) {
     assert_eq!(outcome.candidates, 10);
     assert_eq!(outcome.created.len(), 1);
     assert!(!outcome.vc_exhausted);
+    let selection = &outcome.assignments[0].selection;
+    assert_eq!(selection.minimum_rating, 1500.0);
+    assert_eq!(selection.maximum_rating, 1520.0);
+    assert_eq!(selection.team_average_difference, 4.0);
+    assert_eq!(selection.total_wait_seconds, 6_000);
+    assert_eq!(selection.longest_wait_seconds, 600);
+    assert_eq!(selection.shortest_wait_seconds, 600);
+    assert_eq!(selection.first_choice_count, 10);
+    assert_eq!(selection.second_choice_count, 0);
+    assert_eq!(selection.third_choice_count, 0);
+    assert_eq!(selection.flex_compensation_count, 0);
 
     let formation = outcome.created[0];
     assert_eq!(count(&db, "formations").await, 1);
@@ -250,10 +317,14 @@ async fn a_run_forms_a_match_assigns_a_vc_and_clears_the_queue(owner: PgPool) {
     );
 
     // 凍結値は内部スケール（表示 1500 / 60 = 25）
-    let mu: f64 = sqlx::query_scalar("select mu_at_match from formation_players limit 1")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+    let mu: f64 = sqlx::query_scalar(
+        "select mu_at_match from formation_players where formation_id = $1 and player_id = $2",
+    )
+    .bind(formation.0)
+    .bind(player(2).0)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert!((mu - 25.0).abs() < 1e-9, "mu = {mu}");
 
     db.done().await;
@@ -319,6 +390,100 @@ async fn summary_uses_the_persisted_queue_and_last_fifteen_minutes(owner: PgPool
     assert_eq!(summary.formed_last_15_minutes, 1);
     assert_eq!(summary.median_wait_seconds, Some(180));
     assert_eq!(summary.longest_wait_seconds, Some(300));
+    assert_eq!(summary.first_choice_roles.top_carry, 1);
+    assert_eq!(summary.first_choice_roles.top_support, 1);
+    assert_eq!(summary.vc_in_use, 1);
+    assert_eq!(summary.vc_total, 2);
+    assert_eq!(summary.active.awaiting_host, 1);
+    assert_eq!(summary.pending_reporters, 0);
+    assert_eq!(summary.formed_today, 1);
+    assert_eq!(summary.confirmed_today, 0);
+    assert!(summary.should_publish());
+    db.done().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn summary_includes_operational_state_and_recent_outcomes(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 12).await;
+    enqueue_full_rosters(&db, 10, at(0)).await;
+    let matchmaker = db.matchmaker(7);
+    matchmaker.run_once(at(600)).await.unwrap();
+
+    for (number, role, enqueued_at) in [(11, ROLES[0], at(300)), (12, ROLES[1], at(540))] {
+        db.queue
+            .enqueue(
+                player(number),
+                &QueueRequest {
+                    down_range: 95,
+                    roles: vec![RolePreference {
+                        role: role.to_owned(),
+                        priority: 1,
+                    }],
+                },
+                enqueued_at,
+            )
+            .await
+            .unwrap();
+    }
+
+    advance_to_code_wait(&db, 2, "2", at(610)).await;
+    advance_to_in_progress(&db, 3, "3", at(620)).await;
+    advance_to_in_progress(&db, 4, "4", at(630)).await;
+    db.formations
+        .append_event(
+            fid(4),
+            &NewEvent::new(K::Disputed, None, at(700), "disputed:4"),
+        )
+        .await
+        .unwrap();
+    advance_to_in_progress(&db, 5, "5", at(640)).await;
+    db.formations
+        .append_event(
+            fid(5),
+            &NewEvent::new(K::Confirmed, None, at(710), "confirmed:5"),
+        )
+        .await
+        .unwrap();
+    advance_to_in_progress(&db, 6, "6", at(650)).await;
+    db.formations
+        .append_event(
+            fid(6),
+            &NewEvent::new(K::Nullified, None, at(720), "nullified:6"),
+        )
+        .await
+        .unwrap();
+    create_formation(&db, 7, at(660)).await;
+    db.formations
+        .append_event(
+            fid(7),
+            &NewEvent::abandoned(AbandonReason::NotEnoughPlayers, at(730), "abandoned:7"),
+        )
+        .await
+        .unwrap();
+
+    let summary = matchmaker.summary(at(1_200)).await.unwrap();
+    assert_eq!(summary.queued, 2);
+    assert_eq!(summary.first_choice_roles.top_carry, 1);
+    assert_eq!(summary.first_choice_roles.top_support, 1);
+    assert_eq!(summary.median_wait_seconds, Some(780));
+    assert_eq!(summary.longest_wait_seconds, Some(900));
+    assert_eq!(summary.vc_in_use, 3);
+    assert_eq!(summary.vc_total, 7);
+    assert_eq!(summary.active.awaiting_host, 1);
+    assert_eq!(summary.active.awaiting_code, 1);
+    assert_eq!(summary.active.awaiting_reports, 1);
+    assert_eq!(summary.active.awaiting_resolution, 1);
+    assert_eq!(summary.recent_completions.confirmed, 1);
+    assert_eq!(summary.recent_completions.nullified, 1);
+    assert_eq!(summary.recent_completions.disputed, 1);
+    assert_eq!(summary.recent_completions.abandoned, 1);
+    assert_eq!(summary.pending_reporters, 10);
+    assert_eq!(summary.formed_today, 7);
+    assert_eq!(summary.confirmed_today, 1);
     db.done().await;
 }
 
@@ -515,6 +680,10 @@ async fn flex_compensation_is_derived_from_the_last_formation(owner: PgPool) {
 
     let outcome = db.matchmaker(2).run_once(at(600)).await.unwrap();
     assert_eq!(outcome.created.len(), 1);
+    assert_eq!(
+        outcome.assignments[0].selection.flex_compensation_count, 1,
+        "the formation log records how many first choices were restored by compensation"
+    );
 
     let role: String = sqlx::query_scalar(
         "select role from formation_players where formation_id = $1 and player_id = $2",

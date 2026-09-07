@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select latest.kind, count(*)::bigint as \"count!\" from ( select distinct on (formation_id) formation_id, kind, occurred_at from formation_events order by formation_id, id desc ) latest where latest.kind = any($1) and latest.occurred_at > $2::timestamptz - interval '15 minutes' and latest.occurred_at <= $2::timestamptz group by latest.kind",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_events",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "76e5b05c5ab7fb10e05e48ca1b4136e37f73e565d4c4097dfc7e79852ffb78c6"
+}

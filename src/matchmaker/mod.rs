@@ -20,7 +20,10 @@ pub mod repository;
 pub mod runner;
 pub mod select;
 
-pub use repository::{AssignedFormation, MatchmakerRepository, MatchmakerSummary, RunOutcome};
+pub use repository::{
+    ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerRepository,
+    MatchmakerSummary, RecentCompletionCounts, RunOutcome, SelectionMetrics,
+};
 pub use runner::{Matchmaker, MatchmakerConfig, MatchmakerConfigError};
 pub use select::{
     Candidate, MATCH_SIZE, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch,

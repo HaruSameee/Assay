@@ -135,12 +135,24 @@ pub fn matchmaker_run_log(outcome: &RunOutcome, at: Timestamp) -> OutgoingMessag
         outcome.assignments.len()
     );
     for assigned in &outcome.assignments {
+        let selection = &assigned.selection;
         content.push_str(&format!(
-            "- {} → vc{} (<#{}> / <#{}>)\n",
+            "- {} → vc{} (<#{}> / <#{}>)\n  レート帯: {}〜{}（幅 {}） / チーム平均差: {}\n  待ち時間: 合計 {} / 最長 {} / 最短 {}\n  希望順位: 第1 {}人 / 第2 {}人 / 第3 {}人\n  フレックス補償: {}人\n",
             match_label(assigned.formation_id),
             assigned.vc.label,
             assigned.vc.red_channel_id,
-            assigned.vc.blue_channel_id
+            assigned.vc.blue_channel_id,
+            rating(selection.minimum_rating),
+            rating(selection.maximum_rating),
+            rating(selection.maximum_rating - selection.minimum_rating),
+            rating(selection.team_average_difference),
+            duration_minutes(selection.total_wait_seconds),
+            duration_minutes(selection.longest_wait_seconds),
+            duration_minutes(selection.shortest_wait_seconds),
+            selection.first_choice_count,
+            selection.second_choice_count,
+            selection.third_choice_count,
+            selection.flex_compensation_count,
         ));
     }
     content.push_str(&format!(
@@ -165,12 +177,40 @@ pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> Outgoin
     let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
     OutgoingMessage {
         content: format!(
-            "**マッチメイカ 15分サマリ {} JST**\nキュー中: {}人\n直近15分の成立: {}組\n待ち時間: 中央値 {} / 最長 {}",
+            "**マッチメイカ 15分サマリ {} JST**\n\
+             キュー中: {}人\n\
+             第1希望: 上キャリー {} / サポート {} / 中央 {} / 下キャリー {} / タンク {}\n\
+             待ち時間: 中央値 {} / 最長 {}\n\
+             VC: 使用中 {} / {}組\n\
+             進行中: {}試合（ホスト待ち {} / コード待ち {} / 報告待ち {} / 係争対応待ち {}）\n\
+             直近15分の成立: {}組\n\
+             直近15分の終了: 確定 {} / 無効試合 {} / 係争 {} / 放棄 {}\n\
+             未報告で停止: {}人\n\
+             本日累計: 成立 {}組 / 確定 {}組",
             at.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
             summary.queued,
-            summary.formed_last_15_minutes,
+            summary.first_choice_roles.top_carry,
+            summary.first_choice_roles.top_support,
+            summary.first_choice_roles.jungle,
+            summary.first_choice_roles.bot_carry,
+            summary.first_choice_roles.bot_tank,
             wait_minutes(summary.median_wait_seconds),
-            wait_minutes(summary.longest_wait_seconds)
+            wait_minutes(summary.longest_wait_seconds),
+            summary.vc_in_use,
+            summary.vc_total,
+            summary.active.total(),
+            summary.active.awaiting_host,
+            summary.active.awaiting_code,
+            summary.active.awaiting_reports,
+            summary.active.awaiting_resolution,
+            summary.formed_last_15_minutes,
+            summary.recent_completions.confirmed,
+            summary.recent_completions.nullified,
+            summary.recent_completions.disputed,
+            summary.recent_completions.abandoned,
+            summary.pending_reporters,
+            summary.formed_today,
+            summary.confirmed_today,
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
@@ -179,6 +219,18 @@ pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> Outgoin
 
 fn wait_minutes(seconds: Option<u64>) -> String {
     seconds.map_or_else(|| "なし".to_owned(), |value| format!("{}分", value / 60))
+}
+
+fn duration_minutes(seconds: u64) -> String {
+    format!("{}分", seconds / 60)
+}
+
+fn rating(value: f64) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{:.0}", value)
+    } else {
+        format!("{value:.1}")
+    }
 }
 
 /// 公開招集チャンネルに出す、成立通知と行き先だけのメッセージ。
@@ -697,8 +749,11 @@ mod tests {
     }
 
     #[test]
-    fn matchmaker_logs_do_not_contain_ratings_or_role_assignments() {
-        use crate::matchmaker::{AssignedFormation, MatchmakerSummary, RunOutcome};
+    fn matchmaker_logs_use_aggregate_selection_metrics_without_player_details() {
+        use crate::matchmaker::{
+            ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerSummary,
+            RecentCompletionCounts, RunOutcome, SelectionMetrics,
+        };
         use crate::persistence::VcAssignment;
 
         let outcome = RunOutcome {
@@ -710,6 +765,18 @@ mod tests {
                     label: "3".into(),
                     red_channel_id: 31,
                     blue_channel_id: 32,
+                },
+                selection: SelectionMetrics {
+                    minimum_rating: 1450.0,
+                    maximum_rating: 1520.0,
+                    team_average_difference: 3.2,
+                    total_wait_seconds: 4_200,
+                    longest_wait_seconds: 900,
+                    shortest_wait_seconds: 180,
+                    first_choice_count: 7,
+                    second_choice_count: 2,
+                    third_choice_count: 1,
+                    flex_compensation_count: 1,
                 },
             }],
             vc_exhausted: false,
@@ -721,18 +788,61 @@ mod tests {
         let summary = matchmaker_summary(
             &MatchmakerSummary {
                 queued: 13,
+                first_choice_roles: FirstChoiceRoleCounts {
+                    top_carry: 3,
+                    top_support: 2,
+                    jungle: 4,
+                    bot_carry: 2,
+                    bot_tank: 2,
+                },
                 formed_last_15_minutes: 1,
                 median_wait_seconds: Some(6 * 60),
                 longest_wait_seconds: Some(18 * 60),
+                vc_in_use: 2,
+                vc_total: 30,
+                active: ActiveFormationCounts {
+                    awaiting_host: 1,
+                    awaiting_code: 1,
+                    awaiting_reports: 1,
+                    awaiting_resolution: 1,
+                },
+                recent_completions: RecentCompletionCounts {
+                    confirmed: 1,
+                    nullified: 2,
+                    disputed: 1,
+                    abandoned: 0,
+                },
+                pending_reporters: 5,
+                formed_today: 8,
+                confirmed_today: 4,
             },
             at,
         );
         assert!(run.content.contains("vc3 (<#31> / <#32>)"));
+        assert!(run.content.contains("レート帯"));
+        assert!(
+            run.content
+                .contains("希望順位: 第1 7人 / 第2 2人 / 第3 1人")
+        );
         assert!(summary.content.contains("中央値 6分 / 最長 18分"));
+        assert!(summary.content.contains("VC: 使用中 2 / 30組"));
+        assert!(summary.content.contains("未報告で停止: 5人"));
+        assert!(summary.content.contains("本日累計: 成立 8組 / 確定 4組"));
+        for forbidden in [
+            "トレーナー1",
+            "top_carry",
+            "top_support",
+            "jungle",
+            "bot_carry",
+            "bot_tank",
+            "<@",
+        ] {
+            assert!(!run.content.contains(forbidden), "{}", run.content);
+        }
+        for forbidden in ["レート", "match-", "トレーナー1", "<@"] {
+            assert!(!summary.content.contains(forbidden), "{}", summary.content);
+        }
         for message in [run, summary] {
-            for forbidden in ["レート", "ロール", "top_carry", "上キャリー", "1500"] {
-                assert!(!message.content.contains(forbidden), "{}", message.content);
-            }
             assert!(message.mention_users.is_empty());
         }
     }
@@ -741,7 +851,10 @@ mod tests {
     #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
     #[test]
     fn dump_discord_tuning_messages_for_review() {
-        use crate::matchmaker::{AssignedFormation, MatchmakerSummary, RunOutcome};
+        use crate::matchmaker::{
+            ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerSummary,
+            RecentCompletionCounts, RunOutcome, SelectionMetrics,
+        };
         use crate::persistence::VcAssignment;
 
         let at = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
@@ -755,6 +868,18 @@ mod tests {
                     red_channel_id: 31,
                     blue_channel_id: 32,
                 },
+                selection: SelectionMetrics {
+                    minimum_rating: 1450.0,
+                    maximum_rating: 1520.0,
+                    team_average_difference: 3.2,
+                    total_wait_seconds: 4_200,
+                    longest_wait_seconds: 900,
+                    shortest_wait_seconds: 180,
+                    first_choice_count: 7,
+                    second_choice_count: 2,
+                    third_choice_count: 1,
+                    flex_compensation_count: 1,
+                },
             }],
             vc_exhausted: false,
             unmatched: 13,
@@ -762,9 +887,33 @@ mod tests {
         };
         let summary = MatchmakerSummary {
             queued: 13,
+            first_choice_roles: FirstChoiceRoleCounts {
+                top_carry: 3,
+                top_support: 2,
+                jungle: 4,
+                bot_carry: 2,
+                bot_tank: 2,
+            },
             formed_last_15_minutes: 1,
             median_wait_seconds: Some(6 * 60),
             longest_wait_seconds: Some(18 * 60),
+            vc_in_use: 2,
+            vc_total: 30,
+            active: ActiveFormationCounts {
+                awaiting_host: 1,
+                awaiting_code: 1,
+                awaiting_reports: 1,
+                awaiting_resolution: 1,
+            },
+            recent_completions: RecentCompletionCounts {
+                confirmed: 1,
+                nullified: 2,
+                disputed: 1,
+                abandoned: 0,
+            },
+            pending_reporters: 5,
+            formed_today: 8,
+            confirmed_today: 4,
         };
         println!(
             "========== 割り当て表 ==========\n{}",

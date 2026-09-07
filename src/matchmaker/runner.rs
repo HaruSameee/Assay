@@ -128,7 +128,7 @@ impl Matchmaker {
 
     /// Discord の 15 分サマリ用に、永続化されたキューと formation を集計する。
     pub async fn summary(&self, now: Timestamp) -> Result<MatchmakerSummary, RepositoryError> {
-        self.repo.summary(now).await
+        self.repo.summary(now, self.vc_pool.len()).await
     }
 }
 

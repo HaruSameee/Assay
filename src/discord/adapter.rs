@@ -189,12 +189,15 @@ impl Adapter {
         .await
     }
 
-    /// 成立の有無にかかわらず、15分ごとの運用サマリを投稿する。
+    /// 15分ごとの運用サマリを投稿する。キューも進行中formationも無いときは投稿しない。
     pub async fn publish_matchmaker_summary(
         &self,
         summary: &MatchmakerSummary,
         occurred_at: chrono::DateTime<Utc>,
     ) -> Result<(), AdapterError> {
+        if !summary.should_publish() {
+            return Ok(());
+        }
         self.publish_operational_log(
             "matchmaker_summary",
             render::matchmaker_summary(summary, occurred_at),

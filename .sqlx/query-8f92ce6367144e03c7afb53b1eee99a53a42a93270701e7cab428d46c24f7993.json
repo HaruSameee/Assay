@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(distinct fp.player_id)::bigint as \"count!\" from formation_players fp where exists ( select 1 from formation_events code_posted where code_posted.formation_id = fp.formation_id and code_posted.kind = $1 ) and not exists ( select 1 from match_reports mr where mr.formation_id = fp.formation_id and mr.player_id = fp.player_id ) and not exists ( select 1 from formation_events exempt where exempt.formation_id = fp.formation_id and exempt.kind = any($2) )",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8f92ce6367144e03c7afb53b1eee99a53a42a93270701e7cab428d46c24f7993"
+}

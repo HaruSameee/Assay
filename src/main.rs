@@ -228,17 +228,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             _ = matchmaker_summary.tick() => {
                 let now = chrono::Utc::now();
-                match matchmaker.summary(now).await {
-                    Ok(summary) => {
-                        if let Err(error) = matchmaker_log_adapter
-                            .publish_matchmaker_summary(&summary, now)
-                            .await
-                        {
-                            error!(%error, "could not record matchmaker summary Discord failure");
+                // 集計やDiscordの再試行で次の3分実行を待たせない。これは15分タイマーの
+                // 実行場所を分けるだけで、別の回復・マッチメイカループは作らない。
+                let summary_matchmaker = matchmaker.clone();
+                let summary_adapter = matchmaker_log_adapter.clone();
+                // 集計・Discord送信は次回のマッチング走査を待たせない。
+                std::mem::drop(tokio::spawn(async move {
+                    match summary_matchmaker.summary(now).await {
+                        Ok(summary) => {
+                            if let Err(error) = summary_adapter
+                                .publish_matchmaker_summary(&summary, now)
+                                .await
+                            {
+                                error!(%error, "could not record matchmaker summary Discord failure");
+                            }
                         }
+                        Err(error) => error!(%error, "matchmaker summary query failed"),
                     }
-                    Err(error) => error!(%error, "matchmaker summary query failed"),
-                }
+                }));
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("shutting down");
