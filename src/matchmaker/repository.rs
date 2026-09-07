@@ -18,12 +18,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{FixedOffset, TimeZone, Utc};
 use sqlx::{PgConnection, PgPool};
 use tracing::{info, warn};
 
-use crate::lifecycle::{FormationId, PlayerId, Timestamp};
+use crate::lifecycle::{FormationEventKind, FormationId, FormationState, PlayerId, Timestamp};
 use crate::persistence::{
-    FormationLog, NewEvent, NewFormation, NewFormationPlayer, RepositoryError, VcAssignment,
+    FormationLog, FormationRepository, NewEvent, NewFormation, NewFormationPlayer, RepositoryError,
+    Team, VcAssignment,
 };
 use crate::queue::flex::{RoleAssignment, flex_compensation_owed};
 use crate::rating::{DEFAULT_DISPLAY_MU, DEFAULT_DISPLAY_SIGMA, DISPLAY_SCALE};
@@ -34,7 +36,7 @@ use super::select::{
 };
 
 /// 1 回の実行の結果。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunOutcome {
     /// 見たキュー中の人数。
     pub candidates: usize,
@@ -51,19 +53,156 @@ pub struct RunOutcome {
 }
 
 /// 成立した formation と、そのトランザクションで永続化した VC 割当。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AssignedFormation {
     pub formation_id: FormationId,
     pub vc: VcAssignment,
+    /// 07 §4-2 の選定結果。運営ログには集計だけを出す。
+    pub selection: SelectionMetrics,
+}
+
+/// 1 formation が選ばれた理由を確認するための集計値。
+///
+/// 個人 ID、表示名、割り当てロールは持たない。成立時の運営ログ専用で、永続化しない。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SelectionMetrics {
+    pub minimum_rating: f64,
+    pub maximum_rating: f64,
+    pub team_average_difference: f64,
+    pub total_wait_seconds: u64,
+    pub longest_wait_seconds: u64,
+    pub shortest_wait_seconds: u64,
+    pub first_choice_count: usize,
+    pub second_choice_count: usize,
+    pub third_choice_count: usize,
+    pub flex_compensation_count: usize,
+}
+
+impl SelectionMetrics {
+    fn from_proposal(proposal: &ProposedMatch) -> Self {
+        let minimum_rating = proposal
+            .players
+            .iter()
+            .map(|player| player.rating)
+            .min_by(f64::total_cmp)
+            .unwrap_or_default();
+        let maximum_rating = proposal
+            .players
+            .iter()
+            .map(|player| player.rating)
+            .max_by(f64::total_cmp)
+            .unwrap_or_default();
+        let mut metrics = Self {
+            minimum_rating,
+            maximum_rating,
+            team_average_difference: (proposal.team_average(Team::Red)
+                - proposal.team_average(Team::Blue))
+            .abs(),
+            total_wait_seconds: proposal
+                .players
+                .iter()
+                .map(|player| player.wait_seconds)
+                .sum(),
+            longest_wait_seconds: proposal
+                .players
+                .iter()
+                .map(|player| player.wait_seconds)
+                .max()
+                .unwrap_or_default(),
+            shortest_wait_seconds: proposal
+                .players
+                .iter()
+                .map(|player| player.wait_seconds)
+                .min()
+                .unwrap_or_default(),
+            flex_compensation_count: proposal
+                .players
+                .iter()
+                .filter(|player| player.flex_compensation_applied)
+                .count(),
+            ..Self::default()
+        };
+        for player in &proposal.players {
+            match player.assigned_preference {
+                1 => metrics.first_choice_count += 1,
+                2 => metrics.second_choice_count += 1,
+                3 => metrics.third_choice_count += 1,
+                priority => debug_assert!(false, "unexpected role preference: {priority}"),
+            }
+        }
+        metrics
+    }
+}
+
+/// キュー中プレイヤーの第 1 希望ロール別人数。`ROLES` と同じ固定の5ロール。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FirstChoiceRoleCounts {
+    pub top_carry: usize,
+    pub top_support: usize,
+    pub jungle: usize,
+    pub bot_carry: usize,
+    pub bot_tank: usize,
+}
+
+impl FirstChoiceRoleCounts {
+    fn set(&mut self, role: &str, count: usize) {
+        match role {
+            "top_carry" => self.top_carry = count,
+            "top_support" => self.top_support = count,
+            "jungle" => self.jungle = count,
+            "bot_carry" => self.bot_carry = count,
+            "bot_tank" => self.bot_tank = count,
+            _ => warn!(role, "unknown first-choice role in queue summary"),
+        }
+    }
+}
+
+/// 現在未終了の formation の内訳。係争はVCを解放済みでも裁定待ちなので別に数える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ActiveFormationCounts {
+    pub awaiting_host: usize,
+    pub awaiting_code: usize,
+    pub awaiting_reports: usize,
+    pub awaiting_resolution: usize,
+}
+
+impl ActiveFormationCounts {
+    pub fn total(self) -> usize {
+        self.awaiting_host + self.awaiting_code + self.awaiting_reports + self.awaiting_resolution
+    }
+}
+
+/// 直近15分に最終状態または係争へ進んだ formation の内訳。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecentCompletionCounts {
+    pub confirmed: usize,
+    pub nullified: usize,
+    pub disputed: usize,
+    pub abandoned: usize,
 }
 
 /// 15 分ごとの運用サマリ。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MatchmakerSummary {
     pub queued: usize,
+    pub first_choice_roles: FirstChoiceRoleCounts,
     pub formed_last_15_minutes: usize,
     pub median_wait_seconds: Option<u64>,
     pub longest_wait_seconds: Option<u64>,
+    pub vc_in_use: usize,
+    pub vc_total: usize,
+    pub active: ActiveFormationCounts,
+    pub recent_completions: RecentCompletionCounts,
+    pub pending_reporters: usize,
+    pub formed_today: usize,
+    pub confirmed_today: usize,
+}
+
+impl MatchmakerSummary {
+    /// 開催時間外に空のサマリを流し続けない。係争もスタッフの対応待ちなので投稿対象。
+    pub fn should_publish(&self) -> bool {
+        self.queued != 0 || self.active.total() != 0
+    }
 }
 
 /// マッチメイカの永続化。接続はアプリ用ロールを想定する。
@@ -166,6 +305,7 @@ impl MatchmakerRepository {
             outcome.assignments.push(AssignedFormation {
                 formation_id,
                 vc: assignment,
+                selection: SelectionMetrics::from_proposal(proposal),
             });
         }
 
@@ -185,8 +325,16 @@ impl MatchmakerRepository {
         Ok(outcome)
     }
 
-    /// 現在のキューと直近 15 分の成立数を DB の時刻から集計する。
-    pub async fn summary(&self, now: Timestamp) -> Result<MatchmakerSummary, RepositoryError> {
+    /// 運営用の15分サマリを、永続化されたキューと formation ログから導出する。
+    ///
+    /// 状態カラムやメモリ上の予約を参照しない。各値は短い読み取りクエリで取得するため、
+    /// 実行中に別の遷移があれば隣接する値がわずかにずれることはあるが、マッチ成立や
+    /// Discord送信を待たせない運用観測値として十分である。
+    pub async fn summary(
+        &self,
+        now: Timestamp,
+        vc_total: usize,
+    ) -> Result<MatchmakerSummary, RepositoryError> {
         let enqueued_at = sqlx::query_scalar!("select enqueued_at from queue_entries")
             .fetch_all(&self.pool)
             .await?;
@@ -205,17 +353,164 @@ impl MatchmakerRepository {
         )
         .fetch_one(&self.pool)
         .await?;
+        let first_choice_rows = sqlx::query!(
+            "select role, count(*)::bigint as \"count!\" \
+             from queue_entry_roles where priority = 1 group by role"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut first_choice_roles = FirstChoiceRoleCounts::default();
+        for row in first_choice_rows {
+            first_choice_roles.set(&row.role, count_as_usize(row.count));
+        }
+
+        // `list_unfinished` は formation_events を Rust の状態機械で畳み込む。
+        // `vc_assigned` の再送やホスト辞退を最終イベント種別だけで取り違えない。
+        let unfinished = FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await?;
+        let mut active = ActiveFormationCounts::default();
+        for formation in &unfinished {
+            match &formation.snapshot.state {
+                FormationState::Matched | FormationState::AwaitingHost { .. } => {
+                    active.awaiting_host += 1;
+                }
+                FormationState::AwaitingCode { .. } => active.awaiting_code += 1,
+                FormationState::InProgress { .. } => active.awaiting_reports += 1,
+                FormationState::Disputed => active.awaiting_resolution += 1,
+                FormationState::Confirmed
+                | FormationState::Nullified
+                | FormationState::Voided
+                | FormationState::Abandoned => {}
+            }
+        }
+
+        let mut conn = self.pool.acquire().await?;
+        let vc_in_use = crate::persistence::repository::occupied_vc_labels(&mut conn)
+            .await?
+            .len();
+        drop(conn);
+
+        let final_kinds: Vec<String> = [
+            FormationEventKind::Confirmed,
+            FormationEventKind::Nullified,
+            FormationEventKind::Disputed,
+            FormationEventKind::Abandoned,
+        ]
+        .iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect();
+        // formationごとの最新イベントだけを見る。例えば係争から裁定済みなら、係争と確定を
+        // 同じ15分に二重計上しない。voided は依頼された4分類に含めない。
+        let recent_rows = sqlx::query!(
+            "select latest.kind, count(*)::bigint as \"count!\" \
+             from ( \
+                 select distinct on (formation_id) formation_id, kind, occurred_at \
+                 from formation_events order by formation_id, id desc \
+             ) latest \
+             where latest.kind = any($1) \
+               and latest.occurred_at > $2::timestamptz - interval '15 minutes' \
+               and latest.occurred_at <= $2::timestamptz \
+             group by latest.kind",
+            &final_kinds[..],
+            now,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut recent_completions = RecentCompletionCounts::default();
+        for row in recent_rows {
+            match row.kind.as_str() {
+                "confirmed" => recent_completions.confirmed = count_as_usize(row.count),
+                "nullified" => recent_completions.nullified = count_as_usize(row.count),
+                "disputed" => recent_completions.disputed = count_as_usize(row.count),
+                "abandoned" => recent_completions.abandoned = count_as_usize(row.count),
+                _ => unreachable!("query limits the event kinds"),
+            }
+        }
+
+        // 報告ゲートと同じ意味: コード開示済みで、本人がまだ1件も報告しておらず、
+        // voided / abandoned で義務が消えていないプレイヤーを重複なしで数える。
+        let report_exempt: Vec<String> =
+            [FormationEventKind::Voided, FormationEventKind::Abandoned]
+                .iter()
+                .map(|kind| kind.as_str().to_owned())
+                .collect();
+        let pending_reporters = sqlx::query_scalar!(
+            "select count(distinct fp.player_id)::bigint as \"count!\" \
+             from formation_players fp \
+             where exists ( \
+                 select 1 from formation_events code_posted \
+                 where code_posted.formation_id = fp.formation_id and code_posted.kind = $1 \
+             ) \
+             and not exists ( \
+                 select 1 from match_reports mr \
+                 where mr.formation_id = fp.formation_id and mr.player_id = fp.player_id \
+             ) \
+             and not exists ( \
+                 select 1 from formation_events exempt \
+                 where exempt.formation_id = fp.formation_id and exempt.kind = any($2) \
+             )",
+            FormationEventKind::CodePosted.as_str(),
+            &report_exempt[..],
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let day_started_at = start_of_jst_day(now);
+        let formed_today = sqlx::query_scalar!(
+            "select count(*)::bigint as \"count!\" from formations \
+             where created_at >= $1 and created_at <= $2",
+            day_started_at,
+            now,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let confirmed_today = sqlx::query_scalar!(
+            "select count(distinct formation_id)::bigint as \"count!\" \
+             from formation_events \
+             where kind = $1 and occurred_at >= $2 and occurred_at <= $3",
+            FormationEventKind::Confirmed.as_str(),
+            day_started_at,
+            now,
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(MatchmakerSummary {
             queued: waits.len(),
+            first_choice_roles,
             formed_last_15_minutes: usize::try_from(formed).unwrap_or(usize::MAX),
             median_wait_seconds,
             longest_wait_seconds,
+            vc_in_use,
+            vc_total,
+            active,
+            recent_completions,
+            pending_reporters: count_as_usize(pending_reporters),
+            formed_today: count_as_usize(formed_today),
+            confirmed_today: count_as_usize(confirmed_today),
         })
     }
 }
 
 fn wait_seconds(now: Timestamp, enqueued_at: Timestamp) -> u64 {
     u64::try_from(now.signed_duration_since(enqueued_at).num_seconds()).unwrap_or(0)
+}
+
+fn count_as_usize(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn start_of_jst_day(now: Timestamp) -> Timestamp {
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
+    let midnight = now
+        .with_timezone(&jst)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid midnight");
+    jst.from_local_datetime(&midnight)
+        .single()
+        .expect("fixed offset has no ambiguous local time")
+        .with_timezone(&Utc)
 }
 
 fn longest_wait(candidates: &[Candidate], now: Timestamp) -> Option<u64> {

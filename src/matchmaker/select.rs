@@ -136,8 +136,19 @@ pub struct ProposedPlayer {
     pub team: Team,
     /// 割り当てられたロール。
     pub role: String,
+    /// 割り当てられたロールの希望順位（1 が第 1 希望）。
+    ///
+    /// formation に保存する必要はない。成立時の運用ログで、選択が希望順位をどれだけ
+    /// 満たしたかを集計するためだけに使う。
+    pub assigned_preference: i16,
     /// 第 1 希望以外を割り当てられたか。次回のフレックス補償の入力になる。
     pub role_was_flexed: bool,
+    /// 前回のフレックスに対する補償が今回の第 1 希望へ適用されたか。
+    ///
+    /// これも成立時ログだけの集計値で、プレイヤーの可変状態には持たない。
+    pub flex_compensation_applied: bool,
+    /// 今回の成立時点での待機時間（秒）。
+    pub wait_seconds: u64,
     /// 表示スケールのレート（凍結値の元）。
     pub rating: f64,
     /// 表示スケールの σ（凍結値の元）。
@@ -222,7 +233,7 @@ fn find_one(pool: &[&Candidate], now: Timestamp) -> Option<(Vec<usize>, Proposed
         }
         if let Some(assignment) = assign_roles(pool, &window, now) {
             let taken = assignment.iter().map(|slot| slot.pool_index).collect();
-            return Some((taken, split_teams(pool, &assignment)));
+            return Some((taken, split_teams(pool, &assignment, now)));
         }
     }
     None
@@ -311,7 +322,7 @@ fn edge_cost(candidate: &Candidate, wish: &RoleWish, wait: i64, longest: i64) ->
 ///
 /// 成立した 10 人に対する総当たり。`C(10,5)/2 = 126` 通りを、先頭のプレイヤーを red に
 /// 固定して数え上げる。各チームに 5 ロールが 1 人ずつ入る分け方だけを残す。
-fn split_teams(pool: &[&Candidate], assignment: &[Slot]) -> ProposedMatch {
+fn split_teams(pool: &[&Candidate], assignment: &[Slot], now: Timestamp) -> ProposedMatch {
     let ratings: Vec<f64> = assignment
         .iter()
         .map(|slot| pool[slot.pool_index].rating)
@@ -359,8 +370,12 @@ fn split_teams(pool: &[&Candidate], assignment: &[Slot]) -> ProposedMatch {
                     Team::Blue
                 },
                 role: ROLES[slot.role_index].to_owned(),
+                assigned_preference: slot.priority,
                 // 第 1 希望以外を割り当てられたか。次回のフレックス補償の入力
                 role_was_flexed: slot.priority != 1,
+                flex_compensation_applied: candidate.flex_compensation && slot.priority == 1,
+                wait_seconds: u64::try_from((now - candidate.enqueued_at).num_seconds())
+                    .unwrap_or(0),
                 rating: candidate.rating,
                 sigma: candidate.sigma,
             }

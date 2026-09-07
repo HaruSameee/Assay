@@ -1752,7 +1752,9 @@ async fn a_failed_summon_is_recorded_without_abandoning_the_formation(owner: PgP
     fixtures("../ops/app_privileges.sql")
 )]
 async fn matchmaker_logs_skip_empty_runs_and_failures_do_not_discard_formations(owner: PgPool) {
-    use unite_matchsystem::matchmaker::{AssignedFormation, MatchmakerSummary, RunOutcome};
+    use unite_matchsystem::matchmaker::{
+        ActiveFormationCounts, AssignedFormation, MatchmakerSummary, RunOutcome, SelectionMetrics,
+    };
 
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
@@ -1764,6 +1766,15 @@ async fn matchmaker_logs_skip_empty_runs_and_failures_do_not_discard_formations(
         .await
         .unwrap();
     assert_eq!(fake.total_sends(), 0, "成立0の回は投稿しない");
+    adapter
+        .publish_matchmaker_summary(&MatchmakerSummary::default(), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.total_sends(),
+        0,
+        "キューも進行中formationも無いサマリは投稿しない"
+    );
 
     db.repo.create_formation(&formation(1)).await.unwrap();
     fake.fail_send_channel.store(997, Ordering::SeqCst);
@@ -1777,6 +1788,7 @@ async fn matchmaker_logs_skip_empty_runs_and_failures_do_not_discard_formations(
                 red_channel_id: 101,
                 blue_channel_id: 102,
             },
+            selection: SelectionMetrics::default(),
         }],
         vc_exhausted: false,
         unmatched: 0,
@@ -1789,10 +1801,12 @@ async fn matchmaker_logs_skip_empty_runs_and_failures_do_not_discard_formations(
     adapter
         .publish_matchmaker_summary(
             &MatchmakerSummary {
-                queued: 0,
                 formed_last_15_minutes: 1,
-                median_wait_seconds: None,
-                longest_wait_seconds: None,
+                active: ActiveFormationCounts {
+                    awaiting_reports: 1,
+                    ..ActiveFormationCounts::default()
+                },
+                ..MatchmakerSummary::default()
             },
             now,
         )
