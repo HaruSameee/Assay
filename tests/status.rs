@@ -177,7 +177,7 @@ async fn the_status_page_shows_only_the_sessions_own_confirmed_matches(owner: Pg
     seed_players(&db, 10).await;
     let oauth = Arc::new(FakeOAuth::new("1001"));
 
-    // 1 試合だけ確定。red 1500 vs blue 1500 で red 勝ち -> p1 +11 / p6 -11
+    // 1 試合だけ確定。red 1500 vs blue 1500 で red 勝ち -> p1 +7 / p6 -7（params v2）
     confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
     // 2 試合目は in_progress のまま（確定していない）
     play(&db, 2, 1500.0, 1500.0).await;
@@ -185,13 +185,13 @@ async fn the_status_page_shows_only_the_sessions_own_confirmed_matches(owner: Pg
     let mut mine = signed_in(&db, &oauth, "1001").await;
     let page = body_text(mine.get("/status").await).await;
     assert_eq!(history_rows(&page), 1, "未確定の試合は行にならない: {page}");
-    assert!(page.contains("1511"), "現在のレート: {page}");
-    assert!(page.contains(">+11<"), "増減: {page}");
+    assert!(page.contains("1507"), "現在のレート: {page}");
+    assert!(page.contains(">+7<"), "増減: {page}");
     assert!(page.contains("勝ち"), "{page}");
     // 日時は JST 表示（21:00 UTC -> 翌日 06:00 JST）
     assert!(page.contains("2026-09-13 06:00"), "{page}");
-    // 他人（p6）のレート 1489 は絶対に出ない
-    assert!(!page.contains("1489"), "{page}");
+    // 他人（p6）のレート 1493 は絶対に出ない
+    assert!(!page.contains("1493"), "{page}");
 
     // クエリで他人の player_id を入れても、出るのは自分の分だけ
     let queried = body_text(
@@ -202,17 +202,14 @@ async fn the_status_page_shows_only_the_sessions_own_confirmed_matches(owner: Pg
         .await,
     )
     .await;
-    assert!(queried.contains("1511"), "自分のレートが出る: {queried}");
-    assert!(!queried.contains("1489"), "他人のレートは出ない: {queried}");
+    assert!(queried.contains("1507"), "自分のレートが出る: {queried}");
+    assert!(!queried.contains("1493"), "他人のレートは出ない: {queried}");
 
-    // 別セッション（p6）からは自分の分だけ（-11 / 負け / 1489）が見える
+    // 別セッション（p6）からは自分の分だけ（-7 / 負け / 1493）が見える
     let mut theirs = signed_in(&db, &oauth, "1006").await;
     let other = body_text(theirs.get("/status").await).await;
-    assert!(other.contains("1489"), "{other}");
-    assert!(
-        other.contains(">-12<") || other.contains(">-11<"),
-        "{other}"
-    );
+    assert!(other.contains("1493"), "{other}");
+    assert!(other.contains(">-8<") || other.contains(">-7<"), "{other}");
     assert!(other.contains("負け"), "{other}");
     assert!(!other.contains("1511"), "p1 のレートは出ない: {other}");
 
@@ -243,8 +240,8 @@ async fn unconfirmed_matches_stay_out_of_the_status_page(owner: PgPool) {
     finish(&db, 2, K::Confirmed, "red").await;
     let page = body_text(browser.get("/status").await).await;
     assert_eq!(history_rows(&page), 1, "{page}");
-    assert!(page.contains(">+12<"), "格上（1600）に勝って +12: {page}");
-    assert!(page.contains("1512"), "{page}");
+    assert!(page.contains(">+8<"), "格上（1600）に勝って +8: {page}");
+    assert!(page.contains("1508"), "{page}");
 
     db.done().await;
 }

@@ -18,10 +18,18 @@ use unite_matchsystem::discord::{
 };
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::match_screen::{MatchRepository, MatchState, router as match_router};
-use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository};
+use unite_matchsystem::matchmaker::{
+    MATCHMAKING_PARAMS_VERSION, Matchmaker, MatchmakerConfig, MatchmakerRepository,
+};
 use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
-use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
-use unite_matchsystem::rating::RatingAdjustmentRepository;
+use unite_matchsystem::queue::{
+    DEFAULT_DOWN_RANGE, MAX_DOWN_RANGE, MIN_DOWN_RANGE, QueueRepository, QueueState, UP_RANGE,
+    router as queue_router,
+};
+use unite_matchsystem::rating::{
+    BASE_DELTA, RATING_GAP_THRESHOLD, RATING_PARAMS_VERSION, RatingAdjustmentRepository,
+    UPSET_ADJUSTMENT,
+};
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
     router as registration_router, site_base_url,
@@ -72,6 +80,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         host_accept_timeout_seconds = lifecycle.host_accept_timeout.as_secs(),
         host_candidate_limit = lifecycle.max_host_candidates,
         "host prompt settings loaded"
+    );
+    // どの params で走っているかを起動ログに残す。レート側は導出値なので凍結せず、
+    // ここに出る版数が「いま全履歴に適用されている式」を指す（00 §3-3）
+    info!(
+        rating_params_version = RATING_PARAMS_VERSION,
+        base_delta = BASE_DELTA,
+        upset_adjustment = UPSET_ADJUSTMENT,
+        rating_gap_threshold = RATING_GAP_THRESHOLD,
+        matchmaking_params_version = MATCHMAKING_PARAMS_VERSION,
+        down_range_min = MIN_DOWN_RANGE,
+        down_range_max = MAX_DOWN_RANGE,
+        down_range_default = DEFAULT_DOWN_RANGE,
+        up_range = UP_RANGE,
+        "rating and matchmaking params loaded"
     );
 
     let pool = PgPoolOptions::new()

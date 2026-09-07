@@ -23,7 +23,7 @@ use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::model::{
     QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS, RolePreference,
-    StaffRemoval, VoiceDestination,
+    StaffRemoval, VoiceDestination, clamp_down_range,
 };
 use super::range::QueuedPlayer;
 
@@ -162,7 +162,7 @@ impl QueueRepository {
             player_id,
             enqueued_at: entry.enqueued_at,
             updated_at: entry.updated_at,
-            down_range: entry.down_range,
+            down_range: clamp_down_range(entry.down_range),
             roles: roles
                 .into_iter()
                 .map(|row| RolePreference {
@@ -203,7 +203,7 @@ impl QueueRepository {
             .map(|row| QueuedPlayer {
                 player_id: PlayerId(row.player_id),
                 rating: row.rating,
-                down_range: row.down_range,
+                down_range: clamp_down_range(row.down_range),
             })
             .collect())
     }

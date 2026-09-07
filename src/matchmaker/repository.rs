@@ -29,6 +29,7 @@ use crate::persistence::{
     Team, VcAssignment,
 };
 use crate::queue::flex::{RoleAssignment, flex_compensation_owed};
+use crate::queue::model::clamp_down_range;
 use crate::rating::{DEFAULT_DISPLAY_MU, DEFAULT_DISPLAY_SIGMA, DISPLAY_SCALE};
 
 use super::select::{
@@ -675,7 +676,7 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
                 player_id: PlayerId(row.player_id),
                 rating: row.rating,
                 sigma: row.sigma,
-                down_range: row.down_range,
+                down_range: clamp_down_range(row.down_range),
                 enqueued_at: row.enqueued_at,
                 roles: by_entry.remove(&row.id).unwrap_or_default(),
                 flex_compensation: flex_compensation_owed(&history),

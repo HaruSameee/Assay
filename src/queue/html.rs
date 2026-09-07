@@ -6,7 +6,7 @@ use crate::lifecycle::Timestamp;
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
 
-use super::model::{MAX_DOWN_RANGE, MIN_DOWN_RANGE};
+use super::model::{DEFAULT_DOWN_RANGE, MAX_DOWN_RANGE, MIN_DOWN_RANGE, UP_RANGE};
 use super::routes::{EntryView, RegistrationBlockView, StatusView};
 
 const QUEUE_STYLES: &str = r#"
@@ -122,13 +122,16 @@ fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String
          <div class=\"field\">\n<label for=\"down-range\">下方向のレート範囲</label>\n\
          <div class=\"range-row\"><input id=\"down-range\" type=\"range\" min=\"{min}\" max=\"{max}\" value=\"{down_range}\">\n\
          <output id=\"down-range-value\" class=\"range-value\" for=\"down-range\">-{down_range}</output></div>\n\
-         <p class=\"field-help\">上方向は +95 固定で、変更できません。下方向のみ -{min} から -{max} まで広げられます。</p>\n</div>\n\
+         <p class=\"field-help\">上方向は +{up} 固定で、変更できません。下方向のみ -{min} から -{max} の範囲で調整できます（既定は -{default}）。\
+         上方向が +{up} で頭を押さえているため、-{up} より広げても組める相手は増えません。</p>\n</div>\n\
          <div class=\"notice\" aria-live=\"polite\"><p>現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p></div>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button type=\"submit\">キューに入る</button></div>\n\
          </form>\n<p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
         min = MIN_DOWN_RANGE,
+        up = UP_RANGE,
+        default = DEFAULT_DOWN_RANGE,
         max = MAX_DOWN_RANGE,
         removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
@@ -497,7 +500,9 @@ mod tests {
             assert!(rendered.contains(&format!("value=\"{role}\"")));
             assert!(rendered.contains(label));
         }
-        assert!(rendered.contains("min=\"95\" max=\"200\""));
+        assert!(rendered.contains("min=\"30\" max=\"100\""));
+        assert!(rendered.contains("value=\"95\""), "既定は -95");
+        assert!(rendered.contains("-95 より広げても組める相手は増えません"));
         assert!(rendered.contains("上方向は +95 固定"));
         assert!(rendered.contains("現在この範囲内でキュー中"));
         assert!(rendered.contains("document.hidden"));

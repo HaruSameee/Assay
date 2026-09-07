@@ -39,8 +39,25 @@ pub const DEFAULT_DISPLAY_SIGMA: f64 = 500.0;
 // 初週の固定増減方式（07 §2-2）
 // ----------------------------------------------------------------------
 
+/// 固定増減方式のパラメータ版数。**下の値を変えたら必ず上げること。**
+///
+/// | 版 | `BASE_DELTA` | `UPSET_ADJUSTMENT` | `RATING_GAP_THRESHOLD` |
+/// |---|---|---|---|
+/// | 1 | 11 | 1 | 50 |
+/// | 2 | 7 | 1 | 50 |
+///
+/// **`formations` には凍結しない。**レーティングは導出値で、`recompute` が唯一の計算経路
+/// （00 §3-2 / §3-3）。params を変えれば過去の全試合が**新しい params で引き直される**のが
+/// 意図した挙動であり、「当時の params で再生する」互換レイヤは作らない。したがって
+/// 試合ごとに版数を凍結すると、どこからも読まれないうえに「当時の値で再生できる」と
+/// 誤読させる列になる。ここは「いまの recompute が使っている版」を 1 か所に置くだけ。
+///
+/// マッチメイキング側の版数は別物（[`crate::matchmaker::MATCHMAKING_PARAMS_VERSION`]。
+/// あちらは選択の費用と範囲の版で、`formations` に凍結する）。
+pub const RATING_PARAMS_VERSION: i32 = 2;
+
 /// 基本の増減幅（表示スケール）。
-pub const BASE_DELTA: f64 = 11.0;
+pub const BASE_DELTA: f64 = 7.0;
 /// 「相手との差」がこれ以上なら ±1 する（表示スケール）。
 pub const RATING_GAP_THRESHOLD: f64 = 50.0;
 /// 格上・格下のときの補正幅。
@@ -75,9 +92,9 @@ pub enum MatchResult {
 ///
 /// | 条件 | 勝ち | 負け |
 /// |---|---|---|
-/// | 差が 50 未満 | +11 | −11 |
-/// | 格上（相手平均が 50 以上高い） | +12 | −10 |
-/// | 格下（相手平均が 50 以上低い） | +10 | −12 |
+/// | 差が 50 未満 | +7 | −7 |
+/// | 格上（相手平均が 50 以上高い） | +8 | −6 |
+/// | 格下（相手平均が 50 以上低い） | +6 | −8 |
 ///
 /// `own` と `opponent_mean` はどちらも**その試合の開始時点の凍結値**
 /// （`formation_players.mu_at_match`）を表示スケールに直したもの。**現在レートを使わない。**
@@ -288,52 +305,52 @@ mod tests {
         }
     }
 
-    /// 差が 50 未満なら ±11。
+    /// 差が 50 未満なら ±7（v2）。
     #[test]
     fn an_even_match_moves_the_base_amount() {
         for gap in [0.0, 1.0, -1.0, 49.0, -49.0, 49.999] {
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
-                11.0,
+                7.0,
                 "gap {gap}"
             );
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
-                -11.0,
+                -7.0,
                 "gap {gap}"
             );
         }
     }
 
-    /// 格上（相手平均が 50 以上高い）: 勝ち +12 / 負け −10。
+    /// 格上（相手平均が 50 以上高い）: 勝ち +8 / 負け −6。
     #[test]
     fn beating_a_stronger_opponent_pays_more_and_losing_costs_less() {
         for gap in [50.0, 51.0, 300.0] {
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
-                12.0,
+                8.0,
                 "gap {gap}"
             );
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
-                -10.0,
+                -6.0,
                 "gap {gap}"
             );
         }
     }
 
-    /// 格下（相手平均が 50 以上低い）: 勝ち +10 / 負け −12。
+    /// 格下（相手平均が 50 以上低い）: 勝ち +6 / 負け −8。
     #[test]
     fn beating_a_weaker_opponent_pays_less_and_losing_costs_more() {
         for gap in [-50.0, -51.0, -300.0] {
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
-                10.0,
+                6.0,
                 "gap {gap}"
             );
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
-                -12.0,
+                -8.0,
                 "gap {gap}"
             );
         }
@@ -350,25 +367,28 @@ mod tests {
     /// ちょうど 50 は「50 以上」に入る（境界）。
     #[test]
     fn the_threshold_is_inclusive() {
-        assert_eq!(match_delta(1500.0, 1550.0, MatchResult::Won), 12.0);
-        assert_eq!(match_delta(1500.0, 1450.0, MatchResult::Won), 10.0);
+        assert_eq!(match_delta(1500.0, 1550.0, MatchResult::Won), 8.0);
+        assert_eq!(match_delta(1500.0, 1450.0, MatchResult::Won), 6.0);
         // 直前の値は基本値のまま
-        assert_eq!(match_delta(1500.0, 1549.9, MatchResult::Won), 11.0);
-        assert_eq!(match_delta(1500.0, 1450.1, MatchResult::Won), 11.0);
+        assert_eq!(match_delta(1500.0, 1549.9, MatchResult::Won), 7.0);
+        assert_eq!(match_delta(1500.0, 1450.1, MatchResult::Won), 7.0);
     }
 
     // ------------------------------------------------------------------
     // 畳み込み
     // ------------------------------------------------------------------
 
-    /// 1 勝した 1500 は 1511 になる（07 §3-2 のプール融合の前提）。
+    /// 1 勝した 1500 は 1507 になる（v2。07 §3-2 のプール融合の前提）。
+    ///
+    /// 増減を 11 から 7 に下げても、**1 勝でプールが融合する**という 07 §3-2 の筋は保つ。
+    /// ただし余裕は 6（1600 − 1511 = 89）から 2（1600 − 1507 = 93）に縮む。
     #[test]
-    fn one_win_takes_a_fresh_player_to_fifteen_eleven() {
+    fn one_win_takes_a_fresh_player_into_the_upper_pool() {
         let initial = initial_rating([]);
         assert_eq!(initial.mu * DISPLAY_SCALE, 1500.0);
         let rating = display_rating(initial, &[played(1500.0, 1500.0, MatchResult::Won)]);
-        assert_eq!(rating, 1511.0);
-        // 1600 との差は 89 で、上方向の固定幅 95 の内側に入る
+        assert_eq!(rating, 1507.0);
+        // 1600 との差は 93 で、上方向の固定幅 95 の内側に入る
         assert!(1600.0 - rating <= 95.0);
     }
 
@@ -386,8 +406,8 @@ mod tests {
         reversed.reverse();
         let backward = display_rating(initial_rating([]), &reversed);
         assert_eq!(forward, backward);
-        // +12, -12, 0, +11
-        assert_eq!(forward, 1500.0 + 11.0);
+        // +8, -8, 0, +7
+        assert_eq!(forward, 1500.0 + 7.0);
     }
 
     /// 実績考慮の +100 は第二の初期値ではなく、調整ログの 1 行として効く（07 §2-1）。
@@ -400,10 +420,10 @@ mod tests {
             reverts_id: None,
         }]);
         assert_eq!(seeded.mu * DISPLAY_SCALE, 1600.0);
-        // 1600 の人が同格に勝てば 1611
+        // 1600 の人が同格に勝てば 1607
         assert_eq!(
             display_rating(seeded, &[played(1600.0, 1600.0, MatchResult::Won)]),
-            1611.0
+            1607.0
         );
     }
 

@@ -257,22 +257,22 @@ async fn the_view_produces_the_documented_numbers(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 10).await;
 
-    // 差 0: ±11
+    // 差 0: ±7（params v2）
     confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
-    assert_eq!(view_delta(&db, player(1), fid(1)).await, 11.0);
-    assert_eq!(view_delta(&db, player(6), fid(1)).await, -11.0);
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 7.0);
+    assert_eq!(view_delta(&db, player(6), fid(1)).await, -7.0);
 
     // red 1500 / blue 1600 で red 勝ち。
-    // red から見れば格上に勝って +12、blue から見れば**格下に負けて** -12
+    // red から見れば格上に勝って +8、blue から見れば**格下に負けて** -8
     confirmed_match(&db, 2, 1500.0, 1600.0, "red").await;
-    assert_eq!(view_delta(&db, player(1), fid(2)).await, 12.0);
-    assert_eq!(view_delta(&db, player(6), fid(2)).await, -12.0);
+    assert_eq!(view_delta(&db, player(1), fid(2)).await, 8.0);
+    assert_eq!(view_delta(&db, player(6), fid(2)).await, -8.0);
 
     // red 1600 / blue 1500 で red 勝ち。
-    // red は格下に勝って +10、blue は**格上に負けて** -10
+    // red は格下に勝って +6、blue は**格上に負けて** -6
     confirmed_match(&db, 3, 1600.0, 1500.0, "red").await;
-    assert_eq!(view_delta(&db, player(1), fid(3)).await, 10.0);
-    assert_eq!(view_delta(&db, player(6), fid(3)).await, -10.0);
+    assert_eq!(view_delta(&db, player(1), fid(3)).await, 6.0);
+    assert_eq!(view_delta(&db, player(6), fid(3)).await, -6.0);
 
     // 引き分けは双方 0
     confirmed_match(&db, 4, 1500.0, 1600.0, "draw").await;
@@ -313,11 +313,11 @@ async fn only_confirmed_matches_move_the_rating(owner: PgPool) {
     assert_eq!(db.ratings.display_rating(player(6)).await.unwrap(), 1500.0);
 
     // スタッフ裁定で disputed から confirmed へ進めば、その時点で効き始める（04 §1）。
-    // formation 2 は red 1500 / blue 1600 で red 勝ち。red は格上に勝って +12、
-    // blue は格下に負けて -12
+    // formation 2 は red 1500 / blue 1600 で red 勝ち。red は格上に勝って +8、
+    // blue は格下に負けて -8
     finish(&db, 2, K::Confirmed, "red").await;
-    assert_eq!(db.ratings.display_rating(player(1)).await.unwrap(), 1512.0);
-    assert_eq!(db.ratings.display_rating(player(6)).await.unwrap(), 1488.0);
+    assert_eq!(db.ratings.display_rating(player(1)).await.unwrap(), 1508.0);
+    assert_eq!(db.ratings.display_rating(player(6)).await.unwrap(), 1492.0);
 
     db.done().await;
 }
@@ -356,8 +356,8 @@ async fn one_win_bridges_the_fifteen_hundred_and_sixteen_hundred_pools(owner: Pg
 
     assert_eq!(
         queued_rating(&db, climber).await,
-        1511.0,
-        "07 §3-2: one win takes 1500 to 1511"
+        1507.0,
+        "07 §3-2: one win takes 1500 to 1507（params v2）"
     );
     assert_eq!(
         db.queue.in_range_count(climber).await.unwrap(),

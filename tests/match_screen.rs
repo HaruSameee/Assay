@@ -806,20 +806,20 @@ async fn ten_unanimous_reports_confirm_and_show_my_own_delta(owner: PgPool) {
     }
     assert_eq!(state_of(&db, 1).await, S::Confirmed);
 
-    // red の勝ち。player 1 は red なので +11、player 6 は blue なので -11
+    // red の勝ち。params v2 で差 50 未満なので player 1 は +7、player 6 は -7
     let (_, red) = get_json(&app, 1, player(1)).await;
     assert_eq!(red["stage"], "confirmed");
     assert_eq!(red["result"], "won");
-    assert_eq!(red["my_delta"], json!(11.0));
+    assert_eq!(red["my_delta"], json!(7.0));
     let (_, blue) = get_json(&app, 1, player(6)).await;
     assert_eq!(blue["result"], "lost");
-    assert_eq!(blue["my_delta"], json!(-11.0));
+    assert_eq!(blue["my_delta"], json!(-7.0));
 
     let (_, html) = get_html(&app, 1, player(1)).await;
-    assert!(html.contains(">+11<"), "{html}");
+    assert!(html.contains(">+7<"), "{html}");
     assert!(html.contains("href=\"/queue\""), "キューへ戻る導線");
     // 他人の増減は出ない
-    assert!(!html.contains(">-11<"), "{html}");
+    assert!(!html.contains(">-7<"), "{html}");
     db.done().await;
 }
 

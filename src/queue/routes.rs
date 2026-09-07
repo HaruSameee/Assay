@@ -35,7 +35,7 @@ use crate::registration::{
 };
 
 use super::model::{
-    MIN_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, StaffRemoval, UP_RANGE,
+    DEFAULT_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, StaffRemoval, UP_RANGE,
     VoiceDestination, validate_down_range, validate_request,
 };
 use super::repository::{QueueError, QueueRepository};
@@ -127,7 +127,7 @@ struct ShowQuery {
 }
 
 fn default_down_range() -> i32 {
-    MIN_DOWN_RANGE
+    DEFAULT_DOWN_RANGE
 }
 
 /// 登録ゲートの理由。**報告ゲートとは別のフィールドで返す。**
@@ -305,7 +305,9 @@ async fn show_queue(
             unauthenticated()
         };
     };
-    let preview_down_range = query.down_range.or_else(|| html.then_some(MIN_DOWN_RANGE));
+    let preview_down_range = query
+        .down_range
+        .or_else(|| html.then_some(DEFAULT_DOWN_RANGE));
     if let Some(down_range) = preview_down_range
         && let Err(error) = validate_down_range(down_range)
     {
@@ -318,7 +320,7 @@ async fn show_queue(
                 // ヘッダーの描画にだけ必要。ポーリングされる JSON 側では引かない
                 viewer(&app, player_id).await,
                 &status,
-                preview_down_range.unwrap_or(MIN_DOWN_RANGE),
+                preview_down_range.unwrap_or(DEFAULT_DOWN_RANGE),
                 Utc::now(),
             )),
         )

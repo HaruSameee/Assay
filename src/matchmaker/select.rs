@@ -53,7 +53,15 @@ pub const ROLES: [&str; 5] = [
 ///
 /// 後から「どの版で組まれた試合か」を SQL だけで切り分けられるようにするための値で、
 /// アルゴリズムの入力ではない。
-pub const MATCHMAKING_PARAMS_VERSION: i32 = 1;
+///
+/// | 版 | 下方向の範囲 | 上方向 |
+/// |---|---|---|
+/// | 1 | 95〜200（既定 95） | +95 固定 |
+/// | 2 | 30〜100（既定 95） | +95 固定 |
+///
+/// レーティングの版数は別物（[`crate::rating::RATING_PARAMS_VERSION`]。あちらは導出値の
+/// パラメータなので凍結しない）。
+pub const MATCHMAKING_PARAMS_VERSION: i32 = 2;
 
 /// 予測勝率の凍結値。
 ///

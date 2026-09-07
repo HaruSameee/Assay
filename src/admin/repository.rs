@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::queue::model::clamp_down_range;
 use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
@@ -475,7 +476,7 @@ impl AdminRepository {
                 discord_user_id: row.discord_user_id,
                 trainer_name: row.trainer_name,
                 enqueued_at: row.enqueued_at,
-                down_range: row.down_range,
+                down_range: clamp_down_range(row.down_range),
                 rating: row.rating,
                 roles: by_entry.remove(&row.entry_id).unwrap_or_default(),
             })
