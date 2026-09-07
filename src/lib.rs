@@ -4,6 +4,7 @@
 pub mod admin;
 pub mod api;
 pub mod discord;
+pub mod host;
 pub mod lifecycle;
 pub mod match_screen;
 pub mod matchmaker;

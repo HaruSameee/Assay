@@ -15,6 +15,7 @@
 use chrono::FixedOffset;
 use serenity::model::id::UserId;
 
+use crate::host::HostResources;
 use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
 use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
@@ -207,6 +208,58 @@ fn paused_banner(summary: &MatchmakerSummary, jst: FixedOffset) -> String {
     })
 }
 
+/// サマリ末尾に足すホストのリソース行（0〜2 行）。
+///
+/// **読めなかった項目は黙って省く。**`/proc` が読めなくてもサマリ本体は落とさない
+/// （00 §3-6 の方針）。1 項目も読めなければ 1 行も足さない。
+///
+/// ロードアベレージはスナップショットなので、プロセス内に前回値を持たない。
+/// 15 分平均がそのまま 15 分サマリに対応する（[`crate::host`] の冒頭）。
+fn host_lines(host: &HostResources) -> String {
+    if host.is_empty() {
+        return String::new();
+    }
+    let mut lines = String::new();
+    if let Some(load) = host.load {
+        let per_core =
+            load.per_core_percent(host.cores)
+                .map_or_else(String::new, |(one, five, fifteen)| {
+                    format!(
+                        "、{}コア換算 {one}% / {five}% / {fifteen}%",
+                        host.cores.unwrap_or_default()
+                    )
+                });
+        lines.push_str(&format!(
+            "\nホスト負荷: {:.2} / {:.2} / {:.2}（1分 / 5分 / 15分{per_core}）",
+            load.one, load.five, load.fifteen
+        ));
+    }
+    let mut memory = Vec::new();
+    if let Some(usage) = host.memory {
+        memory.push(format!(
+            "使用 {}%（{} / {}）",
+            usage.used_percent(),
+            gibibytes(usage.used_kib()),
+            gibibytes(usage.total_kib)
+        ));
+    }
+    if let Some(rss_kib) = host.process_rss_kib {
+        memory.push(format!("このプロセス {}", mebibytes(rss_kib)));
+    }
+    if !memory.is_empty() {
+        lines.push_str(&format!("\nホストメモリ: {}", memory.join(" / ")));
+    }
+    lines
+}
+
+fn gibibytes(kib: u64) -> String {
+    format!("{:.1}GiB", kib as f64 / 1024.0 / 1024.0)
+}
+
+fn mebibytes(kib: u64) -> String {
+    format!("{}MiB", (kib as f64 / 1024.0).round() as u64)
+}
+
 /// 15分ごとのマッチメイカ運用サマリ。
 pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> OutgoingMessage {
     let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
@@ -222,7 +275,8 @@ pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> Outgoin
              直近15分の成立: {}組\n\
              直近15分の終了: 確定 {} / 無効試合 {} / 係争 {} / 放棄 {}\n\
              未報告で停止: {}人\n\
-             本日累計: 成立 {}組 / 確定 {}組",
+             本日累計: 成立 {}組 / 確定 {}組\
+             {host}",
             at.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
             summary.queued,
             summary.first_choice_roles.top_carry,
@@ -248,6 +302,7 @@ pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> Outgoin
             summary.formed_today,
             summary.confirmed_today,
             paused = paused_banner(summary, jst),
+            host = host_lines(&summary.host),
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
@@ -855,6 +910,7 @@ mod tests {
                 formed_today: 8,
                 confirmed_today: 4,
                 paused: None,
+                host: HostResources::default(),
             },
             at,
         );
@@ -956,6 +1012,7 @@ mod tests {
             formed_today: 8,
             confirmed_today: 4,
             paused: None,
+            host: production_host(),
         };
         println!(
             "========== 割り当て表（red） ==========\n{}",
@@ -1260,5 +1317,163 @@ mod tests {
             since: Utc.with_ymd_and_hms(2026, 9, 12, 12, 30, 0).unwrap(),
             reason: Some("VC が落ちた".to_owned()),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ホストのリソース（15分サマリの末尾）
+    // ------------------------------------------------------------------
+
+    /// 本番（`match.aynm.dev`、2 コア）で実際に読んだ `/proc` の文字列。
+    fn production_host() -> crate::host::HostResources {
+        crate::host::HostResources {
+            load: crate::host::parse_loadavg("0.13 0.09 0.09 1/178 111858\n"),
+            memory: crate::host::parse_meminfo(
+                "MemTotal:        5549640 kB\n\
+                 MemFree:         2629588 kB\n\
+                 MemAvailable:    4717120 kB\n",
+            ),
+            process_rss_kib: crate::host::parse_vm_rss_kib("VmRSS:\t   20912 kB\n"),
+            cores: Some(2),
+        }
+    }
+
+    fn summary_with_host(host: crate::host::HostResources) -> MatchmakerSummary {
+        MatchmakerSummary {
+            queued: 3,
+            host,
+            ..MatchmakerSummary::default()
+        }
+    }
+
+    #[test]
+    fn the_host_lines_come_last_and_use_the_real_production_numbers() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap();
+        let content = matchmaker_summary(&summary_with_host(production_host()), at).content;
+
+        assert!(
+            content.contains(
+                "\nホスト負荷: 0.13 / 0.09 / 0.09（1分 / 5分 / 15分、2コア換算 7% / 5% / 5%）"
+            ),
+            "{content}"
+        );
+        assert!(
+            content.contains("\nホストメモリ: 使用 15%（0.8GiB / 5.3GiB） / このプロセス 20MiB"),
+            "{content}"
+        );
+        // 既存の運用項目より前に出さない
+        let today = content.find("本日累計").expect("本日累計");
+        assert!(
+            content.find("ホスト負荷").expect("ホスト負荷") > today,
+            "{content}"
+        );
+        assert!(
+            content.find("ホストメモリ").expect("ホストメモリ") > today,
+            "{content}"
+        );
+        // 既存の方針は変えない（個人名・レート・ロール割り当ては出さない）
+        for forbidden in ["レート", "トレーナー", "top_carry", "<@"] {
+            assert!(!content.contains(forbidden), "{forbidden}: {content}");
+        }
+    }
+
+    /// 読めなかった項目だけを省く。**サマリ全体は落とさない。**
+    #[test]
+    fn an_unreadable_proc_only_drops_its_own_line() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap();
+        let body = "**マッチメイカ 15分サマリ";
+
+        // 全滅（/proc が無い環境）でも本体は出る
+        let none = matchmaker_summary(&summary_with_host(Default::default()), at).content;
+        assert!(none.contains(body), "{none}");
+        assert!(none.contains("本日累計"), "{none}");
+        assert!(!none.contains("ホスト負荷"), "{none}");
+        assert!(!none.contains("ホストメモリ"), "{none}");
+
+        // loadavg だけ読めた
+        let load_only = matchmaker_summary(
+            &summary_with_host(crate::host::HostResources {
+                load: production_host().load,
+                cores: Some(2),
+                ..Default::default()
+            }),
+            at,
+        )
+        .content;
+        assert!(load_only.contains("ホスト負荷: 0.13"), "{load_only}");
+        assert!(!load_only.contains("ホストメモリ"), "{load_only}");
+
+        // meminfo が読めず RSS だけ読めた
+        let rss_only = matchmaker_summary(
+            &summary_with_host(crate::host::HostResources {
+                process_rss_kib: Some(20_912),
+                ..Default::default()
+            }),
+            at,
+        )
+        .content;
+        assert!(!rss_only.contains("ホスト負荷"), "{rss_only}");
+        assert!(
+            rss_only.contains("ホストメモリ: このプロセス 20MiB"),
+            "{rss_only}"
+        );
+        assert!(
+            !rss_only.contains("ホストメモリ: 使用"),
+            "総量が無ければ使用率は出さない: {rss_only}"
+        );
+
+        // コア数が分からなければ換算だけ落とす
+        let no_cores = matchmaker_summary(
+            &summary_with_host(crate::host::HostResources {
+                cores: None,
+                ..production_host()
+            }),
+            at,
+        )
+        .content;
+        assert!(
+            no_cores.contains("ホスト負荷: 0.13 / 0.09 / 0.09（1分 / 5分 / 15分）"),
+            "{no_cores}"
+        );
+        assert!(!no_cores.contains("コア換算"), "{no_cores}");
+    }
+
+    /// 停止中の見出しは先頭のまま、ホストの行は末尾のまま。両方が共存する。
+    #[test]
+    fn the_pause_banner_stays_first_and_the_host_lines_stay_last() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap();
+        let content = matchmaker_summary(
+            &MatchmakerSummary {
+                paused: Some(paused_by_staff()),
+                host: production_host(),
+                ..MatchmakerSummary::default()
+            },
+            at,
+        )
+        .content;
+        assert!(
+            content.starts_with("**⏸ マッチメイカは停止中です"),
+            "{content}"
+        );
+        assert!(content.ends_with("このプロセス 20MiB"), "{content}");
+    }
+
+    /// キューが空でも投稿する挙動は変えない（停止中の判定にホストは関与しない）。
+    #[test]
+    fn the_host_reading_does_not_change_when_a_summary_is_published() {
+        let quiet = summary_with_host(production_host());
+        assert!(quiet.should_publish(), "キュー 3 人なので投稿する");
+        let empty = MatchmakerSummary {
+            host: production_host(),
+            ..MatchmakerSummary::default()
+        };
+        assert!(
+            !empty.should_publish(),
+            "ホストが読めても、キューも進行中も無ければ投稿しない"
+        );
+        let paused = MatchmakerSummary {
+            paused: Some(paused_by_staff()),
+            ..MatchmakerSummary::default()
+        };
+        assert!(paused.should_publish(), "停止中は空でも投稿する");
     }
 }

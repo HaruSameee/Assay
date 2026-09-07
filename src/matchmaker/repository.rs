@@ -23,6 +23,7 @@ use sqlx::{PgConnection, PgPool};
 use tracing::{info, warn};
 
 use crate::admin::PauseState;
+use crate::host::HostResources;
 use crate::lifecycle::{FormationEventKind, FormationId, FormationState, PlayerId, Timestamp};
 use crate::persistence::{
     FormationLog, FormationRepository, NewEvent, NewFormation, NewFormationPlayer, RepositoryError,
@@ -186,7 +187,9 @@ pub struct RecentCompletionCounts {
 }
 
 /// 15 分ごとの運用サマリ。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `Eq` は付けない（[`host::HostResources`] のロードアベレージが浮動小数点のため）。
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct MatchmakerSummary {
     pub queued: usize,
     pub first_choice_roles: FirstChoiceRoleCounts,
@@ -202,6 +205,9 @@ pub struct MatchmakerSummary {
     pub confirmed_today: usize,
     /// マッチメイカが止められていれば、誰がいつ止めたか。
     pub paused: Option<PauseState>,
+    /// ホストのリソース使用状況。**読めなかった項目は `None`** で、サマリは落とさない。
+    /// DB とは関係が無いので、詰めるのは [`super::runner::Matchmaker::summary`]。
+    pub host: HostResources,
 }
 
 impl MatchmakerSummary {
@@ -519,6 +525,9 @@ impl MatchmakerRepository {
             formed_today: count_as_usize(formed_today),
             confirmed_today: count_as_usize(confirmed_today),
             paused,
+            // ホストのリソースは DB の話ではないので、ここでは既定（全項目 None）のまま。
+            // 詰めるのは Matchmaker::summary（runner.rs）
+            host: HostResources::default(),
         })
     }
 }

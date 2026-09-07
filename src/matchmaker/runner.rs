@@ -127,8 +127,13 @@ impl Matchmaker {
     }
 
     /// Discord の 15 分サマリ用に、永続化されたキューと formation を集計する。
+    ///
+    /// ホストのリソースは DB と関係が無いのでここで足す。[`crate::host::read`] は失敗せず、
+    /// 読めなかった項目が `None` になるだけなので、`/proc` が無い環境でもサマリは出る。
     pub async fn summary(&self, now: Timestamp) -> Result<MatchmakerSummary, RepositoryError> {
-        self.repo.summary(now, self.vc_pool.len()).await
+        let mut summary = self.repo.summary(now, self.vc_pool.len()).await?;
+        summary.host = crate::host::read();
+        Ok(summary)
     }
 }
 
