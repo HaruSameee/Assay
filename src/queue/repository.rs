@@ -21,7 +21,10 @@ use sqlx::PgPool;
 use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 use crate::rating::DEFAULT_DISPLAY_MU;
 
-use super::model::{QueueEntry, QueueEntryId, QueueRequest, RolePreference, VoiceDestination};
+use super::model::{
+    QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS, RolePreference,
+    StaffRemoval, VoiceDestination,
+};
 use super::range::QueuedPlayer;
 
 /// PostgreSQL の SQLSTATE。
@@ -287,6 +290,37 @@ impl QueueRepository {
             team: row.team,
             label: label.to_owned(),
             channel_id: channel_id.to_owned(),
+        }))
+    }
+
+    /// 「運営によってキューから外された」通知。`admin_actions` の最新行から導出する。
+    ///
+    /// **黙って消さない。**キューから消えた理由が分からないと「バグでキューから外れた」と
+    /// 受け取られる。運営が理由を書いていれば、それも本人にそのまま見せる。
+    ///
+    /// 出す条件は「いまキューにいない」ことと、外されたのが
+    /// [`REMOVAL_NOTICE_WINDOW_HOURS`] 以内であること。窓を切るのは、キューの出入りに履歴が
+    /// 無い（可変テーブル）ため「外された後に自分で入り直して自分で抜けた」を区別できず、
+    /// 窓が無いと何日も前の通知が残り続けるから。開催は 21:00〜25:00 なので、1 回の開催と
+    /// その後の確認に足りる長さにしてある。
+    pub async fn staff_removal(
+        &self,
+        player_id: PlayerId,
+        now: Timestamp,
+    ) -> Result<Option<StaffRemoval>, QueueError> {
+        let since = now - chrono::TimeDelta::hours(REMOVAL_NOTICE_WINDOW_HOURS);
+        let row = sqlx::query!(
+            "select occurred_at, reason from admin_actions \
+             where kind = 'queue_removed' and target_player_id = $1 and occurred_at > $2 \
+             order by id desc limit 1",
+            player_id.0,
+            since,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| StaffRemoval {
+            removed_at: row.occurred_at,
+            reason: row.reason,
         }))
     }
 

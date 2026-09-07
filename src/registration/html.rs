@@ -790,7 +790,7 @@ mod tests {
     /// （キュー画面の同じ検査は `queue::html` 側にある）。
     #[test]
     fn every_screen_renders_the_same_header() {
-        use crate::admin::html::{SearchView, search_page};
+        use crate::admin::html::{MatchmakerView, SearchView, search_page};
         use crate::status::StatusSummary;
         use crate::status::html::{StatusView, status_page};
 
@@ -821,6 +821,10 @@ mod tests {
 
         // 管理パネルも同じ外枠を通る。違うのは管理者向けの 1 リンクだけ
         let admin = search_page(&SearchView {
+            matchmaker: MatchmakerView {
+                paused: None,
+                form_key: "k",
+            },
             query: "",
             players: &[],
             recent: &[],
@@ -852,7 +856,7 @@ mod tests {
     #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
     #[test]
     fn dump_every_page_for_review() {
-        use crate::admin::html::{SearchView, search_page};
+        use crate::admin::html::{MatchmakerView, SearchView, search_page};
         use crate::status::StatusSummary;
         use crate::status::html::{StatusView, status_page};
 
@@ -896,6 +900,10 @@ mod tests {
         println!(
             "{}",
             search_page(&SearchView {
+                matchmaker: MatchmakerView {
+                    paused: None,
+                    form_key: "k"
+                },
                 query: "",
                 players: &[],
                 recent: &[],

@@ -22,6 +22,7 @@ use chrono::{FixedOffset, TimeZone, Utc};
 use sqlx::{PgConnection, PgPool};
 use tracing::{info, warn};
 
+use crate::admin::PauseState;
 use crate::lifecycle::{FormationEventKind, FormationId, FormationState, PlayerId, Timestamp};
 use crate::persistence::{
     FormationLog, FormationRepository, NewEvent, NewFormation, NewFormationPlayer, RepositoryError,
@@ -50,6 +51,9 @@ pub struct RunOutcome {
     pub unmatched: usize,
     /// 成立しなかった候補の最長待ち時間（秒）。
     pub longest_unmatched_wait_seconds: Option<u64>,
+    /// 運営がマッチメイカを止めていたか。**止まっていてもループは回る**ので、
+    /// キューの人数と待ち時間は普段どおり数える（何人待たせているかが見えなくなる）。
+    pub paused: bool,
 }
 
 /// 成立した formation と、そのトランザクションで永続化した VC 割当。
@@ -196,12 +200,17 @@ pub struct MatchmakerSummary {
     pub pending_reporters: usize,
     pub formed_today: usize,
     pub confirmed_today: usize,
+    /// マッチメイカが止められていれば、誰がいつ止めたか。
+    pub paused: Option<PauseState>,
 }
 
 impl MatchmakerSummary {
     /// 開催時間外に空のサマリを流し続けない。係争もスタッフの対応待ちなので投稿対象。
+    ///
+    /// **停止中は必ず投稿する。**キューが空でも運営ログに定期的に出し続けないと、
+    /// 止めたまま忘れる（当日いちばん危ない失敗）。
     pub fn should_publish(&self) -> bool {
-        self.queued != 0 || self.active.total() != 0
+        self.paused.is_some() || self.queued != 0 || self.active.total() != 0
     }
 }
 
@@ -237,6 +246,25 @@ impl MatchmakerRepository {
             longest_unmatched_wait_seconds: longest_wait(&candidates, now),
             ..RunOutcome::default()
         };
+
+        // 運営が止めていれば **formation を作らない**。ループ自体は回り続けるので、
+        // キューの人数と最長待ち時間は数えたうえで戻る（止めている間も観測は続ける）。
+        //
+        // 停止状態は `admin_actions` の最新行から導出する。**同じトランザクション**で読むので、
+        // 停止の追記とマッチ成立が同時に起きても、advisory lock がどちらか一方に決める。
+        // プロセス内のフラグにしないのは、再起動で勝手に再開してしまうため。
+        if let Some(pause) = crate::admin::repository::matchmaker_pause_on(&mut tx).await? {
+            outcome.paused = true;
+            tx.commit().await?;
+            info!(
+                queued = outcome.candidates,
+                paused_by = pause.actor_discord_user_id,
+                paused_since = %pause.since,
+                "matchmaker is paused; forming no matches"
+            );
+            return Ok(outcome);
+        }
+
         let proposals = select_matches(&candidates, now);
         if proposals.is_empty() {
             tx.commit().await?;
@@ -389,6 +417,8 @@ impl MatchmakerRepository {
         let vc_in_use = crate::persistence::repository::occupied_vc_labels(&mut conn)
             .await?
             .len();
+        // 停止中は運営ログへ定期的に出し続ける（止めたまま忘れない）
+        let paused = crate::admin::repository::matchmaker_pause_on(&mut conn).await?;
         drop(conn);
 
         let final_kinds: Vec<String> = [
@@ -488,6 +518,7 @@ impl MatchmakerRepository {
             pending_reporters: count_as_usize(pending_reporters),
             formed_today: count_as_usize(formed_today),
             confirmed_today: count_as_usize(confirmed_today),
+            paused,
         })
     }
 }

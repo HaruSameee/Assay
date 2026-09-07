@@ -4,11 +4,15 @@
 //! 打ち消しは行ごとの POST フォーム（`/admin/revert`）で、ボタンは**未打ち消しの
 //! 通常行にだけ**出す（権威は DB の unique index とトリガー。ここは表示の面倒だけ）。
 
+use chrono::{DateTime, Utc};
+
+use crate::queue::html::role_label;
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
-use super::repository::{AdjustmentRow, FoundPlayer};
+use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
+use super::repository::{AdjustmentRow, FoundPlayer, QueuedEntry};
 
 /// 検索画面に渡すデータ。
 #[derive(Debug, Clone)]
@@ -19,6 +23,8 @@ pub struct SearchView<'a> {
     pub players: &'a [FoundPlayer],
     /// 直近の調整履歴（新しい順）。
     pub recent: &'a [AdjustmentRow],
+    /// マッチメイカの停止・再開。**当日いちばん先に触る操作なので入口の画面に置く。**
+    pub matchmaker: MatchmakerView<'a>,
     /// 操作後の通知。
     pub notice: Option<Notice>,
 }
@@ -32,6 +38,8 @@ pub struct PlayerView<'a> {
     /// 調整フォームの冪等キー（フォーム描画時にサーバ発行。同一フォームの
     /// 二重送信は同じキーを持つので、2 回目の送信は行を増やさない）。
     pub form_key: &'a str,
+    /// 現在のブロック枠（`admin_actions` の最新行からの導出値。既定は 2）。
+    pub block_allowance: i32,
     pub notice: Option<Notice>,
 }
 
@@ -86,6 +94,20 @@ button.revert:hover { border-color: var(--danger); color: var(--danger); }
 dl.fields { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; }
 dl.fields dt { color: var(--muted); font-weight: 650; }
 dl.fields dd { margin: 0; }
+.admin-nav { margin: -8px 0 18px; color: var(--muted); font-size: 0.9rem; }
+.admin-nav a { color: var(--muted); }
+.ops { margin: 20px 0 28px; padding: 18px 20px; border: 1px solid var(--border);
+      border-radius: 8px; background: var(--surface); }
+.ops h2 { margin-top: 0; }
+.ops form { margin-top: 12px; }
+.state { display: inline-block; margin-left: 6px; border-radius: 999px; padding: 1px 12px;
+         font-size: 0.82rem; font-weight: 700; vertical-align: middle; }
+.state-running { border: 1px solid var(--border); color: var(--accent); }
+.state-paused { border: 1px solid var(--danger); color: var(--danger); }
+table.log td form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0; }
+table.log td form input[type="text"] { width: 12rem; margin: 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden;
+           clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 "#;
 
@@ -212,9 +234,11 @@ pub fn search_page(view: &SearchView<'_>) -> String {
              <section aria-labelledby=\"admin-title\">\n\
              <p class=\"eyebrow\">Admin</p>\n\
              <h1 id=\"admin-title\">レート調整パネル</h1>\n\
+             {nav}\
              <p class=\"lead\">調整は <strong>追記のみ</strong> です。既存の行は変更も削除もできず、\
              取り消しは「打ち消し行」の追記で行います。</p>\n\
              {notice}\
+             {matchmaker}\
              <form method=\"get\" action=\"/admin\">\
              <label for=\"q\">プレイヤー検索</label>\
              <input id=\"q\" name=\"q\" type=\"search\" value=\"{q}\" placeholder=\"トレーナー名または Discord ID\">\
@@ -224,7 +248,9 @@ pub fn search_page(view: &SearchView<'_>) -> String {
              <h2>直近の調整履歴</h2>\n\
              {recent}\
              </section>\n",
+            nav = admin_nav("/admin"),
             notice = notice_html(view.notice.as_ref()),
+            matchmaker = matchmaker_section(view.matchmaker),
             q = escape(view.query),
             found = found,
             recent = adjustments_table(view.recent, true),
@@ -243,11 +269,25 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
              <section aria-labelledby=\"admin-player-title\">\n\
              <p class=\"eyebrow\">Admin</p>\n\
              <h1 id=\"admin-player-title\">{name}</h1>\n\
+             {nav}\
              <dl class=\"fields\">\n\
              <dt>Discord ID</dt><dd>{discord}</dd>\n\
              <dt>player id</dt><dd>{player_id}</dd>\n\
+             <dt>ブロック枠</dt><dd>{allowance} 枠</dd>\n\
              </dl>\n\
              {notice}\
+             <h2>ブロック枠</h2>\n\
+             <p class=\"fine-print\">既定は 2 枠です。変更は追記として記録され、\
+             ブロック機能が入ったときにこの値が参照されます。0〜{max} の整数で指定します。</p>\n\
+             <form method=\"post\" action=\"/admin/blocks\">\
+             <input type=\"hidden\" name=\"player\" value=\"{player_id}\">\
+             <input type=\"hidden\" name=\"key\" value=\"blocks:{form_key}\">\
+             <label for=\"allowance\">ブロック枠</label>\
+             <input id=\"allowance\" name=\"allowance\" type=\"number\" min=\"0\" max=\"{max}\" step=\"1\" value=\"{allowance}\" required>\
+             <label for=\"allowance_reason\">理由（任意・操作ログに残ります）</label>\
+             <input id=\"allowance_reason\" name=\"reason\" type=\"text\" maxlength=\"200\">\
+             <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">ブロック枠を変更</button></div>\
+             </form>\n\
              <h2>調整の追記</h2>\n\
              <p class=\"fine-print\">入力は表示スケール（レートの表示と同じ単位）です。\
              内部的な μ / σ への変換は既存の経路で行われます。理由は必須です。</p>\n\
@@ -269,8 +309,11 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
              {history}\
              </section>\n",
             name = escape(view.player.trainer_name.as_deref().unwrap_or("(未設定)")),
+            nav = admin_nav("/admin/player"),
             discord = view.player.discord_user_id,
             player_id = escape(&view.player.player_id.to_string()),
+            allowance = view.block_allowance,
+            max = MAX_BLOCK_ALLOWANCE,
             notice = notice_html(view.notice.as_ref()),
             form_key = escape(view.form_key),
             history = adjustments_table(view.adjustments, false),
@@ -278,12 +321,256 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
     )
 }
 
+// ----------------------------------------------------------------------
+// 当日の運用（マッチメイカの停止・再開 / キュー中の一覧と強制離脱 / 操作履歴）
+// ----------------------------------------------------------------------
+
+/// マッチメイカの停止・再開ブロックに渡すデータ。
+#[derive(Debug, Clone, Copy)]
+pub struct MatchmakerView<'a> {
+    /// 停止中なら誰がいつ止めたか。`None` は稼働中。
+    pub paused: Option<&'a PauseState>,
+    /// 停止 / 再開フォームの冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+}
+
+/// キュー中の一覧画面（`/admin/queue`）に渡すデータ。
+#[derive(Debug, Clone)]
+pub struct QueueView<'a> {
+    /// 同じ画面からマッチメイカも止められるようにする（事故対応で画面を跨がせない）。
+    pub matchmaker: MatchmakerView<'a>,
+    /// キュー中の一覧（待ち時間の長い順）。
+    pub entries: &'a [QueuedEntry],
+    /// 直近の運営操作。誰がいつ何をしたかをこの画面で読めるようにする。
+    pub actions: &'a [AdminActionRow],
+    /// 強制離脱フォームの冪等キー（行ごとに player id を足して使う）。
+    pub form_key: &'a str,
+    /// 待ち時間の基準時刻。
+    pub now: DateTime<Utc>,
+    pub notice: Option<Notice>,
+}
+
+/// 管理パネル内の行き来。画面を跨いでも当日の導線を見失わないようにする。
+fn admin_nav(current: &str) -> String {
+    let link = |href: &str, label: &str| {
+        if href == current {
+            format!("<strong>{label}</strong>")
+        } else {
+            format!("<a href=\"{href}\">{label}</a>")
+        }
+    };
+    format!(
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {}</nav>\n",
+        link("/admin", "レート調整"),
+        link("/admin/queue", "キューと運用"),
+    )
+}
+
+/// マッチメイカの状態と、停止 / 再開のフォーム。
+///
+/// **状態は DB から導出した値**（`admin_actions` の最新行）で、プロセス内のフラグではない。
+/// 止めたまま再起動しても停止のままになる。
+fn matchmaker_section(view: MatchmakerView<'_>) -> String {
+    let (state, detail, action, button, help) = match view.paused {
+        Some(pause) => (
+            "<span class=\"state state-paused\">停止中</span>",
+            format!(
+                "<p class=\"fine-print\">{} に discord:{} が停止しました。理由: {}</p>\n",
+                escape(&display_time(pause.since)),
+                pause.actor_discord_user_id,
+                escape(pause.reason.as_deref().unwrap_or("（記載なし）")),
+            ),
+            "resume",
+            "マッチメイカを再開",
+            "再開すると、次の実行から通常どおり試合が成立します。",
+        ),
+        None => (
+            "<span class=\"state state-running\">稼働中</span>",
+            String::new(),
+            "pause",
+            "マッチメイカを停止",
+            "停止しても、進行中の試合とキューはそのままです。新しい試合が成立しなくなるだけで、\
+             サービス自体は動き続けます。",
+        ),
+    };
+    format!(
+        "<section class=\"ops\" aria-labelledby=\"matchmaker-title\">\n\
+         <h2 id=\"matchmaker-title\">マッチメイカ {state}</h2>\n\
+         {detail}\
+         <p class=\"fine-print\">{help}</p>\n\
+         <form method=\"post\" action=\"/admin/matchmaker\">\
+         <input type=\"hidden\" name=\"action\" value=\"{action}\">\
+         <input type=\"hidden\" name=\"key\" value=\"matchmaker:{key}\">\
+         <label for=\"matchmaker-reason\">理由（任意・操作ログに残ります）</label>\
+         <input id=\"matchmaker-reason\" name=\"reason\" type=\"text\" maxlength=\"200\">\
+         <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">{button}</button></div>\
+         </form>\n</section>\n",
+        key = escape(view.form_key),
+        help = escape(help),
+    )
+}
+
+/// 待ち時間の表示。秒は出さない（当日の判断に要らない）。
+fn wait_label(now: DateTime<Utc>, enqueued_at: DateTime<Utc>) -> String {
+    let seconds = now
+        .signed_duration_since(enqueued_at)
+        .num_seconds()
+        .max(0)
+        .unsigned_abs();
+    let minutes = seconds / 60;
+    if minutes >= 60 {
+        format!("{}時間{}分", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}分")
+    }
+}
+
+/// 希望ロールを表示名で並べる。**内部識別子を画面に出さない。**
+/// 表記はキュー画面と同じ表を引く（選ぶときと運営が見るときで名前が食い違わない）。
+fn role_wishes(entry: &QueuedEntry) -> String {
+    if entry.roles.is_empty() {
+        return String::from("（なし）");
+    }
+    entry
+        .roles
+        .iter()
+        .map(|wish| format!("{}. {}", wish.priority, escape(role_label(&wish.role))))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// キュー中の一覧と、行ごとの強制離脱フォーム。
+fn queue_table(view: &QueueView<'_>) -> String {
+    if view.entries.is_empty() {
+        return String::from("<p class=\"muted\">キュー中のプレイヤーはいません。</p>\n");
+    }
+    let mut body = String::new();
+    for entry in view.entries {
+        body.push_str(&format!(
+            "<tr><td><a href=\"/admin/player?player={id}\">{name}</a>\
+             <span class=\"fine-print\">{discord}</span></td>\
+             <td class=\"num\">{wait}</td><td>{roles}</td>\
+             <td class=\"num\">-{down_range}</td><td class=\"num\">{rating}</td>\
+             <td><form method=\"post\" action=\"/admin/queue/remove\">\
+             <input type=\"hidden\" name=\"player\" value=\"{id}\">\
+             <input type=\"hidden\" name=\"key\" value=\"queue_removed:{id}:{key}\">\
+             <label class=\"sr-only\" for=\"reason-{id}\">理由</label>\
+             <input id=\"reason-{id}\" name=\"reason\" type=\"text\" maxlength=\"200\" placeholder=\"理由（任意・本人に表示）\">\
+             <button class=\"revert\" type=\"submit\">キューから外す</button>\
+             </form></td></tr>\n",
+            id = escape(&entry.player_id.to_string()),
+            name = escape(entry.trainer_name.as_deref().unwrap_or("(未設定)")),
+            discord = entry.discord_user_id,
+            wait = wait_label(view.now, entry.enqueued_at),
+            roles = role_wishes(entry),
+            down_range = entry.down_range,
+            rating = format_rating(entry.rating),
+            key = escape(view.form_key),
+        ));
+    }
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>トレーナー名</th><th>待ち時間</th><th>ロール希望</th>\
+         <th>下方向</th><th>レート</th><th>操作</th></tr></thead>\n\
+         <tbody>\n{body}</tbody>\n</table></div>\n"
+    )
+}
+
+/// 表示スケールのレート。小数は落とす（一覧の読みやすさ優先）。
+fn format_rating(rating: f64) -> String {
+    format!("{:.0}", rating.round())
+}
+
+/// 運営操作の履歴。**誰がいつ何をしたか**をこの1つの表で読めるようにする。
+fn actions_table(rows: &[AdminActionRow]) -> String {
+    if rows.is_empty() {
+        return String::from("<p class=\"muted\">運営操作の記録はまだありません。</p>\n");
+    }
+    let mut body = String::new();
+    for row in rows {
+        let target = match (row.target_player_id, row.target_trainer_name.as_deref()) {
+            (Some(id), name) => format!(
+                "<a href=\"/admin/player?player={}\">{}</a>",
+                escape(&id.to_string()),
+                escape(name.unwrap_or("(未設定)")),
+            ),
+            (None, _) => String::from("<span class=\"muted\">—</span>"),
+        };
+        let detail = match row.allowance {
+            Some(allowance) => format!("{allowance} 枠"),
+            None => String::new(),
+        };
+        // 知らない種別でも一覧は止めない（生の値をそのまま出す）
+        let kind_label: &str = match row.kind {
+            Some(kind) => kind.label(),
+            None => row.raw_kind.as_str(),
+        };
+        body.push_str(&format!(
+            "<tr><td class=\"num\">{id}</td><td>{at}</td><td>{kind}</td><td>{target}</td>\
+             <td>{detail}</td><td>{reason}</td><td>discord:{actor}</td></tr>\n",
+            id = row.id,
+            at = display_time(row.occurred_at),
+            kind = escape(kind_label),
+            target = target,
+            detail = escape(&detail),
+            reason = escape(row.reason.as_deref().unwrap_or("")),
+            actor = row.actor_discord_user_id,
+        ));
+    }
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>#</th><th>日時</th><th>操作</th><th>対象</th><th>内容</th>\
+         <th>理由</th><th>who</th></tr></thead>\n<tbody>\n{body}</tbody>\n</table></div>\n"
+    )
+}
+
+/// キューと当日の運用（`/admin/queue`）。
+pub fn queue_page(view: &QueueView<'_>) -> String {
+    // この画面は管理者しか到達しない（非管理者は 404）。ヘッダーも管理者のもの
+    page(
+        Viewer::ADMIN,
+        "管理 / キューと運用",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-queue-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-queue-title\">キューと運用</h1>\n\
+             {nav}\
+             {notice}\
+             {matchmaker}\
+             <h2>キュー中（{count}人）</h2>\n\
+             <p class=\"fine-print\">キューから外すと、本人のキュー画面に「運営によってキューから\
+             外されました」と表示されます。理由を書けば、それも本人に表示されます。\
+             進行中の試合には影響しません。</p>\n\
+             {queue}\
+             <h2>運営操作の履歴</h2>\n\
+             {actions}\
+             </section>\n",
+            nav = admin_nav("/admin/queue"),
+            notice = notice_html(view.notice.as_ref()),
+            matchmaker = matchmaker_section(view.matchmaker),
+            count = view.entries.len(),
+            queue = queue_table(view),
+            actions = actions_table(view.actions),
+        ),
+    )
+}
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{TimeDelta, TimeZone, Utc};
     use uuid::Uuid;
 
     use super::*;
+    use crate::admin::actions::{AdminActionKind, DEFAULT_BLOCK_ALLOWANCE};
+    use crate::admin::repository::QueuedRole;
+
+    /// 停止していないマッチメイカ。既存のテストはこの状態を前提にしている
+    fn running() -> MatchmakerView<'static> {
+        MatchmakerView {
+            paused: None,
+            form_key: "form-key",
+        }
+    }
 
     fn player() -> FoundPlayer {
         FoundPlayer {
@@ -324,6 +611,7 @@ mod tests {
             query: "ハル",
             players: &players,
             recent: &recent,
+            matchmaker: running(),
             notice: None,
         });
         assert!(rendered.starts_with("<!doctype html>"));
@@ -339,6 +627,7 @@ mod tests {
             player: &player(),
             adjustments: &[],
             form_key: "0f6f0b7a-6e31-7a2c-9b93-0a3c6f9d2a11",
+            block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             notice: None,
         });
         assert!(rendered.contains("action=\"/admin/adjustments\""));
@@ -360,6 +649,7 @@ mod tests {
             player: &player(),
             adjustments: &rows,
             form_key: "k",
+            block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             notice: None,
         });
         assert_eq!(rendered.matches("action=\"/admin/revert\"").count(), 1);
@@ -376,6 +666,7 @@ mod tests {
             player: &player,
             adjustments: &[],
             form_key: "k",
+            block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             notice: Some(Notice {
                 kind: NoticeKind::Error,
                 message: "<b>not html</b>".to_owned(),
@@ -392,10 +683,237 @@ mod tests {
             query: "",
             players: &[],
             recent: &[],
+            matchmaker: running(),
             notice: None,
         });
         assert!(rendered.contains("color-scheme: dark"));
         assert!(rendered.contains("@media (max-width: 480px)"));
         assert!(rendered.contains("overflow-x: auto"));
+    }
+
+    fn paused_state() -> PauseState {
+        PauseState {
+            actor_discord_user_id: 900000000000000001,
+            since: Utc.with_ymd_and_hms(2026, 9, 12, 12, 30, 0).unwrap(),
+            reason: Some("VC が落ちた".to_owned()),
+        }
+    }
+
+    fn queued(n: u128, minutes_ago: i64) -> QueuedEntry {
+        QueuedEntry {
+            player_id: Uuid::from_u128(n),
+            discord_user_id: 1000 + n as i64,
+            trainer_name: Some(format!("トレーナー{n}")),
+            enqueued_at: Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap()
+                - TimeDelta::minutes(minutes_ago),
+            down_range: 95,
+            rating: 1511.0,
+            roles: vec![
+                QueuedRole {
+                    role: "jungle".to_owned(),
+                    priority: 1,
+                },
+                QueuedRole {
+                    role: "bot_tank".to_owned(),
+                    priority: 2,
+                },
+            ],
+        }
+    }
+
+    fn action(id: i64, kind: AdminActionKind, allowance: Option<i32>) -> AdminActionRow {
+        AdminActionRow {
+            id,
+            kind: Some(kind),
+            raw_kind: kind.as_str().to_owned(),
+            actor_discord_user_id: 900000000000000001,
+            target_player_id: allowance.map(|_| Uuid::from_u128(7)),
+            target_trainer_name: allowance.map(|_| "ハル".to_owned()),
+            reason: Some("荒らし対応".to_owned()),
+            allowance,
+            occurred_at: Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap(),
+        }
+    }
+
+    fn queue_view<'a>(
+        entries: &'a [QueuedEntry],
+        actions: &'a [AdminActionRow],
+        paused: Option<&'a PauseState>,
+    ) -> QueueView<'a> {
+        QueueView {
+            matchmaker: MatchmakerView {
+                paused,
+                form_key: "form-key",
+            },
+            entries,
+            actions,
+            form_key: "form-key",
+            now: Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap(),
+            notice: None,
+        }
+    }
+
+    #[test]
+    fn a_running_matchmaker_offers_pause_and_a_paused_one_offers_resume() {
+        let running_page = search_page(&SearchView {
+            query: "",
+            players: &[],
+            recent: &[],
+            matchmaker: running(),
+            notice: None,
+        });
+        assert!(running_page.contains("<span class=\"state state-running\">稼働中</span>"));
+        assert!(running_page.contains("name=\"action\" value=\"pause\""));
+        assert!(!running_page.contains("value=\"resume\""));
+
+        let pause = paused_state();
+        let paused_page = search_page(&SearchView {
+            query: "",
+            players: &[],
+            recent: &[],
+            matchmaker: MatchmakerView {
+                paused: Some(&pause),
+                form_key: "form-key",
+            },
+            notice: None,
+        });
+        assert!(paused_page.contains("<span class=\"state state-paused\">停止中</span>"));
+        assert!(paused_page.contains("name=\"action\" value=\"resume\""));
+        assert!(!paused_page.contains("value=\"pause\""));
+        // 誰がいつ止めたかを画面に出す（止めたまま忘れないための情報）
+        assert!(paused_page.contains("discord:900000000000000001"));
+        assert!(paused_page.contains("2026-09-12 21:30"), "JST で出す");
+        assert!(paused_page.contains("VC が落ちた"));
+    }
+
+    #[test]
+    fn the_queue_page_lists_the_five_columns_and_a_removal_form_per_row() {
+        let entries = vec![queued(11, 73), queued(12, 4)];
+        let rendered = queue_page(&queue_view(&entries, &[], None));
+        assert!(rendered.starts_with("<!doctype html>"));
+        assert!(rendered.contains("キュー中（2人）"));
+        // トレーナー名 / 待ち時間 / ロール希望 / 下方向の範囲 / レート
+        assert!(rendered.contains("トレーナー11"));
+        assert!(rendered.contains("1時間13分"));
+        assert!(rendered.contains("4分"));
+        assert!(rendered.contains("1. 中央 / 2. タンク"), "表示名で出す");
+        assert!(!rendered.contains("jungle"), "内部識別子を画面に出さない");
+        assert!(rendered.contains(">-95</td>"));
+        assert!(rendered.contains(">1511</td>"));
+        assert_eq!(
+            rendered.matches("action=\"/admin/queue/remove\"").count(),
+            2,
+            "行ごとに強制離脱フォームが出る"
+        );
+        // 理由は任意。本人に見せると画面にも書いてある
+        assert!(rendered.contains("placeholder=\"理由（任意・本人に表示）\""));
+        assert!(rendered.contains("「運営によってキューから外されました」"));
+    }
+
+    #[test]
+    fn an_empty_queue_says_so_instead_of_rendering_an_empty_table() {
+        let rendered = queue_page(&queue_view(&[], &[], None));
+        assert!(rendered.contains("キュー中のプレイヤーはいません"));
+        assert!(!rendered.contains("action=\"/admin/queue/remove\""));
+        assert!(rendered.contains("運営操作の記録はまだありません"));
+    }
+
+    #[test]
+    fn the_action_log_names_who_did_what() {
+        let actions = vec![
+            action(3, AdminActionKind::BlockAllowanceSet, Some(4)),
+            action(2, AdminActionKind::MatchmakerPaused, None),
+        ];
+        let rendered = queue_page(&queue_view(&[], &actions, None));
+        assert!(rendered.contains("ブロック枠の変更"));
+        assert!(rendered.contains("4 枠"));
+        assert!(rendered.contains("マッチメイカ停止"));
+        assert!(rendered.contains("discord:900000000000000001"));
+        assert!(rendered.contains("荒らし対応"));
+    }
+
+    #[test]
+    fn an_unknown_action_kind_still_renders_as_a_row() {
+        // 読み手は知らない種別で止まらない（追記ログは消せない）
+        let mut row = action(9, AdminActionKind::QueueRemoved, None);
+        row.kind = None;
+        row.raw_kind = "matchmaker_exploded".to_owned();
+        let rendered = queue_page(&queue_view(&[], &[row], None));
+        assert!(rendered.contains("matchmaker_exploded"));
+    }
+
+    #[test]
+    fn the_player_page_shows_the_block_allowance_and_its_form() {
+        let rendered = player_page(&PlayerView {
+            player: &player(),
+            adjustments: &[],
+            form_key: "k",
+            block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            notice: None,
+        });
+        assert!(rendered.contains("<dt>ブロック枠</dt><dd>2 枠</dd>"));
+        assert!(rendered.contains("action=\"/admin/blocks\""));
+        assert!(rendered.contains("name=\"key\" value=\"blocks:k\""));
+        assert!(rendered.contains(&format!("max=\"{MAX_BLOCK_ALLOWANCE}\"")));
+        // 調整フォームの冪等キーと衝突しない
+        assert!(rendered.contains("name=\"key\" value=\"k\""));
+    }
+
+    #[test]
+    fn the_queue_page_escapes_user_supplied_text() {
+        let mut entry = queued(11, 1);
+        entry.trainer_name = Some("<script>alert(1)</script>".to_owned());
+        let mut row = action(1, AdminActionKind::QueueRemoved, None);
+        row.reason = Some("<b>not html</b>".to_owned());
+        let rendered = queue_page(&queue_view(&[entry], &[row], None));
+        assert!(!rendered.contains("<script>alert"));
+        assert!(rendered.contains("&lt;script&gt;"));
+        assert!(!rendered.contains("<b>not html</b>"));
+    }
+
+    #[test]
+    fn the_ops_pages_keep_the_shared_dark_theme_and_mobile_layout() {
+        let entries = vec![queued(11, 1)];
+        let rendered = queue_page(&queue_view(&entries, &[], None));
+        assert!(rendered.contains("color-scheme: dark"));
+        assert!(rendered.contains("@media (max-width: 480px)"));
+        assert!(
+            rendered.contains("overflow-x: auto"),
+            "表は横スクロールする"
+        );
+    }
+
+    /// レビュー用に全画面を吐く。`cargo test -- --ignored dump_every_admin_page` で使う。
+    #[test]
+    #[ignore = "レビュー用の出力。通常のテスト実行では回さない"]
+    fn dump_every_admin_page_for_review() {
+        let pause = paused_state();
+        let entries = vec![queued(11, 73), queued(12, 4)];
+        let actions = vec![
+            action(3, AdminActionKind::BlockAllowanceSet, Some(4)),
+            action(2, AdminActionKind::MatchmakerPaused, None),
+        ];
+        for (name, html) in [
+            (
+                "admin-queue-running",
+                queue_page(&queue_view(&entries, &actions, None)),
+            ),
+            (
+                "admin-queue-paused",
+                queue_page(&queue_view(&entries, &actions, Some(&pause))),
+            ),
+            (
+                "admin-player",
+                player_page(&PlayerView {
+                    player: &player(),
+                    adjustments: &[],
+                    form_key: "k",
+                    block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+                    notice: None,
+                }),
+            ),
+        ] {
+            println!("===== {name}\n{html}");
+        }
     }
 }

@@ -88,6 +88,24 @@ impl VoiceDestination {
     }
 }
 
+/// 「運営に外された」通知を出し続ける長さ（時間）。
+///
+/// キューは可変テーブルで出入りの履歴が無い（マイグレーション `20260906140000_queue`）ため、
+/// 「外された後に自分で入り直して自分で抜けた」を区別できない。窓を切らないと、何日も前の
+/// 通知が残り続ける。開催は 21:00〜25:00 なので、1 回の開催とその後の確認に足りる長さにする。
+pub const REMOVAL_NOTICE_WINDOW_HOURS: i64 = 12;
+
+/// 運営がキューから外したことを本人に伝える通知。`admin_actions` の追記から導出する。
+///
+/// **黙って消さない。**理由が分からないと「バグでキューから外れた」と受け取られる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffRemoval {
+    /// 外された時刻。
+    pub removed_at: Timestamp,
+    /// 運営が書いた理由（任意）。**本人にそのまま見せる。**
+    pub reason: Option<String>,
+}
+
 /// 投入リクエストが受け付けられない理由。**値そのものはメッセージに載せてよい**
 /// （秘密ではなく、本人が送った設定なので）。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

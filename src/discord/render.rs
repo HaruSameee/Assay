@@ -185,12 +185,35 @@ pub fn matchmaker_run_log(outcome: &RunOutcome, at: Timestamp) -> OutgoingMessag
     }
 }
 
+/// 停止中に 15 分サマリの先頭へ差し込む見出し。
+///
+/// **止めたまま忘れることを防ぐのが目的**なので、キューが空でもサマリごと投稿する
+/// （`MatchmakerSummary::should_publish`）。
+///
+/// 止めた人はメンションではなく `discord:<id>` の平文で書く。運用ログのメッセージに
+/// メンション構文を混ぜない方針（管理パネルの表示とも揃う）で、15 分ごとに通知が飛ぶ
+/// こともない。
+fn paused_banner(summary: &MatchmakerSummary, jst: FixedOffset) -> String {
+    summary.paused.as_ref().map_or_else(String::new, |pause| {
+        format!(
+            "**⏸ マッチメイカは停止中です。新しい試合は成立しません**\n\
+             停止: {} JST / 操作: discord:{}\n\
+             理由: {}\n\
+             再開するまで新しい試合は組まれません。`/admin` から再開してください。\n\n",
+            pause.since.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
+            pause.actor_discord_user_id,
+            plain_discord_text(pause.reason.as_deref().unwrap_or("記載なし")),
+        )
+    })
+}
+
 /// 15分ごとのマッチメイカ運用サマリ。
 pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> OutgoingMessage {
     let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
     OutgoingMessage {
         content: format!(
-            "**マッチメイカ 15分サマリ {} JST**\n\
+            "{paused}\
+             **マッチメイカ 15分サマリ {} JST**\n\
              キュー中: {}人\n\
              第1希望: 上キャリー {} / サポート {} / 中央 {} / 下キャリー {} / タンク {}\n\
              待ち時間: 中央値 {} / 最長 {}\n\
@@ -224,6 +247,7 @@ pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> Outgoin
             summary.pending_reporters,
             summary.formed_today,
             summary.confirmed_today,
+            paused = paused_banner(summary, jst),
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
@@ -796,6 +820,7 @@ mod tests {
             vc_exhausted: false,
             unmatched: 13,
             longest_unmatched_wait_seconds: Some(12 * 60),
+            paused: false,
         };
         let at = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
         let run = matchmaker_run_log(&outcome, at);
@@ -829,6 +854,7 @@ mod tests {
                 pending_reporters: 5,
                 formed_today: 8,
                 confirmed_today: 4,
+                paused: None,
             },
             at,
         );
@@ -898,6 +924,7 @@ mod tests {
             vc_exhausted: false,
             unmatched: 13,
             longest_unmatched_wait_seconds: Some(12 * 60),
+            paused: false,
         };
         let summary = MatchmakerSummary {
             queued: 13,
@@ -928,6 +955,7 @@ mod tests {
             pending_reporters: 5,
             formed_today: 8,
             confirmed_today: 4,
+            paused: None,
         };
         println!(
             "========== 割り当て表（red） ==========\n{}",
@@ -952,6 +980,17 @@ mod tests {
         println!(
             "========== 15分サマリ ==========\n{}",
             matchmaker_summary(&summary, at).content
+        );
+        println!(
+            "========== 15分サマリ（マッチメイカ停止中） ==========\n{}",
+            matchmaker_summary(
+                &MatchmakerSummary {
+                    paused: Some(paused_by_staff()),
+                    ..summary
+                },
+                at
+            )
+            .content
         );
     }
 
@@ -1178,6 +1217,48 @@ mod tests {
         ));
         for message in messages {
             assert!(message.buttons.is_empty(), "{message:?}");
+        }
+    }
+
+    /// 停止中のサマリは、先頭に停止の見出しを付ける（止めたまま忘れない）。
+    #[test]
+    fn a_paused_summary_leads_with_the_pause_notice() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap();
+        let summary = MatchmakerSummary {
+            paused: Some(paused_by_staff()),
+            ..MatchmakerSummary::default()
+        };
+        let message = matchmaker_summary(&summary, at);
+        assert!(
+            message.content.starts_with("**⏸ マッチメイカは停止中です"),
+            "{}",
+            message.content
+        );
+        // 誰がいつ止めたか。JST で出す
+        assert!(message.content.contains("2026-09-12 21:30 JST"));
+        assert!(message.content.contains("discord:900000000000000001"));
+        assert!(message.content.contains("理由: VC が落ちた"));
+        // 通常のサマリ本文はそのまま続く
+        assert!(message.content.contains("**マッチメイカ 15分サマリ"));
+        // 運用ログにメンション構文を混ぜない（15 分ごとに通知を飛ばさない）
+        assert!(!message.content.contains("<@"));
+        assert!(message.mention_users.is_empty());
+    }
+
+    /// 停止していなければ見出しは出ない。
+    #[test]
+    fn a_running_summary_has_no_pause_notice() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap();
+        let message = matchmaker_summary(&MatchmakerSummary::default(), at);
+        assert!(message.content.starts_with("**マッチメイカ 15分サマリ"));
+        assert!(!message.content.contains("停止中"));
+    }
+
+    fn paused_by_staff() -> crate::admin::PauseState {
+        crate::admin::PauseState {
+            actor_discord_user_id: 900000000000000001,
+            since: Utc.with_ymd_and_hms(2026, 9, 12, 12, 30, 0).unwrap(),
+            reason: Some("VC が落ちた".to_owned()),
         }
     }
 }

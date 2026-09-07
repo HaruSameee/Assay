@@ -1,6 +1,10 @@
 //! 管理パネルのエンドポイント。
 //!
-//! - `GET /admin` 検索と直近の調整履歴
+//! - `GET  /admin` 検索・直近の調整履歴・マッチメイカの停止/再開
+//! - `GET  /admin/queue` キュー中の一覧、強制離脱、運営操作の履歴
+//! - `POST /admin/matchmaker` マッチメイカの停止/再開（`admin_actions` への追記）
+//! - `POST /admin/queue/remove` キューからの強制離脱
+//! - `POST /admin/blocks` ブロック枠の変更
 //! - `GET /admin/player?player=<uuid>` 1 プレイヤーの調整履歴と追記フォーム
 //! - `POST /admin/adjustments` 調整の追記
 //! - `POST /admin/revert` 既存調整の打ち消し（打ち消し行の追記）
@@ -25,9 +29,18 @@ use uuid::Uuid;
 use crate::registration::html::error_page;
 use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
+use super::actions::{
+    AdminActionKind, MAX_BLOCK_ALLOWANCE, normalize_reason, parse_block_allowance,
+};
 use super::config::AdminIds;
-use super::html::{Notice, NoticeKind, PlayerView, SearchView, player_page, search_page};
-use super::repository::{AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment};
+use super::html::{
+    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, SearchView, player_page, queue_page,
+    search_page,
+};
+use super::repository::{
+    ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
+    RemovalOutcome,
+};
 
 /// 検索のヒット上限と、一覧に出す直近ログの件数。
 const SEARCH_LIMIT: i64 = 25;
@@ -75,6 +88,11 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/player", get(show_player))
         .route("/admin/adjustments", post(create_adjustment))
         .route("/admin/revert", post(create_revert))
+        // 当日の運用。どれも `admin_actions` への追記で表す
+        .route("/admin/queue", get(show_queue))
+        .route("/admin/matchmaker", post(control_matchmaker))
+        .route("/admin/queue/remove", post(remove_from_queue))
+        .route("/admin/blocks", post(set_block_allowance))
         .with_state(state)
 }
 
@@ -211,10 +229,23 @@ async fn show_search(
             return internal_error();
         }
     };
+    // 当日の入口の画面。マッチメイカの状態はここでも読めるようにする
+    let paused = match app.store.matchmaker_pause().await {
+        Ok(paused) => paused,
+        Err(err) => {
+            error!(%err, "could not read the matchmaker pause state");
+            return internal_error();
+        }
+    };
+    let key = form_key();
     Html(search_page(&SearchView {
         query,
         players: &players,
         recent: &recent,
+        matchmaker: MatchmakerView {
+            paused: paused.as_ref(),
+            form_key: &key,
+        },
         notice: None,
     }))
     .into_response()
@@ -253,12 +284,21 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
         error!("could not read the adjustment history");
         return internal_error();
     };
+    // 枠数も追記ログからの導出値。行が無ければ既定の 2 枠
+    let block_allowance = match app.store.block_allowance(player_id).await {
+        Ok(allowance) => allowance,
+        Err(err) => {
+            error!(%err, "could not read the block allowance");
+            return internal_error();
+        }
+    };
     // 冪等キーはフォーム描画のたびに発行。同じフォームの再送信は同じキーを持つ
-    let form_key = Uuid::new_v4().to_string();
+    let form_key = form_key();
     Html(player_page(&PlayerView {
         player: &player,
         adjustments: &adjustments,
         form_key: &form_key,
+        block_allowance,
         notice,
     }))
     .into_response()
@@ -417,4 +457,241 @@ async fn create_revert(
 fn parse_delta(raw: &str) -> Option<f64> {
     let value: f64 = raw.trim().parse().ok()?;
     if value.is_finite() { Some(value) } else { None }
+}
+
+// ----------------------------------------------------------------------
+// 当日の運用（マッチメイカの停止・再開 / 強制離脱 / ブロック枠）
+// ----------------------------------------------------------------------
+//
+// どれも `admin_actions` への**追記だけ**で表現する（強制離脱の `queue_entries` からの
+// DELETE を除く。キューは可変テーブル）。現在の状態は最新行から導出するので、
+// 「誰がいつ止めたか」が上書きで消えない。
+
+/// フォームごとに発行する冪等キー。同じフォームの二重送信は同じキーを持つので行が増えない。
+fn form_key() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// キューと運用の画面を描画する。運用操作の後は必ずここへ戻す（結果と履歴が同じ画面で読める）。
+async fn render_queue(app: &AdminState, notice: Option<Notice>) -> Response {
+    let paused = match app.store.matchmaker_pause().await {
+        Ok(paused) => paused,
+        Err(err) => {
+            error!(%err, "could not read the matchmaker pause state");
+            return internal_error();
+        }
+    };
+    let entries = match app.store.queued_entries().await {
+        Ok(entries) => entries,
+        Err(err) => {
+            error!(%err, "could not list the queue");
+            return internal_error();
+        }
+    };
+    let actions = match app.store.recent_actions(RECENT_LIMIT).await {
+        Ok(actions) => actions,
+        Err(err) => {
+            error!(%err, "could not list the recent admin actions");
+            return internal_error();
+        }
+    };
+    let key = form_key();
+    Html(queue_page(&QueueView {
+        matchmaker: MatchmakerView {
+            paused: paused.as_ref(),
+            form_key: &key,
+        },
+        entries: &entries,
+        actions: &actions,
+        form_key: &key,
+        now: Utc::now(),
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_queue(State(app): State<AdminState>, session: Option<CurrentSession>) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_queue(&app, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct MatchmakerForm {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// マッチメイカの停止・再開。
+///
+/// **状態は DB に追記して表す。**プロセス内のフラグにすると、止めたまま再起動したときに
+/// 勝手に動き出す。停止しても `systemctl stop` とは違い、進行中の試合・キュー・報告・
+/// 通知はそのまま動き続ける（止まるのは新しい formation を作ることだけ）。
+async fn control_matchmaker(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<MatchmakerForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    // 受け付けるのはこの 2 つだけ。知らない値は 404（画面に無い操作を作らせない）
+    let kind = match form.action.trim() {
+        "pause" => AdminActionKind::MatchmakerPaused,
+        "resume" => AdminActionKind::MatchmakerResumed,
+        _ => return not_found(),
+    };
+    let input = NewAdminAction {
+        kind,
+        actor_discord_user_id: actor.discord_user_id,
+        target_player_id: None,
+        reason: normalize_reason(&form.reason),
+        payload: serde_json::json!({}),
+        occurred_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.append_action(&input).await {
+        Ok(ActionOutcome::Recorded { .. }) => info(
+            match kind {
+                AdminActionKind::MatchmakerPaused => {
+                    "マッチメイカを停止しました。新しい試合は成立しません。\
+                     進行中の試合・キュー・報告はそのまま動きます。"
+                }
+                _ => "マッチメイカを再開しました。次の実行から試合が成立します。",
+            }
+            .to_owned(),
+        ),
+        Ok(ActionOutcome::Duplicate) => {
+            info("この操作は既に記録されています。状態は変わっていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not record the matchmaker control");
+            return internal_error();
+        }
+    };
+    render_queue(&app, Some(notice)).await
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveForm {
+    #[serde(default)]
+    player: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// キューからの強制離脱。
+///
+/// 進行中の formation には触らない（キューと formation は別の系）。理由は任意だが、
+/// 書けば**本人のキュー画面にそのまま表示される** — 黙って消すと「バグでキューから外れた」と
+/// 受け取られるため。
+async fn remove_from_queue(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<RemoveForm>,
+) -> Response {
+    let Ok(player_id) = Uuid::parse_str(form.player.trim()) else {
+        return not_found();
+    };
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let input = NewAdminAction {
+        kind: AdminActionKind::QueueRemoved,
+        actor_discord_user_id: actor.discord_user_id,
+        target_player_id: Some(player_id),
+        reason: normalize_reason(&form.reason),
+        payload: serde_json::json!({}),
+        occurred_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.remove_from_queue(&input).await {
+        Ok(RemovalOutcome::Removed) => info(
+            "キューから外しました。本人のキュー画面に「運営によってキューから外されました」と\
+             表示されます。"
+                .to_owned(),
+        ),
+        // 記録も残していない（身に覚えのない通知を本人に出さない）
+        Ok(RemovalOutcome::NotQueued) => {
+            fail("そのプレイヤーは既にキューにいません。記録は残していません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not remove a player from the queue");
+            return internal_error();
+        }
+    };
+    render_queue(&app, Some(notice)).await
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockForm {
+    #[serde(default)]
+    player: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    allowance: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// ブロック枠の変更。ブロック機能そのものは未実装で、ここでは**枠数を持つだけ**。
+async fn set_block_allowance(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<BlockForm>,
+) -> Response {
+    let Ok(player_id) = Uuid::parse_str(form.player.trim()) else {
+        return not_found();
+    };
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    // 存在しないプレイヤーは 404 に寄せる（追記してから FK 違反を 500 にしない）
+    match app.store.find_player(player_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(),
+        Err(err) => {
+            error!(%err, "could not read the player before setting the block allowance");
+            return internal_error();
+        }
+    }
+    let Some(allowance) = parse_block_allowance(&form.allowance) else {
+        let notice = fail(format!(
+            "ブロック枠は 0〜{MAX_BLOCK_ALLOWANCE} の整数で入力してください。"
+        ));
+        return render_player(&app, player_id, Some(notice)).await;
+    };
+    let input = NewAdminAction {
+        kind: AdminActionKind::BlockAllowanceSet,
+        actor_discord_user_id: actor.discord_user_id,
+        target_player_id: Some(player_id),
+        reason: normalize_reason(&form.reason),
+        payload: serde_json::json!({ "allowance": allowance }),
+        occurred_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.append_action(&input).await {
+        Ok(ActionOutcome::Recorded { .. }) => {
+            info(format!("ブロック枠を {allowance} 枠に変更しました。"))
+        }
+        Ok(ActionOutcome::Duplicate) => {
+            info("この操作は既に記録されています。枠数は変わっていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not record the block allowance");
+            return internal_error();
+        }
+    };
+    render_player(&app, player_id, Some(notice)).await
 }

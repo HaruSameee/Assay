@@ -35,8 +35,8 @@ use crate::registration::{
 };
 
 use super::model::{
-    MIN_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, UP_RANGE, VoiceDestination,
-    validate_down_range, validate_request,
+    MIN_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, StaffRemoval, UP_RANGE,
+    VoiceDestination, validate_down_range, validate_request,
 };
 use super::repository::{QueueError, QueueRepository};
 
@@ -234,6 +234,27 @@ pub(super) struct StatusView {
     /// 成立済みなら、`vc_assigned` のログから読んだ本人側の集合先。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) destination: Option<DestinationView>,
+    /// 運営にキューから外された直後なら、その通知。**黙って消さない。**
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) removed_by_staff: Option<RemovalView>,
+}
+
+/// 「運営によってキューから外されました」。本人にだけ返す。
+#[derive(Debug, Serialize)]
+pub(super) struct RemovalView {
+    /// 外された時刻。RFC 3339。
+    pub(super) removed_at: String,
+    /// 運営が書いた理由（書かれていなければ `null`）。
+    pub(super) reason: Option<String>,
+}
+
+impl From<StaffRemoval> for RemovalView {
+    fn from(removal: StaffRemoval) -> Self {
+        Self {
+            removed_at: removal.removed_at.to_rfc3339(),
+            reason: removal.reason,
+        }
+    }
 }
 
 /// キュー画面に出す本人側の集合先。
@@ -448,12 +469,24 @@ async fn status(
     } else {
         None
     };
+    // キュー中の人には出さない（外された後に自分で入り直した人に、古い通知を見せない）
+    let removed_by_staff = if entry.is_none() {
+        app.queue
+            .staff_removal(player_id, Utc::now())
+            .await
+            .inspect_err(|error| error!(%error, "could not read the staff removal notice"))
+            .ok()?
+            .map(Into::into)
+    } else {
+        None
+    };
     Some(StatusView {
         queued: entry.is_some(),
         entry: entry.map(EntryView::from),
         in_range,
         eligibility: EligibilityView::from(&eligibility),
         destination,
+        removed_by_staff,
     })
 }
 

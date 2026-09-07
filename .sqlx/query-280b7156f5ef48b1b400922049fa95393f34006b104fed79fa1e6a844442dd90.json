@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select occurred_at, reason from admin_actions where kind = 'queue_removed' and target_player_id = $1 and occurred_at > $2 order by id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "occurred_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "occurred_at"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "280b7156f5ef48b1b400922049fa95393f34006b104fed79fa1e6a844442dd90"
+}

@@ -39,6 +39,7 @@ legend { padding: 0; font-weight: 700; }
   .matched .destination { padding: 18px; }
   .matched .destination strong { font-size: 1.6rem; }
 }
+.notice-removed { border-left: 3px solid var(--danger); }
 .poll-status { min-height: 1.5em; margin-top: 14px; color: var(--danger); font-size: 0.875rem; }
 .button-danger { border-color: #7e3d43; background: transparent; color: var(--danger); }
 .button-danger:hover { border-color: var(--danger); background: var(--danger-bg); }
@@ -109,6 +110,7 @@ fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String
          <div class=\"form-header\">\n<p class=\"eyebrow\">Match queue</p>\n\
          <h1 id=\"queue-title\">キューに参加</h1>\n\
          <p class=\"lead\">希望ロールと、受け入れる下方向のレート範囲を選びます。</p>\n</div>\n\
+         {removal}\
          <form id=\"queue-form\" class=\"queue-form\" novalidate>\n\
          <fieldset class=\"field\"><legend>ロール希望</legend>\n\
          <p class=\"field-help\">第1希望は必須です。第2・第3希望は必要な分だけ選べます。</p>\n\
@@ -128,9 +130,35 @@ fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String
          <script>{script}</script>\n",
         min = MIN_DOWN_RANGE,
         max = MAX_DOWN_RANGE,
+        removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
     );
     page_with_styles(viewer, "キュー", &body, QUEUE_STYLES)
+}
+
+/// 「運営によってキューから外されました」。**黙って消さない**（そうすると
+/// 「バグでキューから外れた」と受け取られる）。運営が理由を書いていればそれも出す。
+///
+/// キュー中の人にはこの通知が来ない（[`crate::queue::routes`] が引かない）ので、
+/// 外された後に入り直せば消える。
+fn removal_notice(status: &StatusView) -> String {
+    let Some(removal) = &status.removed_by_staff else {
+        return String::new();
+    };
+    let reason = removal.reason.as_deref().map_or_else(
+        || {
+            String::from(
+                "<p class=\"fine-print\">理由は記載されていません。運営にお問い合わせください。</p>\n",
+            )
+        },
+        |reason| format!("<p>理由: {}</p>\n", escape(reason)),
+    );
+    format!(
+        "<div class=\"notice notice-removed\" data-removed=\"1\" role=\"status\">\n\
+         <p><strong>運営によってキューから外されました。</strong></p>\n\
+         {reason}\
+         <p class=\"fine-print\">再度キューに入ることはできます。</p>\n</div>\n"
+    )
 }
 
 fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Timestamp) -> String {
@@ -265,7 +293,9 @@ fn registration_gate(block: &RegistrationBlockView) -> String {
     )
 }
 
-fn role_label(role: &str) -> &str {
+/// 内部識別子から画面の表記へ。管理パネルのキュー一覧もこの表を引く
+/// （選ぶときと運営が見るときで名前が食い違わない）。
+pub(crate) fn role_label(role: &str) -> &str {
     ROLE_OPTIONS
         .iter()
         .find_map(|(value, label)| (*value == role).then_some(*label))
@@ -456,6 +486,7 @@ mod tests {
                 pending_reports: Vec::new(),
             },
             destination: None,
+            removed_by_staff: None,
         }
     }
 

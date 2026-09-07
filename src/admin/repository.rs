@@ -1,4 +1,6 @@
-//! 管理パネルの永続化。**`rating_adjustments` への INSERT と、読み取りだけ**を書く。
+//! 管理パネルの永続化。**`rating_adjustments` / `admin_actions` への INSERT と、
+//! 読み取りだけ**を書く。唯一の例外は強制離脱による `queue_entries` からの DELETE で、
+//! これは可変テーブル（マイグレーション `20260906140000_queue` の冒頭）。
 //!
 //! 不変条件（このモジュールで守るもの）:
 //! - 追記専用（00 §3-1）。UPDATE / DELETE は書かない。DB 側でも
@@ -9,9 +11,15 @@
 //! - 冪等は「同一 idempotency_key のみ no-op」。キーが違う行は別操作として通す。
 //!   同じキーで中身が違うものは no-op にせず衝突として返す。
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+use crate::rating::DEFAULT_DISPLAY_MU;
+
+use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
 
 /// PostgreSQL の SQLSTATE。
 const UNIQUE_VIOLATION: &str = "23505";
@@ -309,4 +317,290 @@ fn classify_insert_error(error: sqlx::Error) -> AdminStoreError {
         return AdminStoreError::OriginalMissing;
     }
     AdminStoreError::Database(error)
+}
+
+// ----------------------------------------------------------------------
+// 当日の運用操作（admin_actions）
+// ----------------------------------------------------------------------
+//
+// マイグレーション `20260907120000_admin_actions` と対。ここでも **INSERT と読み取りだけ**を
+// 書く。停止状態も枠数も列に持たず、最新行から導出する（[`super::actions`] の冒頭）。
+
+/// 追記する運営操作 1 行。`actor_discord_user_id` は照合を通った管理者から自動で埋める。
+#[derive(Debug, Clone)]
+pub struct NewAdminAction {
+    /// 操作の種別。
+    pub kind: AdminActionKind,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 対象プレイヤー。マッチメイカの停止・再開では `None`（DB の CHECK と対）。
+    pub target_player_id: Option<Uuid>,
+    /// 運営が書いた理由（任意）。
+    pub reason: Option<String>,
+    /// 構造化コンテキスト。`block_allowance_set` は `{"allowance": N}`。
+    pub payload: serde_json::Value,
+    /// 操作時刻。
+    pub occurred_at: DateTime<Utc>,
+    /// 冪等キー。同じフォームの二重送信は行を増やさない。
+    pub idempotency_key: String,
+}
+
+/// 運営操作の追記結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// 新しい行が入った。
+    Recorded {
+        /// 追記された行の id。
+        id: i64,
+    },
+    /// 同一 `idempotency_key` の行が既にある（no-op）。同じフォームの二重送信。
+    Duplicate,
+}
+
+/// 強制離脱の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalOutcome {
+    /// キューから外し、操作を記録した。
+    Removed,
+    /// そのプレイヤーはキューにいなかった。**記録も残さない**
+    /// （残すと、本人のキュー画面に身に覚えのない通知が出る）。
+    NotQueued,
+}
+
+/// キュー中の 1 人（管理パネルの一覧用）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedEntry {
+    /// 対象プレイヤー。
+    pub player_id: Uuid,
+    /// Discord ID。検索と照合の手掛かり。
+    pub discord_user_id: i64,
+    /// トレーナー名（未設定なら `None`）。
+    pub trainer_name: Option<String>,
+    /// 最初にキューへ入った時刻。待ち時間の表示に使う。
+    pub enqueued_at: DateTime<Utc>,
+    /// 下方向のマッチング範囲（上方向は +95 固定なので列が無い）。
+    pub down_range: i32,
+    /// 表示スケールの現在レート（追記ログからの導出値）。
+    pub rating: f64,
+    /// 希望ロール。`priority` の昇順。
+    pub roles: Vec<QueuedRole>,
+}
+
+/// 希望ロール 1 つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedRole {
+    /// `roles.id`。
+    pub role: String,
+    /// 1 が第1希望。
+    pub priority: i16,
+}
+
+impl AdminRepository {
+    /// 運営操作を追記する。同一 `idempotency_key` があれば行を増やさない（no-op）。
+    pub async fn append_action(
+        &self,
+        input: &NewAdminAction,
+    ) -> Result<ActionOutcome, AdminStoreError> {
+        let mut conn = self.pool.acquire().await?;
+        append_action_on(&mut conn, input).await
+    }
+
+    /// マッチメイカの停止状態。停止中なら誰がいつ止めたかを返す。
+    ///
+    /// **DB が正**なので、プロセスを再起動しても止まったままになる。
+    pub async fn matchmaker_pause(&self) -> Result<Option<PauseState>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        matchmaker_pause_on(&mut conn).await
+    }
+
+    /// そのプレイヤーのブロック枠。行が無ければ [`DEFAULT_BLOCK_ALLOWANCE`]。
+    ///
+    /// ブロック機能そのものは未実装で、いまは枠数を持つだけ（機能側が入ったらここを読む）。
+    pub async fn block_allowance(&self, player_id: Uuid) -> Result<i32, sqlx::Error> {
+        let row = sqlx::query_scalar!(
+            "select (payload->>'allowance')::int as \"allowance!\" \
+             from admin_actions \
+             where kind = $1 and target_player_id = $2 \
+             order by id desc limit 1",
+            AdminActionKind::BlockAllowanceSet.as_str(),
+            player_id,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.unwrap_or(DEFAULT_BLOCK_ALLOWANCE))
+    }
+
+    /// キュー中の一覧（最初に入った順 = 待ち時間の長い順）。
+    ///
+    /// レートは導出値なので現在値のテーブルを持たない。`queue::repository::queued_players` や
+    /// マッチメイカの候補読み込みと同じ式（初期値 + `rating_adjustments` + 確定した試合の増減）。
+    pub async fn queued_entries(&self) -> Result<Vec<QueuedEntry>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, \
+                    p.discord_user_id, p.trainer_name, \
+                    $1::double precision \
+                        + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                                    where a.player_id = q.player_id), 0::double precision) \
+                        + coalesce(m.delta, 0::double precision) \
+                        as \"rating!\" \
+             from queue_entries q \
+             join players p on p.id = q.player_id \
+             left join player_match_ratings m on m.player_id = q.player_id \
+             order by q.enqueued_at, q.id",
+            DEFAULT_DISPLAY_MU,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entry_ids: Vec<Uuid> = rows.iter().map(|row| row.entry_id).collect();
+        let wishes = sqlx::query!(
+            "select entry_id, role, priority from queue_entry_roles \
+             where entry_id = any($1) order by entry_id, priority",
+            &entry_ids,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_entry: HashMap<Uuid, Vec<QueuedRole>> = HashMap::new();
+        for wish in wishes {
+            by_entry.entry(wish.entry_id).or_default().push(QueuedRole {
+                role: wish.role,
+                priority: wish.priority,
+            });
+        }
+
+        Ok(rows
+            .into_iter()
+            .map(|row| QueuedEntry {
+                player_id: row.player_id,
+                discord_user_id: row.discord_user_id,
+                trainer_name: row.trainer_name,
+                enqueued_at: row.enqueued_at,
+                down_range: row.down_range,
+                rating: row.rating,
+                roles: by_entry.remove(&row.entry_id).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// キューから外し、同じトランザクションで操作を記録する。
+    ///
+    /// マッチメイカと同じ**プール全体の advisory lock** を取る。マッチメイカは 1 回の実行を
+    /// 1 トランザクションで行い、その中で成立した 10 人をキューから消す。ロックを共有しないと
+    /// 「formation に入った直後の人をキューから外した」ように見える競合が起きる。
+    /// `SELECT ... FOR UPDATE` は使わない（00 §5）。
+    ///
+    /// **キューにいなければ記録も残さない。**身に覚えのない通知を本人に出さないため。
+    /// formation には触らない。キューと formation は別の系なので、進行中の試合は影響を受けない。
+    pub async fn remove_from_queue(
+        &self,
+        input: &NewAdminAction,
+    ) -> Result<RemovalOutcome, AdminStoreError> {
+        let Some(player_id) = input.target_player_id else {
+            // 呼び出し側が対象を入れ忘れた場合。DB の CHECK と同じ判断をここでも下す
+            return Err(AdminStoreError::Database(sqlx::Error::RowNotFound));
+        };
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+        let deleted = sqlx::query!("delete from queue_entries where player_id = $1", player_id)
+            .execute(&mut *tx)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(RemovalOutcome::NotQueued);
+        }
+        if append_action_on(&mut tx, input).await? == ActionOutcome::Duplicate {
+            // 同じフォームの二重送信。1 回目の記録が既にあるので行は増やさない
+            tracing::warn!(%player_id, "queue removal replayed with the same idempotency key");
+        }
+        tx.commit().await?;
+        Ok(RemovalOutcome::Removed)
+    }
+
+    /// 直近の運営操作（新しい順）。管理パネルの履歴表に出す。
+    pub async fn recent_actions(&self, limit: i64) -> Result<Vec<AdminActionRow>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select a.id, a.kind, a.actor_discord_user_id, a.target_player_id, a.reason, \
+                    a.occurred_at, \
+                    case when a.kind = 'block_allowance_set' \
+                         then (a.payload->>'allowance')::int end as \"allowance?\", \
+                    p.trainer_name as \"trainer_name?\" \
+             from admin_actions a \
+             left join players p on p.id = a.target_player_id \
+             order by a.id desc limit $1",
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AdminActionRow {
+                id: row.id,
+                kind: AdminActionKind::parse(&row.kind),
+                raw_kind: row.kind,
+                actor_discord_user_id: row.actor_discord_user_id,
+                target_player_id: row.target_player_id,
+                target_trainer_name: row.trainer_name,
+                reason: row.reason,
+                allowance: row.allowance,
+                occurred_at: row.occurred_at,
+            })
+            .collect())
+    }
+}
+
+/// 追記の実体。プールからでもトランザクションからでも同じ経路を通す。
+async fn append_action_on(
+    conn: &mut PgConnection,
+    input: &NewAdminAction,
+) -> Result<ActionOutcome, AdminStoreError> {
+    let inserted = sqlx::query_scalar!(
+        "insert into admin_actions \
+         (kind, actor_discord_user_id, target_player_id, reason, payload, occurred_at, \
+          idempotency_key) \
+         values ($1, $2, $3, $4, $5, $6, $7) \
+         on conflict (idempotency_key) do nothing \
+         returning id",
+        input.kind.as_str(),
+        input.actor_discord_user_id,
+        input.target_player_id,
+        input.reason.as_deref(),
+        input.payload,
+        input.occurred_at,
+        input.idempotency_key,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    match inserted {
+        Some(id) => Ok(ActionOutcome::Recorded { id }),
+        None => Ok(ActionOutcome::Duplicate),
+    }
+}
+
+/// マッチメイカの停止状態を、停止・再開の**最新行**から導出する。
+///
+/// マッチメイカは自分のトランザクション（advisory lock 取得済み）の中でこれを読む。
+/// 実行の判断と同じトランザクションで読むので、走り出してから止められることがない。
+pub(crate) async fn matchmaker_pause_on(
+    conn: &mut PgConnection,
+) -> Result<Option<PauseState>, sqlx::Error> {
+    let kinds = [
+        AdminActionKind::MatchmakerPaused.as_str().to_owned(),
+        AdminActionKind::MatchmakerResumed.as_str().to_owned(),
+    ];
+    let row = sqlx::query!(
+        "select kind, actor_discord_user_id, reason, occurred_at \
+         from admin_actions \
+         where kind = any($1) \
+         order by id desc limit 1",
+        &kinds[..],
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row
+        .filter(|row| row.kind == AdminActionKind::MatchmakerPaused.as_str())
+        .map(|row| PauseState {
+            actor_discord_user_id: row.actor_discord_user_id,
+            since: row.occurred_at,
+            reason: row.reason,
+        }))
 }

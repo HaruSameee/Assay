@@ -13,7 +13,7 @@
 //! - 他人のエントリを操作できる経路を作らない。`player_id` はセッションからしか来ない。
 
 pub mod flex;
-mod html;
+pub(crate) mod html;
 pub mod model;
 pub mod range;
 pub mod repository;
@@ -22,8 +22,8 @@ pub mod routes;
 pub use flex::{RoleAssignment, flex_compensation_owed, latest_assignment};
 pub use model::{
     MAX_DOWN_RANGE, MAX_ROLE_PREFERENCES, MIN_DOWN_RANGE, QueueEntry, QueueEntryId, QueueRequest,
-    QueueRequestError, RolePreference, UP_RANGE, VoiceDestination, validate_down_range,
-    validate_request,
+    QueueRequestError, REMOVAL_NOTICE_WINDOW_HOURS, RolePreference, StaffRemoval, UP_RANGE,
+    VoiceDestination, validate_down_range, validate_request,
 };
 pub use range::{QueuedPlayer, accepts, count_in_range, mutually_in_range};
 pub use repository::{QueueError, QueueRepository};

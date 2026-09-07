@@ -88,6 +88,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let match_pool = pool.clone();
     let matchmaker_repo = MatchmakerRepository::new(pool);
 
+    // 停止状態は DB が正（メモリに持たない）。**起動ログに必ず出す** — 止めたまま再起動して
+    // 「動いているつもりで動いていない」ことに気付かないのが、当日いちばん危ない
+    match admin_store.matchmaker_pause().await {
+        Ok(Some(pause)) => warn!(
+            paused_by = pause.actor_discord_user_id,
+            paused_since = %pause.since,
+            reason = pause.reason.as_deref().unwrap_or("(なし)"),
+            "MATCHMAKER IS PAUSED: no matches will be formed until it is resumed from /admin"
+        ),
+        Ok(None) => info!("matchmaker is running (not paused)"),
+        // 読めなくても起動は続ける。マッチメイカは実行ごとに自分で読み直す
+        Err(error) => warn!(%error, "could not read the matchmaker pause state at startup"),
+    }
+
     let handler = Arc::new(Handler::default());
     let mut client = build_client(&discord_config.token, handler.clone()).await?;
     let gateway = Arc::new(SerenityGateway::new(client.http.clone()));
@@ -240,6 +254,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             queued = outcome.candidates,
                             formed = outcome.created.len(),
                             vc_exhausted = outcome.vc_exhausted,
+                            paused = outcome.paused,
                             "matchmaker run finished"
                         );
                         if let Err(error) = matchmaker_log_adapter

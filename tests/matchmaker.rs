@@ -347,6 +347,7 @@ async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
             vc_exhausted: false,
             unmatched: 9,
             longest_unmatched_wait_seconds: Some(600),
+            paused: false,
         }
     );
     assert_eq!(count(&db, "formations").await, 0);

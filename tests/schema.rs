@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use unite_matchsystem::admin::AdminActionKind;
 use unite_matchsystem::lifecycle::{AbandonReason, FormationEventKind, PlayerId};
 use unite_matchsystem::rating::RatingAdjustmentRepository;
 
@@ -45,6 +46,8 @@ async fn append_only_privileges_and_triggers_are_wired(owner: sqlx::PgPool) {
         "delete from formation_events",
         "update match_reports set id = id",
         "delete from match_reports",
+        "update admin_actions set id = id",
+        "delete from admin_actions",
         "update discord_failures set id = id",
         "delete from discord_failures",
     ] {
@@ -434,29 +437,54 @@ fn kind_check_values(sql: &str) -> Option<Vec<String>> {
     Some(values)
 }
 
-#[test]
-fn event_kind_check_matches_rust_enum() {
-    let checks: Vec<(PathBuf, Vec<String>)> = up_migrations()
+/// `kind` の CHECK を、**そのテーブルに触れているマイグレーションだけ**から集める。
+///
+/// `kind` 列を持つ追記ログは 1 つではないので、ファイル全体から拾うと別のテーブルの
+/// CHECK を取り違える（`admin_actions` を足したときに実際に起きた）。
+fn kind_checks_for(table: &str) -> Vec<(PathBuf, Vec<String>)> {
+    let marker = format!("table {table}");
+    up_migrations()
         .into_iter()
+        .filter(|(_, sql)| sql.contains(&marker))
         .filter_map(|(path, sql)| kind_check_values(&sql).map(|values| (path, values)))
-        .collect();
+        .collect()
+}
+
+/// 最後に定義された CHECK が Rust の列挙と一致することを見る（片方だけ変わる事故を防ぐ）。
+fn assert_kind_check_matches(table: &str, rust_values: &[&str], enum_name: &str) {
+    let checks = kind_checks_for(table);
     let (path, sql_values) = checks
         .last()
-        .expect("at least one migration must define the kind CHECK");
+        .unwrap_or_else(|| panic!("no migration defines the kind CHECK of {table}"));
 
     let mut sql_sorted = sql_values.clone();
     sql_sorted.sort();
-    let mut rust_sorted: Vec<String> = FormationEventKind::ALL
-        .iter()
-        .map(|kind| kind.as_str().to_owned())
-        .collect();
+    let mut rust_sorted: Vec<String> = rust_values.iter().map(|kind| (*kind).to_owned()).collect();
     rust_sorted.sort();
     assert_eq!(
         sql_sorted,
         rust_sorted,
-        "kind CHECK in {} must match FormationEventKind::ALL",
+        "kind CHECK in {} must match {enum_name}",
         path.display()
     );
+}
+
+#[test]
+fn event_kind_check_matches_rust_enum() {
+    let values: Vec<&str> = FormationEventKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect();
+    assert_kind_check_matches("formation_events", &values, "FormationEventKind::ALL");
+}
+
+#[test]
+fn admin_action_kind_check_matches_rust_enum() {
+    let values: Vec<&str> = AdminActionKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect();
+    assert_kind_check_matches("admin_actions", &values, "AdminActionKind::ALL");
 }
 
 #[test]
