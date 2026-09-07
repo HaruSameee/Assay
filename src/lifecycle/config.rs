@@ -1,5 +1,6 @@
 //! 設定値（タイムアウト、候補上限）と、それを読む純粋関数。
 
+use std::env;
 use std::time::Duration;
 
 use chrono::TimeDelta;
@@ -7,9 +8,36 @@ use chrono::TimeDelta;
 use super::ids::Timestamp;
 use super::state::FormationState;
 
+/// ホスト候補の承諾期限の環境変数。**当日の校正対象。**
+pub const HOST_ACCEPT_TIMEOUT_SECONDS: &str = "HOST_ACCEPT_TIMEOUT_SECONDS";
+/// 打診するホスト候補の上限の環境変数。**当日の校正対象。**
+pub const HOST_CANDIDATE_LIMIT: &str = "HOST_CANDIDATE_LIMIT";
+
+/// 既定の承諾期限（秒）。
+///
+/// 仕様 §1 は 90 秒だが、これは「Discord のボタンを押すだけ」を前提にした値だった。
+/// 打診はサイトへ移り、候補はマッチ画面を開いて操作する（画面を見ていなければ
+/// Discord の通知に気づいてから開く）ので、**180 秒**に伸ばしてある。
+pub const DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS: u64 = 180;
+/// 既定の候補上限（仕様 §1「上位3人まで」）。
+pub const DEFAULT_HOST_CANDIDATE_LIMIT: u32 = 3;
+
+/// 設定の読み込みエラー。値そのものは秘密ではないので理由に載せる。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LifecycleConfigError {
+    /// 値の形が不正。
+    #[error("invalid {name}: {reason}")]
+    Invalid {
+        /// 環境変数名。
+        name: &'static str,
+        /// 理由。
+        reason: String,
+    },
+}
+
 /// ライフサイクルの設定値。仕様 §1 のタイムアウトと候補上限。
 ///
-/// コードに定数として埋め込まず、ここから読む。既定値は仕様 §1 の値。
+/// コードに定数として埋め込まず、ここから読む。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleConfig {
     /// `awaiting_host`: ホスト候補の承諾を待つ時間。過ぎたら `host_timeout` → 次の候補へ。
@@ -25,16 +53,75 @@ pub struct LifecycleConfig {
 }
 
 impl Default for LifecycleConfig {
-    /// 仕様 §1 の値: 90秒 / 180秒 / 45分 / 30分 / 上位3人。
+    /// 180秒 / 180秒 / 45分 / 30分 / 上位3人。
     fn default() -> Self {
         Self {
-            host_accept_timeout: Duration::from_secs(90),
+            host_accept_timeout: Duration::from_secs(DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS),
             code_post_timeout: Duration::from_secs(180),
             no_report_timeout: Duration::from_secs(45 * 60),
             report_window: Duration::from_secs(30 * 60),
-            max_host_candidates: 3,
+            max_host_candidates: DEFAULT_HOST_CANDIDATE_LIMIT,
         }
     }
+}
+
+impl LifecycleConfig {
+    /// 環境変数から読む。未設定なら既定値。
+    pub fn from_env() -> Result<Self, LifecycleConfigError> {
+        Self::parse(
+            env::var(HOST_ACCEPT_TIMEOUT_SECONDS).ok().as_deref(),
+            env::var(HOST_CANDIDATE_LIMIT).ok().as_deref(),
+        )
+    }
+
+    /// 設定値の解釈。**純粋関数**（`#![forbid(unsafe_code)]` の下ではテストから
+    /// 環境変数を書き換えられないので、読み取りと解釈を分けてある）。
+    ///
+    /// どちらも 0 は拒否する。候補 0 人は「成立した瞬間に必ず解散」、承諾 0 秒は
+    /// 「打診した瞬間にタイムアウト」であり、設定ミスが黙って動く形になるため。
+    pub fn parse(
+        host_accept_timeout_seconds: Option<&str>,
+        host_candidate_limit: Option<&str>,
+    ) -> Result<Self, LifecycleConfigError> {
+        let defaults = Self::default();
+        let host_accept_timeout = match trimmed(host_accept_timeout_seconds) {
+            None => defaults.host_accept_timeout,
+            Some(raw) => {
+                Duration::from_secs(positive(HOST_ACCEPT_TIMEOUT_SECONDS, raw, "seconds")?)
+            }
+        };
+        let max_host_candidates = match trimmed(host_candidate_limit) {
+            None => defaults.max_host_candidates,
+            Some(raw) => u32::try_from(positive(HOST_CANDIDATE_LIMIT, raw, "candidates")?)
+                .map_err(|_| LifecycleConfigError::Invalid {
+                    name: HOST_CANDIDATE_LIMIT,
+                    reason: format!("{raw:?} is out of range"),
+                })?,
+        };
+        Ok(Self {
+            host_accept_timeout,
+            max_host_candidates,
+            ..defaults
+        })
+    }
+}
+
+fn trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn positive(name: &'static str, raw: &str, unit: &str) -> Result<u64, LifecycleConfigError> {
+    let value: u64 = raw.parse().map_err(|_| LifecycleConfigError::Invalid {
+        name,
+        reason: format!("expected a positive number of {unit}, got {raw:?}"),
+    })?;
+    if value == 0 {
+        return Err(LifecycleConfigError::Invalid {
+            name,
+            reason: format!("must be at least 1 {}", unit.trim_end_matches('s')),
+        });
+    }
+    Ok(value)
 }
 
 /// 状態ごとの期限の種類。期限が来たときに取るべき行動を表す。
@@ -137,9 +224,60 @@ mod tests {
     }
 
     #[test]
+    fn unset_environment_keeps_the_defaults() {
+        assert_eq!(
+            LifecycleConfig::parse(None, None).unwrap(),
+            LifecycleConfig::default()
+        );
+        // 空文字・空白だけも「未設定」と同じ（.env に空行を残しても既定に戻る）
+        assert_eq!(
+            LifecycleConfig::parse(Some(""), Some("  ")).unwrap(),
+            LifecycleConfig::default()
+        );
+    }
+
+    #[test]
+    fn the_host_timeout_and_candidate_limit_come_from_the_environment() {
+        let config = LifecycleConfig::parse(Some("45"), Some("5")).unwrap();
+        assert_eq!(config.host_accept_timeout, Duration::from_secs(45));
+        assert_eq!(config.max_host_candidates, 5);
+        // 他の期限は動かない
+        let defaults = LifecycleConfig::default();
+        assert_eq!(config.code_post_timeout, defaults.code_post_timeout);
+        assert_eq!(config.no_report_timeout, defaults.no_report_timeout);
+        assert_eq!(config.report_window, defaults.report_window);
+
+        // 片方だけ設定してもよい
+        let only_limit = LifecycleConfig::parse(None, Some("1")).unwrap();
+        assert_eq!(only_limit.host_accept_timeout, defaults.host_accept_timeout);
+        assert_eq!(only_limit.max_host_candidates, 1);
+    }
+
+    #[test]
+    fn a_meaningless_setting_fails_at_startup() {
+        // 0 秒は「打診した瞬間にタイムアウト」、0 人は「成立した瞬間に解散」。
+        // 黙って動かず起動で落とす
+        for (timeout, limit) in [
+            (Some("0"), None),
+            (None, Some("0")),
+            (Some("-1"), None),
+            (Some("soon"), None),
+            (None, Some("たくさん")),
+            (None, Some("4294967296")),
+        ] {
+            assert!(
+                LifecycleConfig::parse(timeout, limit).is_err(),
+                "{timeout:?} / {limit:?} must be rejected"
+            );
+        }
+        let error = LifecycleConfig::parse(Some("0"), None).unwrap_err();
+        assert!(error.to_string().contains(HOST_ACCEPT_TIMEOUT_SECONDS));
+    }
+
+    #[test]
     fn defaults_match_the_spec() {
         let config = LifecycleConfig::default();
-        assert_eq!(config.host_accept_timeout, Duration::from_secs(90));
+        assert_eq!(config.host_accept_timeout, Duration::from_secs(180));
         assert_eq!(config.code_post_timeout, Duration::from_secs(180));
         assert_eq!(config.no_report_timeout, Duration::from_secs(45 * 60));
         assert_eq!(config.report_window, Duration::from_secs(30 * 60));

@@ -1,7 +1,13 @@
-//! VC のテキストチャットに出す文言。純粋関数。
+//! VC のテキストチャットと招集チャンネルに出す文言。純粋関数。
+//!
+//! **すべて通知であり、操作は無い。**ボタンもモーダルも作らない（Discord に
+//! インタラクションを残さない）。行き先としてマッチ画面の URL を添える。
 //!
 //! 出してよいのは、割り当て表・集合場所（VC）・部屋設定・ルーム ID・ホスト打診・解散の通知だけ。
 //! 勝敗に関する語は一切出さない（`tests` で検査する）。
+//!
+//! **相手チームの構成は載せない。**割り当て表と招集はチームごとに分けて投稿する。
+//! サイト側だけ隠しても、VC の投稿に相手のロールが載っていれば意味が無い。
 //!
 //! VC は使い回すので、1 本のチャットに何試合分ものメッセージが溜まる（消さない）。
 //! どの試合のものか分かるよう、すべての投稿の先頭に見出し（VC ラベル・時刻・試合 ID）を付ける。
@@ -13,12 +19,8 @@ use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
 use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
 
-use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
-use super::gateway::{Button, ButtonStyle, Modal, OutgoingMessage};
+use super::gateway::OutgoingMessage;
 use super::vc_pool::VcPair;
-
-/// ルーム ID の最大長（モーダルの入力制限）。
-pub const ROOM_CODE_MAX_LENGTH: u16 = 32;
 
 /// 見出しの時刻は日本時間で出す（コミュニティの時間帯）。
 const JST_OFFSET_SECONDS: i32 = 9 * 3600;
@@ -45,6 +47,16 @@ pub fn match_label(formation: FormationId) -> String {
     format!("match-{}", &simple[..8])
 }
 
+/// マッチ画面の URL。**通知には必ずこれを添える**（操作はサイトにしか無いので、
+/// 行き先が書いていない通知は「あなたの番です」を伝えきれない）。
+pub fn match_url(site_base_url: &str, formation: FormationId) -> String {
+    format!(
+        "{}/match/{}",
+        site_base_url.trim_end_matches('/'),
+        formation.0
+    )
+}
+
 /// すべての投稿の先頭に付ける見出し: VC ラベル・時刻（JST）・試合 ID。
 pub fn heading(vc: &VcPair, at: Timestamp, formation: FormationId) -> String {
     let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
@@ -63,42 +75,43 @@ fn mention(user: UserId) -> String {
 
 /// 割り当て表 + 集合場所 + 部屋設定のチェックリスト（マップを先頭に差し込む）。
 ///
-/// red と blue の両方の VC チャットに投稿する（全員に届ける必要があるので）。
+/// **そのVCのチームの構成だけを載せる。**red の VC には red だけ、blue の VC には blue だけ。
+/// 両チーム分を1つのメッセージにして両方へ投げると、サイト側で相手のロールを隠しても
+/// 意味が無くなる（部屋に入るまでの数分で相手の構成に合わせた準備ができてしまう）。
+/// 相手が誰かは招集チャンネルで分かる。隠しているのは**相手のロールだけ**。
 pub fn assignment(
     heading: &str,
     roster: &[RosterEntry],
     vc: &VcPair,
+    team: Team,
     room_map: &str,
     checklist: &[String],
 ) -> OutgoingMessage {
     let mut content = String::from(heading);
     content.push_str("## 割り当て表\n");
-    for team in Team::ALL {
+    content.push_str(&format!(
+        "{} **{}** — {}\n",
+        team_emoji(team),
+        team,
+        vc_line(vc, team)
+    ));
+    let mut members: Vec<&RosterEntry> = roster.iter().filter(|entry| entry.team == team).collect();
+    members.sort_by(|a, b| {
+        a.role_sort_order
+            .cmp(&b.role_sort_order)
+            .then_with(|| a.player_id.cmp(&b.player_id))
+    });
+    for entry in members {
+        let name = entry
+            .trainer_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("（名前未登録）");
         content.push_str(&format!(
-            "{} **{}** — {}\n",
-            team_emoji(team),
-            team,
-            vc_line(vc, team)
+            "- {} — {}\n",
+            plain_discord_text(name),
+            entry.role_display_name
         ));
-        let mut members: Vec<&RosterEntry> =
-            roster.iter().filter(|entry| entry.team == team).collect();
-        members.sort_by(|a, b| {
-            a.role_sort_order
-                .cmp(&b.role_sort_order)
-                .then_with(|| a.player_id.cmp(&b.player_id))
-        });
-        for entry in members {
-            let name = entry
-                .trainer_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or("（名前未登録）");
-            content.push_str(&format!(
-                "- {} — {}\n",
-                plain_discord_text(name),
-                entry.role_display_name
-            ));
-        }
     }
     content.push_str("\n## 部屋設定\n");
     content.push_str(&format!("- [ ] マップ: {room_map}\n"));
@@ -233,81 +246,92 @@ fn rating(value: f64) -> String {
     }
 }
 
-/// 公開招集チャンネルに出す、成立通知と行き先だけのメッセージ。
+/// 公開招集チャンネルに出す、片チーム分の成立通知。
 ///
-/// **チームごとに行を分ける。**10 人が同じメッセージを見るので、赤と青を 1 行に並べると
-/// 自分がどちらへ行くのか分からない。チーム分けは formation 確定時に決まっているので、
-/// ここで新しく判定するものは無い。
+/// **チームごとに別のメッセージにする。**同じメッセージに両チームを入れると、そこから
+/// 相手の構成が読めてしまう（割り当て表を VC ごとに分けた意味が消える）。呼ぶ側が
+/// [`Team::ALL`] を回して 2 通投稿する。
 ///
 /// レート、ロール割り当て、報告に関わる情報は全員が見る場所へ出さない（00 §3-5）。
-/// 出してよいのは**参加者名・チーム・行き先 VC だけ**。本文のメンションと `mention_users` は
-/// 同じ10人に揃える。
-pub fn summon(roster: &[RosterEntry], vc: &VcPair) -> OutgoingMessage {
-    let mut lines = String::new();
-    let mut everyone: Vec<UserId> = Vec::new();
-    // red が先。並びは Team::ALL に従い、チーム内はユーザー ID 順で安定させる
-    for team in Team::ALL {
-        let mut users: Vec<UserId> = roster
-            .iter()
-            .filter(|entry| entry.team == team)
-            .filter_map(user_of)
-            .collect();
-        users.sort_unstable();
-        users.dedup();
-        if users.is_empty() {
-            continue;
-        }
-        let mentions = users
-            .iter()
-            .map(|user| mention(*user))
-            .collect::<Vec<_>>()
-            .join(" ");
-        lines.push_str(&format!("{mentions} → <#{}>\n", vc.channel(team).get()));
-        everyone.extend(users);
-    }
-    everyone.sort_unstable();
-    everyone.dedup();
+/// 出してよいのは**参加者名・チーム・行き先 VC と、サイトへの導線だけ**。
+/// 本文のメンションと `mention_users` は同じ5人に揃える。
+pub fn summon(roster: &[RosterEntry], vc: &VcPair, team: Team, match_url: &str) -> OutgoingMessage {
+    // チーム内はユーザー ID 順で安定させる
+    let mut users: Vec<UserId> = roster
+        .iter()
+        .filter(|entry| entry.team == team)
+        .filter_map(user_of)
+        .collect();
+    users.sort_unstable();
+    users.dedup();
+    let mentions = users
+        .iter()
+        .map(|user| mention(*user))
+        .collect::<Vec<_>>()
+        .join(" ");
     OutgoingMessage {
         content: format!(
-            "{lines}マッチが成立しました。割り当てとルーム設定は各VCのテキストチャットにあります"
+            "{mentions} → <#{channel}>\n\
+             マッチが成立しました。**操作はすべてマッチ画面から**行います: {match_url}\n\
+             割り当てとルーム設定は各VCのテキストチャットにもあります",
+            channel = vc.channel(team).get(),
         ),
         buttons: Vec::new(),
-        mention_users: everyone,
+        mention_users: users,
     }
 }
 
-/// ホスト候補への打診（[ 部屋を作る ] [ 今回はパスする ]）。候補の側の VC チャットにだけ投稿する。
+/// 招集チャンネルに出すホストの通知。**ホストは相手チームの人にも伝える**
+/// （誰が部屋を建てたか分からないと、入れなかったときに聞く相手が分からない）。
 ///
-/// 同じ側の候補に変わったらこのメッセージを編集する。新しいメッセージを積まない。
+/// ホストのロールは出さない。メンションはホスト1人だけなので、招集の通知と重複しない。
+pub fn host_announcement(
+    formation: FormationId,
+    host: UserId,
+    index: usize,
+    total: usize,
+    match_url: &str,
+) -> OutgoingMessage {
+    let changed = if index > 1 {
+        format!("（候補 {index}/{total} に交代しました）")
+    } else {
+        String::new()
+    };
+    OutgoingMessage {
+        content: format!(
+            "**{label}** ホストは {host} さんです{changed}。\n\
+             ホストの方はサイトで部屋を作って、ルーム ID を入力してください: {match_url}",
+            label = match_label(formation),
+            host = mention(host),
+        ),
+        buttons: Vec::new(),
+        mention_users: vec![host],
+    }
+}
+
+/// ホスト候補への打診の**通知**。候補の側の VC チャットにだけ投稿する。
+///
+/// **ボタンは無い。**操作はマッチ画面で行う（Discord にインタラクションを残さない）。
+/// ここに残すのは「あなたの番です」を伝える役目だけで、これが無いと画面を開いている人
+/// しか進行できなくなる。同じ側の候補に変わったらこのメッセージを編集する。
 pub fn host_prompt(
     heading: &str,
     candidate: UserId,
-    formation: FormationId,
-    player: PlayerId,
     index: usize,
     total: usize,
+    match_url: &str,
 ) -> OutgoingMessage {
     OutgoingMessage {
         content: format!(
             "{}{} さん、部屋の作成をお願いできますか？（候補 {}/{}）\n\
-             部屋を作ったら「部屋を作る」を押して、ルーム ID を入力してください。",
+             マッチ画面で「部屋を作る」か「今回はパスする」を選んでください: {}",
             heading,
             mention(candidate),
             index,
-            total
+            total,
+            match_url
         ),
-        buttons: vec![
-            Button {
-                custom_id: CustomId::new(Action::HostAccept, formation, player).encode(),
-                label: "部屋を作る".into(),
-                style: ButtonStyle::Primary,
-            },
-            Button {
-                custom_id: CustomId::new(Action::HostDecline, formation, player).encode(),
-                label: "今回はパスする".into(),
-                style: ButtonStyle::Secondary,
-            },
-        ],
+        buttons: Vec::new(),
         mention_users: vec![candidate],
     }
 }
@@ -321,120 +345,60 @@ pub fn host_prompt_moved(heading: &str, to: Team) -> OutgoingMessage {
     }
 }
 
-/// ホストが承諾した後の状態表示（[ ルーム ID を入力 ]）。
-pub fn host_accepted(
-    heading: &str,
-    host: UserId,
-    formation: FormationId,
-    player: PlayerId,
-) -> OutgoingMessage {
+/// ホストが承諾した後の状態表示。**ボタンは無い**（入力はマッチ画面）。
+pub fn host_accepted(heading: &str, host: UserId, match_url: &str) -> OutgoingMessage {
     OutgoingMessage {
         content: format!(
-            "{}{} さんが部屋を作成中です。作成できたら「ルーム ID を入力」からルーム ID を送ってください。",
+            "{}{} さんが部屋を作成中です。作成できたら、マッチ画面でルーム ID を入力してください: {}",
             heading,
-            mention(host)
+            mention(host),
+            match_url
         ),
-        buttons: vec![Button {
-            custom_id: CustomId::new(Action::CodeOpen, formation, player).encode(),
-            label: "ルーム ID を入力".into(),
-            style: ButtonStyle::Primary,
-        }],
+        buttons: Vec::new(),
         mention_users: Vec::new(),
     }
 }
 
-/// ルーム ID 入力後の状態表示（[ ルーム ID を修正 ]）。
-pub fn code_status(
-    heading: &str,
-    host: UserId,
-    room_code: &str,
-    formation: FormationId,
-    player: PlayerId,
-) -> OutgoingMessage {
-    OutgoingMessage {
-        content: format!(
-            "{}ルーム ID: **{}**（ホスト: {}）",
-            heading,
-            room_code,
-            mention(host)
-        ),
-        buttons: vec![Button {
-            custom_id: CustomId::new(Action::CodeOpen, formation, player).encode(),
-            label: "ルーム ID を修正".into(),
-            style: ButtonStyle::Secondary,
-        }],
-        mention_users: Vec::new(),
-    }
-}
-
-/// ルーム ID の開示。red と blue の両方の VC チャットに投稿し、貼り直しは両方を編集する。
+/// ルーム ID の開示。**そのVCのチーム側に投稿する**（貼り直しは編集する）。
+///
+/// **参加者10人のメンションは付けない。**招集チャンネルで既に通知しており、重複する。
+/// ホストのメンションだけ残す — 1人なので通知の重複にならず、部屋に入れなかったときに
+/// 誰へ聞けばよいかが分かる。表示名は [`plain_discord_text`] を通し、名前に紛れ込んだ
+/// mention 構文を本文へ持ち込まない。
 pub fn code_reveal(
     heading: &str,
     host: UserId,
-    others: &[UserId],
     room_code: &str,
     vc: &VcPair,
+    team: Team,
 ) -> OutgoingMessage {
-    let mut content = String::from(heading);
-    if !others.is_empty() {
-        let mentions: Vec<String> = others.iter().map(|user| mention(*user)).collect();
-        content.push_str(&mentions.join(" "));
-        content.push('\n');
-    }
-    content.push_str(&format!(
-        "ルーム ID は **{}** です（ホスト: {}）。\n{}、{}してください。",
-        room_code,
-        mention(host),
-        vc_line(vc, Team::Red),
-        vc_line(vc, Team::Blue)
-    ));
-    OutgoingMessage {
-        content,
-        buttons: Vec::new(),
-        mention_users: others.to_vec(),
-    }
-}
-
-/// 全参加者向けの報告入口。集計・人数・報告者名は一切載せない。
-pub fn report_prompt(heading: &str, formation: FormationId) -> OutgoingMessage {
     OutgoingMessage {
         content: format!(
-            "{heading}試合の内容を選んで報告してください。報告内容は他の参加者には表示されません。"
+            "{}ルーム ID は **{}** です（ホスト: {}）。\n{}してください。",
+            heading,
+            plain_discord_text(room_code),
+            mention(host),
+            vc_line(vc, team),
         ),
-        buttons: vec![
-            Button {
-                custom_id: CustomId::report(Action::ReportRed, formation).encode(),
-                label: "赤の勝ち".into(),
-                style: ButtonStyle::Primary,
-            },
-            Button {
-                custom_id: CustomId::report(Action::ReportBlue, formation).encode(),
-                label: "青の勝ち".into(),
-                style: ButtonStyle::Primary,
-            },
-            Button {
-                custom_id: CustomId::report(Action::ReportNullified, formation).encode(),
-                label: "無効試合".into(),
-                style: ButtonStyle::Secondary,
-            },
-        ],
-        mention_users: Vec::new(),
+        buttons: Vec::new(),
+        // ホスト1人だけ。9人分の重複通知は出さない
+        mention_users: vec![host],
     }
 }
 
-/// 報告を受理した本人だけに返す。判定状態や他人の情報は含めない。
-pub fn report_received() -> String {
-    "受け付けました".into()
-}
-
-/// 編成外のユーザーにだけ返す。
-pub fn report_not_participant() -> String {
-    "この試合の参加者だけが報告できます。".into()
-}
-
-/// コード開示前や報告不能状態の操作にだけ返す。内部状態は明かさない。
-pub fn report_unavailable() -> String {
-    "この報告は受け付けられませんでした。".into()
+/// 報告の**催促**。集計・人数・報告者名は一切載せない。
+///
+/// **ボタンは無く、メンションも付けない。**報告はマッチ画面で受ける。ここに残すのは
+/// 「終わったら報告してください」を伝える役目だけ（報告には 30 分の期限がある）。
+pub fn report_prompt(heading: &str, match_url: &str) -> OutgoingMessage {
+    OutgoingMessage {
+        content: format!(
+            "{heading}試合が終わったら、マッチ画面で結果を報告してください: {match_url}\n\
+             報告内容は他の参加者には表示されません。"
+        ),
+        buttons: Vec::new(),
+        mention_users: Vec::new(),
+    }
 }
 
 /// 係争を運営専用チャンネルへ通知する。最新報告だけの内訳を出す。
@@ -497,49 +461,16 @@ pub fn abandoned_notice(heading: &str, reason: AbandonReason) -> OutgoingMessage
     }
 }
 
-/// ルーム ID を受け取るモーダル。
-pub fn code_modal(formation: FormationId, player: PlayerId, current: Option<&str>) -> Modal {
-    Modal {
-        custom_id: CustomId::new(Action::CodeSubmit, formation, player).encode(),
-        title: if current.is_some() {
-            "ルーム ID の修正".into()
-        } else {
-            "ルーム ID の入力".into()
-        },
-        input_custom_id: ROOM_CODE_INPUT_ID.into(),
-        input_label: "ルーム ID".into(),
-        placeholder: Some("ゲーム内で表示されるルーム ID".into()),
-        max_length: ROOM_CODE_MAX_LENGTH,
-        prefill: current.map(str::to_owned),
-    }
-}
-
-/// 打診されていない人がボタンを押した（本人にだけ表示）。
-pub fn not_addressed_to_you(addressee: Option<UserId>) -> String {
-    match addressee {
-        Some(user) => format!("このボタンは {} さん宛てです。", mention(user)),
-        None => "このボタンはあなた宛てではありません。".into(),
-    }
-}
-
-/// 古い、または無効になった操作（本人にだけ表示）。
-pub fn stale() -> String {
-    "この操作はもう有効ではありません。最新のメッセージを確認してください。".into()
-}
-
-/// ホスト以外がルーム ID を入力しようとした（本人にだけ表示）。
-pub fn not_the_host() -> String {
-    "ルーム ID を入力できるのはホストだけです。".into()
-}
-
-/// ルーム ID が空だった（本人にだけ表示）。
-pub fn code_invalid() -> String {
-    "ルーム ID が空です。もう一度入力してください。".into()
-}
-
-/// ルーム ID の開示に失敗した（本人にだけ表示）。
-pub fn reveal_failed() -> String {
-    "ルーム ID を VC のチャットに投稿できませんでした。この試合は解散になります。".into()
+/// 過去に投稿したボタンを押した人にだけ返す（本人にしか見えない）。
+///
+/// 新しいボタンはもう作らないが、**チャット履歴に残った古いメッセージは押せる**。
+/// 黙って無視すると「押したのに何も起きない」になるので、行き先を返す。
+/// このメッセージは状態を一切変えない。
+pub fn moved_to_the_site(site_base_url: &str) -> String {
+    format!(
+        "この操作はサイトへ移りました。マッチ画面から操作してください: {}",
+        site_base_url.trim_end_matches('/')
+    )
 }
 
 /// 編成の Discord ユーザー。0 以下は無効（`None`）。
@@ -612,21 +543,32 @@ mod tests {
     }
 
     /// VC チャットに投稿・編集されるメッセージを全部作る。
+    /// VC チャットに出すメッセージ（見出し付き）。
+    ///
+    /// **報告の催促は含めない。**あれは「報告してください」と書くのが仕事なので、
+    /// 禁止語（`報告`）の検査からは外す。代わりに
+    /// `the_report_prompt_only_points_at_the_site` が勝敗を名指ししないことを見る。
     fn all_messages() -> Vec<OutgoingMessage> {
-        let formation = formation();
-        let player = PlayerId(Uuid::from_u128(1));
         let host = UserId::new(1001);
-        let others: Vec<UserId> = (1002..=1010).map(UserId::new).collect();
         let checklist = vec!["設定 A".to_owned(), "設定 B".to_owned()];
         let heading = head();
+        let url = SITE;
         let mut messages = vec![
-            assignment(&heading, &roster(), &vc(), "kyogre", &checklist),
-            host_prompt(&heading, host, formation, player, 1, 3),
+            host_prompt(&heading, host, 1, 3, url),
             host_prompt_moved(&heading, Team::Blue),
-            host_accepted(&heading, host, formation, player),
-            code_status(&heading, host, "1234", formation, player),
-            code_reveal(&heading, host, &others, "1234", &vc()),
+            host_accepted(&heading, host, url),
         ];
+        for team in Team::ALL {
+            messages.push(assignment(
+                &heading,
+                &roster(),
+                &vc(),
+                team,
+                "kyogre",
+                &checklist,
+            ));
+            messages.push(code_reveal(&heading, host, "1234", &vc(), team));
+        }
         messages.extend(
             AbandonReason::ALL
                 .into_iter()
@@ -635,11 +577,8 @@ mod tests {
         messages
     }
 
-    /// メッセージに加えて、モーダルと本人向けの通知の文言も全部集める。
+    /// メッセージに加えて、本人向けの通知の文言も全部集める。
     fn all_texts() -> Vec<String> {
-        let formation = formation();
-        let player = PlayerId(Uuid::from_u128(1));
-        let host = UserId::new(1001);
         let mut texts: Vec<String> = all_messages()
             .iter()
             .flat_map(|message| {
@@ -647,17 +586,12 @@ mod tests {
                     .chain(message.buttons.iter().map(|button| button.label.clone()))
             })
             .collect();
-        let modal = code_modal(formation, player, Some("1234"));
-        texts.push(modal.title);
-        texts.push(modal.input_label);
-        texts.extend(modal.placeholder);
-        texts.push(not_addressed_to_you(Some(host)));
-        texts.push(stale());
-        texts.push(not_the_host());
-        texts.push(code_invalid());
-        texts.push(reveal_failed());
+        texts.push(moved_to_the_site(SITE));
         texts
     }
+
+    /// テスト用のサイト起点。
+    const SITE: &str = "https://match.example.test";
 
     #[test]
     fn chat_texts_never_mention_the_outcome() {
@@ -682,70 +616,150 @@ mod tests {
         }
     }
 
+    /// **そのVCのチームの構成だけ。**相手のロールは載せない。
     #[test]
-    fn assignment_lists_all_ten_players_and_inserts_the_map_first() {
-        let message = assignment(&head(), &roster(), &vc(), "kyogre", &["設定 A".to_owned()]);
-        assert!(message.mention_users.is_empty());
-        assert!(!message.content.contains("<@"), "{}", message.content);
-        for n in 1..=10 {
-            assert!(message.content.contains(&format!("トレーナー{n}")));
+    fn the_assignment_table_only_lists_its_own_team() {
+        let red = assignment(
+            &head(),
+            &roster(),
+            &vc(),
+            Team::Red,
+            "kyogre",
+            &["設定 A".to_owned()],
+        );
+        assert!(red.mention_users.is_empty());
+        assert!(!red.content.contains("<@"), "{}", red.content);
+        assert!(red.content.contains("**red**"));
+        assert!(!red.content.contains("**blue**"), "{}", red.content);
+        assert!(red.content.contains("vc3-red"));
+        assert!(!red.content.contains("vc3-blue"), "{}", red.content);
+        // red の5人だけが並ぶ。「トレーナー1」は「トレーナー10」の部分文字列なので、
+        // 行そのもの（`- 名前 — ロール`）で照合する
+        let listed = |content: &str, n: u32| {
+            content
+                .lines()
+                .any(|line| line.starts_with(&format!("- トレーナー{n} — ")))
+        };
+        for n in 1..=5 {
+            assert!(listed(&red.content, n), "{}", red.content);
         }
-        assert!(message.content.contains("**red**"));
-        assert!(message.content.contains("**blue**"));
-        assert!(message.content.contains("vc3-red"));
-        assert!(message.content.contains("vc3-blue"));
-        assert!(message.content.contains("<#31>"));
-        assert!(message.content.contains("<#32>"));
-        let map = message.content.find("- [ ] マップ: kyogre").unwrap();
-        let item = message.content.find("- [ ] 設定 A").unwrap();
+        for n in 6..=10 {
+            assert!(
+                !listed(&red.content, n),
+                "blue の {n} が red の表に載っている: {}",
+                red.content
+            );
+        }
+        let map = red.content.find("- [ ] マップ: kyogre").unwrap();
+        let item = red.content.find("- [ ] 設定 A").unwrap();
         assert!(map < item, "the map comes first");
-        let red = message.content.find("**red**").unwrap();
-        let blue = message.content.find("**blue**").unwrap();
-        assert!(red < blue);
-        // red チーム内はロールの表示順（ロール0 が先頭）
-        let first_red = message.content[red..blue].find("トレーナー5").unwrap();
-        let second_red = message.content[red..blue].find("トレーナー1").unwrap();
-        assert!(first_red < second_red);
+        // チーム内はロールの表示順（ロール0 が先頭）
+        let first = red.content.find("トレーナー5").unwrap();
+        let second = red.content.find("トレーナー1").unwrap();
+        assert!(first < second);
+
+        // blue 側も同じく、自分のチームだけ
+        let blue = assignment(&head(), &roster(), &vc(), Team::Blue, "kyogre", &[]);
+        assert!(blue.content.contains("**blue**"));
+        assert!(!blue.content.contains("**red**"), "{}", blue.content);
+        for n in 1..=5 {
+            assert!(
+                !listed(&blue.content, n),
+                "red の {n} が blue の表に載っている: {}",
+                blue.content
+            );
+        }
+    }
+
+    /// **red の VC への投稿に blue のロール割り当てが含まれないこと。**
+    ///
+    /// ロール名の文字列自体は両チームで共通なので、「誰がどのロールか」の行で検査する。
+    #[test]
+    fn the_opposing_roles_never_reach_a_voice_chat() {
+        let red = assignment(&head(), &roster(), &vc(), Team::Red, "kyogre", &[]);
+        let blue = assignment(&head(), &roster(), &vc(), Team::Blue, "kyogre", &[]);
+        // roster() は player_id ごとに `ロール<n % 5>` という表示名を持たせてある
+        let pair_line = |n: u32| format!("- トレーナー{n} — ロール{}", n % 5);
+        for n in 6..=10 {
+            assert!(!red.content.contains(&pair_line(n)), "{}", red.content);
+        }
+        for n in 1..=5 {
+            assert!(!blue.content.contains(&pair_line(n)), "{}", blue.content);
+            // 自分の側には出る
+            assert!(red.content.contains(&pair_line(n)), "{}", red.content);
+        }
     }
 
     #[test]
     fn assignment_neutralizes_mention_syntax_in_trainer_names() {
         let mut roster = roster();
         roster[0].trainer_name = Some("<@123>\n@everyone".into());
-        let message = assignment(&head(), &roster, &vc(), "kyogre", &[]);
+        let message = assignment(&head(), &roster, &vc(), roster[0].team, "kyogre", &[]);
         assert!(!message.content.contains("<@"), "{}", message.content);
         assert!(message.content.contains("＜@123＞ @everyone"));
         assert!(message.mention_users.is_empty());
     }
 
-    /// **チーム別に 1 行ずつ。**自分がどちらの VC へ行くのかが一目で分かること。
+    /// **チームごとに別のメッセージ。**片方の投稿に相手チームが混ざらないこと。
     #[test]
-    fn summon_splits_the_two_teams_onto_their_own_lines() {
-        let message = summon(&roster(), &vc());
+    fn the_summon_is_split_per_team() {
+        let red = summon(&roster(), &vc(), Team::Red, SITE);
+        let blue = summon(&roster(), &vc(), Team::Blue, SITE);
         assert_eq!(
-            message.content,
-            "<@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
-             <@1006> <@1007> <@1008> <@1009> <@1010> → <#32>\n\
-             マッチが成立しました。割り当てとルーム設定は各VCのテキストチャットにあります"
+            red.content,
+            format!(
+                "<@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
+                 マッチが成立しました。**操作はすべてマッチ画面から**行います: {SITE}\n\
+                 割り当てとルーム設定は各VCのテキストチャットにもあります"
+            )
         );
-        // red が先、blue が後
-        let red = message.content.find("<#31>").unwrap();
-        let blue = message.content.find("<#32>").unwrap();
-        assert!(red < blue, "{}", message.content);
-        // 5 人ずつに分かれ、どちらの行にも相手チームの誰かが混ざらない
-        let lines: Vec<&str> = message.content.lines().collect();
-        assert_eq!(lines.len(), 3, "{}", message.content);
-        for (line, members) in [(lines[0], 1001..=1005), (lines[1], 1006..=1010)] {
-            assert_eq!(line.matches("<@").count(), 5, "{line}");
-            for user in members {
-                assert!(line.contains(&format!("<@{user}>")), "{line}");
-            }
+        // 相手チームのメンションも、相手の行き先 VC も入らない
+        assert!(!red.content.contains("<#32>"), "{}", red.content);
+        for user in 1006..=1010 {
+            assert!(
+                !red.content.contains(&format!("<@{user}>")),
+                "{}",
+                red.content
+            );
+        }
+        for user in 1001..=1005 {
+            assert!(
+                !blue.content.contains(&format!("<@{user}>")),
+                "{}",
+                blue.content
+            );
         }
         assert_eq!(
-            message.mention_users,
-            (1001..=1010).map(UserId::new).collect::<Vec<_>>()
+            red.mention_users,
+            (1001..=1005).map(UserId::new).collect::<Vec<_>>()
         );
-        assert!(message.buttons.is_empty());
+        assert_eq!(
+            blue.mention_users,
+            (1006..=1010).map(UserId::new).collect::<Vec<_>>()
+        );
+        assert!(red.buttons.is_empty() && blue.buttons.is_empty());
+    }
+
+    /// ホストは**相手チームの人にも**伝える。メンションはホスト1人だけ。
+    #[test]
+    fn the_host_announcement_names_the_host_once() {
+        let first = host_announcement(formation(), UserId::new(1001), 1, 3, SITE);
+        assert!(first.content.contains("<@1001>"), "{}", first.content);
+        assert_eq!(first.content.matches("<@").count(), 1, "{}", first.content);
+        assert_eq!(first.mention_users, vec![UserId::new(1001)]);
+        assert!(first.content.contains(SITE), "{}", first.content);
+        // 1人目は「交代」と書かない
+        assert!(!first.content.contains("交代"), "{}", first.content);
+        assert!(first.buttons.is_empty());
+
+        // 候補が移ったら、その旨も招集チャンネルに出る
+        let second = host_announcement(formation(), UserId::new(1002), 2, 3, SITE);
+        assert!(second.content.contains("交代"), "{}", second.content);
+        assert!(second.content.contains("2/3"), "{}", second.content);
+        // ロールは出さない
+        for role in ["ロール0", "ロール1", "上キャリー", "中央"] {
+            assert!(!second.content.contains(role), "{}", second.content);
+        }
     }
 
     #[test]
@@ -916,12 +930,20 @@ mod tests {
             confirmed_today: 4,
         };
         println!(
-            "========== 割り当て表 ==========\n{}",
-            assignment(&head(), &roster(), &vc(), "kyogre", &["設定 A".into()]).content
+            "========== 割り当て表（red） ==========\n{}",
+            assignment(
+                &head(),
+                &roster(),
+                &vc(),
+                Team::Red,
+                "kyogre",
+                &["設定 A".into()]
+            )
+            .content
         );
         println!(
-            "========== 招集通知 ==========\n{}",
-            summon(&roster(), &vc()).content
+            "========== 招集通知（red） ==========\n{}",
+            summon(&roster(), &vc(), Team::Red, SITE).content
         );
         println!(
             "========== 成立時ログ ==========\n{}",
@@ -933,95 +955,229 @@ mod tests {
         );
     }
 
-    /// レビュー用に招集の文面をそのまま出す。
-    ///
-    /// `cargo test --lib discord::render -- --ignored --nocapture` で取り出す。
     #[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
     #[test]
-    fn dump_summon_for_review() {
-        println!("========== 招集チャンネルの文面 ==========");
-        println!("{}", summon(&roster(), &vc()).content);
+    fn dump_notifications_for_review() {
+        let host = UserId::new(1001);
+        let checklist = vec!["大会モード".to_owned(), "ドラフト3枠ban".to_owned()];
+        println!("========== 招集チャンネル: 成立（red） ==========");
+        println!("{}", summon(&roster(), &vc(), Team::Red, SITE).content);
+        println!("\n========== 招集チャンネル: 成立（blue） ==========");
+        println!("{}", summon(&roster(), &vc(), Team::Blue, SITE).content);
+        println!("\n========== 招集チャンネル: ホスト決定 ==========");
+        println!(
+            "{}",
+            host_announcement(formation(), host, 1, 3, SITE).content
+        );
+        println!("\n========== 招集チャンネル: ホスト交代 ==========");
+        println!(
+            "{}",
+            host_announcement(formation(), UserId::new(1006), 2, 3, SITE).content
+        );
+        println!("\n========== red の VC: 割り当て表 ==========");
+        println!(
+            "{}",
+            assignment(&head(), &roster(), &vc(), Team::Red, "kyogre", &checklist).content
+        );
+        println!("\n========== blue の VC: 割り当て表 ==========");
+        println!(
+            "{}",
+            assignment(&head(), &roster(), &vc(), Team::Blue, "kyogre", &checklist).content
+        );
+        println!("\n========== ホスト候補の VC: 打診 ==========");
+        println!("{}", host_prompt(&head(), host, 1, 3, SITE).content);
+        println!("\n========== ホスト候補の VC: 承諾後 ==========");
+        println!("{}", host_accepted(&head(), host, SITE).content);
+        println!("\n========== red の VC: ルーム ID 開示 ==========");
+        println!(
+            "{}",
+            code_reveal(&head(), host, "12345678", &vc(), Team::Red).content
+        );
+        println!("\n========== blue の VC: ルーム ID 開示 ==========");
+        println!(
+            "{}",
+            code_reveal(&head(), host, "12345678", &vc(), Team::Blue).content
+        );
+        println!("\n========== 両 VC: 報告の催促 ==========");
+        println!("{}", report_prompt(&head(), SITE).content);
+        println!("\n========== 古いボタンを押した人にだけ ==========");
+        println!("{}", moved_to_the_site(SITE));
     }
 
     /// 招集チャンネルは全員が見る。**レート・ロール割り当て・報告の情報を出さない**（00 §3-5）。
     #[test]
     fn summon_never_leaks_ratings_roles_or_reports() {
-        let message = summon(&roster(), &vc());
+        for team in Team::ALL {
+            let message = summon(&roster(), &vc(), team, SITE);
+            for forbidden in [
+                "1500",
+                "レート",
+                "25",
+                "top_carry",
+                "上キャリー",
+                "ロール",
+                "報告",
+                "勝",
+            ] {
+                assert!(
+                    !message.content.contains(forbidden),
+                    "{forbidden} leaked: {}",
+                    message.content
+                );
+            }
+            // roster が持っているロール表示名も識別子も出ていない
+            for entry in roster() {
+                assert!(
+                    !message.content.contains(&entry.role_display_name),
+                    "{}",
+                    message.content
+                );
+                assert!(
+                    !message.content.contains(&entry.role),
+                    "{}",
+                    message.content
+                );
+            }
+        }
+    }
+
+    /// **打診にボタンは無い。**操作はマッチ画面。通知としての役目だけ残す。
+    #[test]
+    fn the_host_prompt_is_a_notification_without_buttons() {
+        let message = host_prompt(&head(), UserId::new(1001), 2, 3, SITE);
+        assert_eq!(message.mention_users, vec![UserId::new(1001)]);
+        assert!(message.content.contains("2/3"));
+        assert!(message.content.contains(SITE), "{}", message.content);
+        assert!(message.buttons.is_empty(), "{message:?}");
+        assert!(host_prompt_moved(&head(), Team::Blue).buttons.is_empty());
+        assert!(
+            host_accepted(&head(), UserId::new(1001), SITE)
+                .buttons
+                .is_empty()
+        );
+    }
+
+    /// **開示のメンションはホスト1人だけ。**参加者10人分は招集チャンネルと重複する。
+    #[test]
+    fn the_room_code_mentions_only_the_host() {
+        let host = UserId::new(1001);
+        for team in Team::ALL {
+            let message = code_reveal(&head(), host, "8888", &vc(), team);
+            assert_eq!(message.mention_users, vec![host]);
+            // ホスト以外の `<@` が本文に無い
+            assert_eq!(
+                message.content.matches("<@").count(),
+                1,
+                "{}",
+                message.content
+            );
+            assert!(message.content.contains("<@1001>"), "{}", message.content);
+            for user in 1002..=1010 {
+                assert!(
+                    !message.content.contains(&format!("<@{user}>")),
+                    "{}",
+                    message.content
+                );
+            }
+            assert!(message.content.contains("**8888**"));
+            // 集合先はそのチームの側だけ
+            assert!(message.content.contains(&vc().channel_name(team)));
+            assert!(message.buttons.is_empty());
+        }
+        // red の投稿に blue の VC が出てこない
+        let red = code_reveal(&head(), host, "8888", &vc(), Team::Red);
+        assert!(!red.content.contains("vc3-blue"), "{}", red.content);
+    }
+
+    /// ルーム ID に紛れ込んだ mention 構文を本文へ持ち込まない。
+    #[test]
+    fn a_hostile_room_code_cannot_mention_anyone() {
+        let message = code_reveal(&head(), UserId::new(1001), "<@&12345>", &vc(), Team::Red);
+        assert_eq!(
+            message.content.matches("<@").count(),
+            1,
+            "{}",
+            message.content
+        );
+        assert!(
+            message.content.contains("＜@&12345＞"),
+            "{}",
+            message.content
+        );
+    }
+
+    /// **報告の催促にボタンは無く、メンションも付けない。**
+    ///
+    /// 「報告してください」とは書くが、**勝敗を名指ししない**。選択肢はサイトにある。
+    #[test]
+    fn the_report_prompt_only_points_at_the_site() {
+        let message = report_prompt(&head(), SITE);
+        assert!(message.buttons.is_empty(), "{message:?}");
+        assert!(message.mention_users.is_empty(), "{message:?}");
+        assert!(message.content.contains(SITE), "{}", message.content);
+        assert!(!message.content.contains("<@"), "{}", message.content);
+        // 勝敗の語も、他人の状況も、件数も出さない
         for forbidden in [
-            "1500",
-            "レート",
-            "25",
-            "top_carry",
-            "上キャリー",
-            "ロール",
-            "報告",
             "勝",
+            "負",
+            "敗",
+            "赤",
+            "青",
+            "無効",
+            "人が報告",
+            "件",
+            "済み",
         ] {
             assert!(
                 !message.content.contains(forbidden),
-                "{forbidden} leaked: {}",
-                message.content
-            );
-        }
-        // roster が持っているロール表示名も出ていない
-        for entry in roster() {
-            assert!(
-                !message.content.contains(&entry.role_display_name),
-                "{}",
-                message.content
-            );
-            assert!(
-                !message.content.contains(&entry.role),
-                "{}",
+                "{forbidden}: {}",
                 message.content
             );
         }
     }
 
+    /// 通知にはすべてマッチ画面の行き先が入る。**操作はサイトにしか無い。**
     #[test]
-    fn host_prompt_has_accept_and_decline_buttons_for_the_candidate() {
-        let formation = formation();
-        let player = PlayerId(Uuid::from_u128(1));
-        let message = host_prompt(&head(), UserId::new(1001), formation, player, 2, 3);
-        assert_eq!(message.mention_users, vec![UserId::new(1001)]);
-        assert!(message.content.contains("2/3"));
-        let ids: Vec<CustomId> = message
-            .buttons
-            .iter()
-            .map(|button| CustomId::parse(&button.custom_id).unwrap())
-            .collect();
-        assert_eq!(ids[0].action, Action::HostAccept);
-        assert_eq!(ids[1].action, Action::HostDecline);
-        assert!(
-            ids.iter()
-                .all(|id| id.formation == formation && id.player == player)
-        );
-        assert!(host_prompt_moved(&head(), Team::Blue).buttons.is_empty());
-    }
-
-    #[test]
-    fn code_reveal_pings_the_other_nine_only() {
-        let host = UserId::new(1001);
-        let others: Vec<UserId> = (1002..=1010).map(UserId::new).collect();
-        let message = code_reveal(&head(), host, &others, "8888", &vc());
-        assert_eq!(message.mention_users, others);
-        assert!(message.content.contains("**8888**"));
-        assert!(message.content.contains("vc3-red"));
-        assert!(message.content.contains("vc3-blue"));
-    }
-
-    #[test]
-    fn modal_prefills_the_current_code_when_correcting() {
-        let formation = formation();
-        let player = PlayerId(Uuid::from_u128(1));
-        assert_eq!(code_modal(formation, player, None).prefill, None);
+    fn every_actionable_notification_carries_the_match_url() {
+        let url = match_url(SITE, formation());
         assert_eq!(
-            code_modal(formation, player, Some("1234"))
-                .prefill
-                .as_deref(),
-            Some("1234")
+            url,
+            format!("{SITE}/match/000000000000000000000000000000f0").replace(
+                "000000000000000000000000000000f0",
+                &formation().0.to_string()
+            )
         );
-        let parsed = CustomId::parse(&code_modal(formation, player, None).custom_id).unwrap();
-        assert_eq!(parsed.action, Action::CodeSubmit);
+        for message in [
+            summon(&roster(), &vc(), Team::Red, &url),
+            host_announcement(formation(), UserId::new(1001), 1, 3, &url),
+            host_prompt(&head(), UserId::new(1001), 1, 3, &url),
+            host_accepted(&head(), UserId::new(1001), &url),
+            report_prompt(&head(), &url),
+        ] {
+            assert!(message.content.contains(&url), "{}", message.content);
+        }
+        // 末尾の / を重ねない
+        assert_eq!(
+            match_url("https://match.example.test/", formation()),
+            match_url("https://match.example.test", formation())
+        );
+    }
+
+    /// **どのメッセージにもボタンが無い**（Discord にインタラクションを残さない）。
+    #[test]
+    fn no_message_carries_an_interaction() {
+        let mut messages = all_messages();
+        messages.push(report_prompt(&head(), SITE));
+        messages.push(summon(&roster(), &vc(), Team::Red, SITE));
+        messages.push(host_announcement(
+            formation(),
+            UserId::new(1001),
+            1,
+            3,
+            SITE,
+        ));
+        for message in messages {
+            assert!(message.buttons.is_empty(), "{message:?}");
+        }
     }
 }

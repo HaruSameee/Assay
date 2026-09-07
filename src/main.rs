@@ -17,13 +17,14 @@ use unite_matchsystem::discord::{
     Adapter, DiscordConfig, Handler, SerenityGateway, build_client, resolve_vc_pool,
 };
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
+use unite_matchsystem::match_screen::{MatchRepository, MatchState, router as match_router};
 use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository};
 use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
 use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
 use unite_matchsystem::rating::RatingAdjustmentRepository;
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
-    router as registration_router,
+    router as registration_router, site_base_url,
 };
 use unite_matchsystem::status::{StatusRepository, StatusState, router as status_router};
 
@@ -65,7 +66,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "REPORT_GATE_DISABLED=true: report gate is disabled; registration gate remains active"
         );
     }
-    let lifecycle = LifecycleConfig::default();
+    // 打診の期限と候補人数は当日の校正対象。0 は起動で落とす
+    let lifecycle = LifecycleConfig::from_env()?;
+    info!(
+        host_accept_timeout_seconds = lifecycle.host_accept_timeout.as_secs(),
+        host_candidate_limit = lifecycle.max_host_candidates,
+        "host prompt settings loaded"
+    );
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -78,6 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ratings_repo = RatingAdjustmentRepository::new(pool.clone());
     let status_repo = StatusRepository::new(pool.clone());
     let admin_store = AdminRepository::new(pool.clone());
+    let match_pool = pool.clone();
     let matchmaker_repo = MatchmakerRepository::new(pool);
 
     let handler = Arc::new(Handler::default());
@@ -100,13 +108,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect();
     let matchmaker = Matchmaker::new(matchmaker_repo, vc_assignments, matchmaker_config);
+    // 通知に載せるマッチ画面 URL の起点。リダイレクト URI から導出するので、
+    // ログインの行き先と別のホストを指すことがない
+    let site = site_base_url(&auth_config.redirect_uri);
+    let room_map = discord_config.room_map.clone();
+    let room_checklist = discord_config.room_checklist.clone();
     let adapter = Arc::new(Adapter::new(
-        repo,
+        repo.clone(),
         gateway,
         discord_config,
         vc_pool,
         lifecycle.clone(),
         Box::new(DefaultHostSelector::from_config(&lifecycle)),
+        site.clone(),
     ));
     handler.attach(adapter.clone());
     let timeout_adapter = adapter.clone();
@@ -143,8 +157,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .merge(status_router(
         StatusState::new(auth_config.clone(), ratings_repo, status_repo)
             .with_admins(admin_ids.clone()),
+    ))
+    // 操作はすべてここ。Discord にはインタラクションを残さない
+    .merge(match_router(
+        MatchState::new(
+            auth_config.clone(),
+            repo,
+            MatchRepository::new(match_pool),
+            lifecycle.clone(),
+            &room_map,
+            &room_checklist,
+        )
+        .with_admins(admin_ids.clone()),
     ));
-    info!("status routes mounted");
+    info!(site = %site, "status and match routes mounted");
     // fail-closed: 管理者 ID が未設定ならルート自体をマウントしない
     // （INTERNAL_API_TOKEN と同じ方針。設定してもセッションの Discord ID 照合が正）
     let app = match admin_ids {

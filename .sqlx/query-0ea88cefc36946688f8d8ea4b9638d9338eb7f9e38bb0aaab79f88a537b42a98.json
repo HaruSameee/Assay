@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select team from formation_players where formation_id = $1 and player_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "team",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "team"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0ea88cefc36946688f8d8ea4b9638d9338eb7f9e38bb0aaab79f88a537b42a98"
+}

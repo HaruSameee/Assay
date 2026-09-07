@@ -5,6 +5,7 @@ pub mod admin;
 pub mod api;
 pub mod discord;
 pub mod lifecycle;
+pub mod match_screen;
 pub mod matchmaker;
 pub mod persistence;
 pub mod queue;

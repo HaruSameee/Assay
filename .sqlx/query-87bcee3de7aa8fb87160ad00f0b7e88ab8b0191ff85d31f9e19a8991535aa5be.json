@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select kind, operation from discord_failures where formation_id = $1",
+  "query": "select kind, operation from discord_failures where formation_id = $1 order by id",
   "describe": {
     "columns": [
       {
@@ -36,5 +36,5 @@
       false
     ]
   },
-  "hash": "23d3a2ac0f94ae44506375fb1d06c929c960e4f4bae83f1ba6aa6a4d84793a11"
+  "hash": "87bcee3de7aa8fb87160ad00f0b7e88ab8b0191ff85d31f9e19a8991535aa5be"
 }

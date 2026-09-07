@@ -30,8 +30,13 @@ pub const HOST_PROMPT_CHANNEL_ID_KEY: &str = "host_prompt_channel_id";
 pub const HOST_PROMPT_MESSAGE_ID_KEY: &str = "host_prompt_message_id";
 /// `code_posted`: ルーム ID を開示したメッセージの ID（`{"red": "...", "blue": "..."}`）。貼り直しは編集する。
 pub const CODE_MESSAGE_IDS_KEY: &str = "code_message_ids";
-/// `code_posted`: 報告ボタンを置いたメッセージの ID（red / blue）。
+/// `code_posted`: 報告の催促を置いたメッセージの ID（red / blue）。
 pub const REPORT_MESSAGE_IDS_KEY: &str = "report_message_ids";
+/// `host_accepted`: 承諾を VC チャットへ反映済みであることの印。
+///
+/// 操作がサイトへ移り、承諾の追記（HTTP）と VC への反映（再開ループ）が別々に起きるように
+/// なった。**二重投稿を避ける判断材料をログに残す** — プロセス内のフラグに持つと再起動で消える。
+pub const HOST_ACCEPT_NOTIFIED_KEY: &str = "host_accept_notified";
 /// `disputed`: 運営専用通知のチャンネル ID。
 pub const DISPUTE_CHANNEL_ID_KEY: &str = "dispute_channel_id";
 /// `disputed`: 運営専用通知のメッセージ ID。
@@ -87,8 +92,14 @@ pub struct DiscordRecord {
     pub host_prompt: Option<(ChannelId, MessageId)>,
     /// ルーム ID を開示したメッセージ（チームごと）。
     pub code_message_ids: HashMap<Team, MessageId>,
-    /// 報告ボタンのメッセージ（チームごと）。
+    /// 報告の催促のメッセージ（チームごと）。
     pub report_message_ids: HashMap<Team, MessageId>,
+    /// **VC チャットへ実際に開示済みのルーム ID。**現在のルーム ID と食い違っていれば、
+    /// 打ち直しがまだ届いていない。サイトからの追記と VC への投稿が別々に起きるので、
+    /// 「投稿したかどうか」をログから判定できる形にしてある。
+    pub revealed_code: Option<String>,
+    /// ホストの承諾を VC チャットへ反映済みか。
+    pub host_accept_notified: bool,
     /// 係争の運営通知。
     pub dispute_notification: Option<(ChannelId, MessageId)>,
 }
@@ -117,8 +128,19 @@ impl DiscordRecord {
                             host_prompt: None,
                             code_message_ids: HashMap::new(),
                             report_message_ids: HashMap::new(),
+                            revealed_code: None,
+                            host_accept_notified: false,
                             dispute_notification: None,
                         };
+                    }
+                }
+                K::HostAccepted => {
+                    if payload
+                        .get(HOST_ACCEPT_NOTIFIED_KEY)
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        record.host_accept_notified = true;
                     }
                 }
                 K::HostAssigned => {
@@ -134,6 +156,13 @@ impl DiscordRecord {
                     let ids = per_team_ids(payload.get(CODE_MESSAGE_IDS_KEY));
                     if !ids.is_empty() {
                         record.code_message_ids = ids;
+                        // メッセージ ID が入っている追記だけが「開示した」ことの証拠。
+                        // サイトからの投稿（ID が無い）はここを更新しないので、
+                        // 打ち直しは必ず未開示として扱われる
+                        record.revealed_code = payload
+                            .get(ROOM_CODE_KEY)
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                     }
                     let report_ids = per_team_ids(payload.get(REPORT_MESSAGE_IDS_KEY));
                     if !report_ids.is_empty() {
@@ -287,6 +316,20 @@ pub fn host_response(discord_user_id: i64, failures: &[DiscordFailure]) -> Value
     with_failures(map, failures)
 }
 
+/// 承諾を VC チャットへ反映したことを残す `host_accepted` の payload。
+///
+/// 同じホストの `host_accepted` の再追記なので**状態は変わらない**（状態機械はそのまま）。
+/// これは「投稿済み」という副作用の記録であって、新しい遷移ではない。
+pub fn host_accept_notified(discord_user_id: i64, failures: &[DiscordFailure]) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        DISCORD_USER_ID_KEY.into(),
+        Value::String(discord_user_id.to_string()),
+    );
+    map.insert(HOST_ACCEPT_NOTIFIED_KEY.into(), Value::Bool(true));
+    with_failures(map, failures)
+}
+
 /// `code_posted` の payload。状態機械が読む `room_code` を含む。
 pub fn code_posted(
     room_code: &str,
@@ -436,8 +479,83 @@ mod tests {
                 host_prompt: Some((ChannelId::new(31), MessageId::new(103))),
                 code_message_ids: ids(104, 105),
                 report_message_ids: ids(106, 107),
+                // メッセージ ID が入った code_posted なので「開示済み」として読める
+                revealed_code: Some("1234".into()),
+                host_accept_notified: false,
                 dispute_notification: None,
             }
+        );
+    }
+
+    /// サイトからの追記（メッセージ ID なし）は開示済みにしない。
+    ///
+    /// **打ち直しが VC に必ず届く**ための性質。ここが緩むと、貼り直したコードが
+    /// マッチ画面にだけ出て、VC には古いコードが残る。
+    #[test]
+    fn a_room_code_posted_from_the_site_is_not_yet_revealed() {
+        let assigned = stored(1, K::VcAssigned, json!({ VC_KEY: vc_to_json(&pair()) }));
+        let from_site = |seq: i64, code: &str| {
+            stored(
+                seq,
+                K::CodePosted,
+                json!({ ROOM_CODE_KEY: code, "source": "web" }),
+            )
+        };
+        let revealed = |seq: i64, code: &str| {
+            stored(
+                seq,
+                K::CodePosted,
+                json!({
+                    ROOM_CODE_KEY: code,
+                    CODE_MESSAGE_IDS_KEY: { "red": "104", "blue": "105" },
+                }),
+            )
+        };
+
+        // サイトから積んだだけでは未開示
+        let record = DiscordRecord::from_log(&log(vec![assigned.clone(), from_site(2, "1234")]));
+        assert_eq!(record.revealed_code, None);
+        assert!(record.code_message_ids.is_empty());
+
+        // VC に出した追記が続くと開示済みになる
+        let record = DiscordRecord::from_log(&log(vec![
+            assigned.clone(),
+            from_site(2, "1234"),
+            revealed(3, "1234"),
+        ]));
+        assert_eq!(record.revealed_code.as_deref(), Some("1234"));
+
+        // 打ち直し（サイトから）は、開示済みのコードと食い違うので再投稿の対象になる
+        let record = DiscordRecord::from_log(&log(vec![
+            assigned,
+            from_site(2, "1234"),
+            revealed(3, "1234"),
+            from_site(4, "5678"),
+        ]));
+        assert_eq!(
+            record.revealed_code.as_deref(),
+            Some("1234"),
+            "新しいコードはまだ VC に出ていない"
+        );
+    }
+
+    /// 承諾の VC への反映も、ログから導出する（プロセス内のフラグに持たない）。
+    #[test]
+    fn the_host_acceptance_notice_is_recorded_in_the_log() {
+        let assigned = stored(1, K::VcAssigned, json!({ VC_KEY: vc_to_json(&pair()) }));
+        let from_site = stored(2, K::HostAccepted, json!({ "source": "web" }));
+        assert!(
+            !DiscordRecord::from_log(&log(vec![assigned.clone(), from_site.clone()]))
+                .host_accept_notified
+        );
+
+        let notified = stored(
+            3,
+            K::HostAccepted,
+            json!({ HOST_ACCEPT_NOTIFIED_KEY: true }),
+        );
+        assert!(
+            DiscordRecord::from_log(&log(vec![assigned, from_site, notified])).host_accept_notified
         );
     }
 

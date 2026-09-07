@@ -1,0 +1,84 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select fp.player_id, fp.team, p.trainer_name, r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", $2::double precision + coalesce((select sum(a.delta_mu) from rating_adjustments a where a.player_id = fp.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\" from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role left join player_match_ratings m on m.player_id = fp.player_id where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "team",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "team"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "role_display_name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "role_sort_order!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "1f5a90c168fbd13926b3c87bb6ceb7c6825f842e36512c9d3ba1a147af6b0b26"
+}

@@ -32,7 +32,9 @@ pub mod routes;
 pub mod session;
 pub mod viewer;
 
-pub use config::{AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env};
+pub use config::{
+    AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env, site_base_url,
+};
 pub use gate::{
     QueueEligibility, RegistrationBlock, active_formation_blocks_queue, evaluate,
     formation_blocks_queue,

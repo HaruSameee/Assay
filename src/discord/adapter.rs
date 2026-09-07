@@ -1,14 +1,20 @@
-//! Discord アダプタ本体。Discord 操作と、イベント時刻から導出する Phase 5 のタイムアウトを扱う。
+//! Discord アダプタ本体。**通知の送出**と、イベント時刻から導出する Phase 5 のタイムアウトを扱う。
 //!
-//! 流れ:
-//! 1. `matched` → VC の組を LRU で確保 → 割り当て表を red / blue 両方の VC チャットに投稿 →
-//!    `vc_assigned`（payload に VC のラベルと両チャンネル ID、割り当て表のメッセージ ID）
-//! 2. `HostSelector` の候補を、候補の側の VC チャットにだけ打診 → `host_assigned`
-//!    （payload に打診メッセージのチャンネル ID と ID）
-//! 3. 「部屋を作る」→ モーダル → `host_accepted` → モーダル送信 → 両 VC に開示 → `code_posted`
-//!    （payload にルーム ID・開示メッセージ ID）
-//! 4. 「今回はパスする」→ `host_declined` → 次の候補（同じ側なら打診メッセージを編集、反対側なら
-//!    古い打診のボタンを外して反対側に投稿）。尽きたら `abandoned`
+//! **操作はここには無い。**ホスト打診への応答・ルーム ID の投稿・報告はすべてマッチ画面
+//! （[`crate::match_screen`]）の HTTP エンドポイントで受ける。ボタンもモーダルも作らない。
+//! Discord に残すのは通知だけ — サイトを開いていない人に「あなたの番です」を伝える手段が
+//! 他に無く、打診は候補あたり数分、報告は 30 分の期限がある。通知が無ければ、画面を
+//! 開いている人だけが進行できる仕組みになる。
+//!
+//! 流れ（**すべて再開ループが DB の状態から出す**。サイトはイベントを積むだけ）:
+//! 1. `matched` → VC の組を LRU で確保 → 割り当て表を**チームごとの本文で**両 VC に投稿 →
+//!    招集チャンネルにも**チームごとに**投稿 → `vc_assigned`
+//! 2. `awaiting_host`（候補未指名）→ 候補の側の VC に打診の通知、招集チャンネルにホストの
+//!    通知 → `host_assigned`
+//! 3. `awaiting_code` → 承諾を VC の打診メッセージに反映（[`Adapter::ensure_host_accepted_notice`]）
+//! 4. `in_progress` → ルーム ID を両 VC に開示し、報告の催促を出す
+//!    （[`Adapter::ensure_code_revealed`]）。**打ち直しはコードが変わるので必ず届く**
+//! 5. `disputed` → 運営専用チャンネルへ通知
 //!
 //! 失敗経路（すべて `abandoned` で解散し、理由と詳細を payload に残す。10 人を黙って拘束しない）:
 //! - 空いている VC が無い → `vc_pool_exhausted`
@@ -18,15 +24,12 @@
 //! - 副作用の記録が正。Discord に投稿したら、その ID を必ず `formation_events.payload` に入れる。
 //!   失敗も同じ payload に残す（stdout のログは記録ではない）。再起動後は [`DiscordRecord`] を
 //!   ログから導出して続きを操作する。Discord 側を検索し直さない。
+//! - **投稿済みかどうかもログから導出する。**プロセス内のフラグに持たない（再起動で消える）。
 //! - VC チャットのメッセージは消さない（VC は使い回すが、過去のルーム ID は試合終了で無効）。
 //!   すべての投稿に見出し（VC ラベル・時刻・試合 ID）を付ける。
-//! - インタラクションでは「副作用 → 記録」。VC 割当だけはクラッシュ後の二重利用を防ぐため、
-//!   プール全体の DB ロックと同一トランザクションで先に記録してから副作用を行う。
-//!   状態機械で事前に検証してから応答し、
-//!   応答の成否を含めて追記する。正式な検証は [`FormationRepository::append_event`]
-//!   （ロック → 検証 → INSERT）が行う。
-//! - インタラクション由来のイベントの冪等キーは、そのインタラクション ID。
-//! - 古いボタンは Discord 側で無効化しない。状態機械の検証で弾いて、押した本人にだけ知らせる。
+//! - **相手チームの構成を載せない。**割り当て表も招集もチームごとに分ける。サイト側だけ
+//!   隠しても、VC の投稿に相手のロールが載っていれば意味が無い。
+//! - 履歴に残った古いボタンは Discord 側で無効化しない。押されたら、本人にだけ行き先を返す。
 //!
 //! マッチメイカ側への制約（Phase 4 の範囲外、03 に書き留めること）:
 //! formation を確定させる前に VC プールの空きを確認する。座席が無いのに formation を作ると、
@@ -41,19 +44,17 @@ use serenity::model::id::{ChannelId, GuildId, InteractionId, MessageId, UserId};
 use tracing::{debug, error, info, warn};
 
 use crate::lifecycle::{
-    AbandonReason, Anomaly, Deadline, EventPayload, Formation, FormationEvent, FormationEventKind,
-    FormationId, FormationPlayer, FormationState, HostAction, HostSelector, LifecycleConfig,
-    PlayerId, apply, next_deadline, next_host_action,
+    AbandonReason, Anomaly, Deadline, Formation, FormationEventKind, FormationId, FormationPlayer,
+    FormationState, HostAction, HostSelector, LifecycleConfig, PlayerId, next_deadline,
+    next_host_action,
 };
 use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{
-    FormationLog, FormationRepository, NewDiscordFailure, NewEvent, NewReport, Outcome,
-    ReportDecision, RepositoryError, RosterEntry, Team, UnfinishedFormation, VcAssignment,
-    VcAssignmentOutcome,
+    FormationLog, FormationRepository, NewDiscordFailure, NewEvent, ReportDecision,
+    RepositoryError, RosterEntry, Team, UnfinishedFormation, VcAssignment, VcAssignmentOutcome,
 };
 
 use super::config::DiscordConfig;
-use super::custom_id::{Action, CustomId, ROOM_CODE_INPUT_ID};
 use super::gateway::{Gateway, GatewayError, InteractionRef, InteractionResponse, OutgoingMessage};
 use super::payload::{self, DiscordFailure, DiscordRecord};
 use super::render;
@@ -127,6 +128,9 @@ pub struct Adapter {
     lifecycle: LifecycleConfig,
     selector: Box<dyn HostSelector + Send + Sync>,
     vc_pool: VcPool,
+    /// サイトの起点（`https://match.aynm.dev`）。通知に添えるマッチ画面 URL を組み立てる。
+    /// **必須の引数にしてある** — 操作はサイトにしか無いので、行き先の無い通知は用を成さない。
+    site_base_url: String,
     /// Ready 時と定期走査が同じ副作用を二重送信しないためのプロセス内直列化。
     /// 期限や VC 占有の正はここに持たず、DB のイベント列と advisory lock にある。
     resume_lock: tokio::sync::Mutex<()>,
@@ -141,6 +145,7 @@ impl Adapter {
         vc_pool: Vec<VcPair>,
         lifecycle: LifecycleConfig,
         selector: Box<dyn HostSelector + Send + Sync>,
+        site_base_url: impl Into<String>,
     ) -> Self {
         Self {
             repo,
@@ -149,8 +154,14 @@ impl Adapter {
             lifecycle,
             selector,
             vc_pool: VcPool::new(vc_pool),
+            site_base_url: site_base_url.into(),
             resume_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// この formation のマッチ画面 URL。通知には必ず添える。
+    fn match_url(&self, formation: FormationId) -> String {
+        render::match_url(&self.site_base_url, formation)
     }
 
     /// 永続化層。
@@ -348,11 +359,16 @@ impl Adapter {
                 return Ok(());
             }
 
+            // **通知の入口はここ 1 つ。**サイトはイベントを積むだけで Discord を呼ばない。
+            // 何を投稿すべきかは毎回 DB の状態から決まるので、プロセスが落ちても
+            // 次のスキャンで続きから進む（00 §7 Phase 5 の申し送り: 復帰の入口を 2 つ作らない）。
             return match &formation.snapshot.state {
                 FormationState::Matched => self.start_formation_locked(id).await,
                 FormationState::AwaitingHost { pending: None, .. } => {
                     self.resume_vc_assignment(id, &formation.log).await
                 }
+                FormationState::AwaitingCode { .. } => self.ensure_host_accepted_notice(id).await,
+                FormationState::InProgress { .. } => self.ensure_code_revealed(id).await,
                 FormationState::Disputed => self.ensure_dispute_notification(id).await,
                 _ => Ok(()),
             };
@@ -477,16 +493,19 @@ impl Adapter {
             ));
         }
         let heading = render::heading(vc, log.created_at, id);
-        let message = render::assignment(
-            &heading,
-            &roster,
-            vc,
-            &self.config.room_map,
-            &self.config.room_checklist,
-        );
+        let match_url = self.match_url(id);
         let mut ids = HashMap::new();
         let mut failures = Vec::new();
+        // **チームごとに別の本文。**そのVCには、そのチームの構成しか載せない
         for team in Team::ALL {
+            let message = render::assignment(
+                &heading,
+                &roster,
+                vc,
+                team,
+                &self.config.room_map,
+                &self.config.room_checklist,
+            );
             match self
                 .post_or_edit(
                     vc.channel(team),
@@ -503,34 +522,40 @@ impl Adapter {
             }
         }
         let assignment_failed = !failures.is_empty();
+        // 招集もチームごとに分ける。1 通に両チームを入れると相手の顔ぶれと行き先が
+        // 同じ場所に並ぶので、割り当てを VC ごとに分けた意味が薄れる
         let summon = if assignment_failed {
             None
         } else if let Some(existing) = record.summon_notification {
             Some(existing)
         } else {
-            let message = render::summon(&roster, vc);
-            match self
-                .retry("send:summon", || {
-                    self.gateway
-                        .send_message(self.config.summon_channel_id, &message)
-                })
-                .await
-            {
-                Ok(message_id) => {
-                    info!(
-                        formation = %id,
-                        channel = %self.config.summon_channel_id,
-                        %message_id,
-                        "match summon posted"
-                    );
-                    Some((self.config.summon_channel_id, message_id))
-                }
-                Err(failure) => {
-                    error!(formation = %id, error = %failure.error, "match summon failed; formation continues");
-                    failures.push(failure);
-                    None
+            let mut first = None;
+            for team in Team::ALL {
+                let message = render::summon(&roster, vc, team, &match_url);
+                match self
+                    .retry(&format!("send:summon:{team}"), || {
+                        self.gateway
+                            .send_message(self.config.summon_channel_id, &message)
+                    })
+                    .await
+                {
+                    Ok(message_id) => {
+                        info!(
+                            formation = %id,
+                            channel = %self.config.summon_channel_id,
+                            %message_id,
+                            %team,
+                            "match summon posted"
+                        );
+                        first.get_or_insert((self.config.summon_channel_id, message_id));
+                    }
+                    Err(failure) => {
+                        error!(formation = %id, %team, error = %failure.error, "match summon failed; formation continues");
+                        failures.push(failure);
+                    }
                 }
             }
+            first
         };
         let event = NewEvent::new(
             FormationEventKind::VcAssigned,
@@ -623,16 +648,16 @@ impl Adapter {
         })?;
         let channel = vc.channel(entry.team);
 
+        let match_url = self.match_url(id);
         let message = render::host_prompt(
             &heading,
             user,
-            id,
-            candidate,
             candidate_index + 1,
             candidates.len(),
+            &match_url,
         );
         let mut failures = Vec::new();
-        // 同じ側の VC に打診メッセージがあれば編集する。反対側にあればボタンを外して、こちらに投稿する
+        // 同じ側の VC に打診メッセージがあれば編集する。反対側にあれば「移りました」に書き換える
         let existing = match record.host_prompt {
             Some((prompt_channel, prompt_message)) if prompt_channel == channel => {
                 Some(prompt_message)
@@ -665,6 +690,22 @@ impl Adapter {
                     .await;
             }
         };
+        // **招集チャンネルにもホストを知らせる。**相手チームの人にも伝える（誰が部屋を
+        // 建てたか分からないと、入れなかったときに聞く相手が分からない）。候補が次に
+        // 移ったときも同じ経路で投稿するので、交代したことが公開の場に残る
+        let announcement =
+            render::host_announcement(id, user, candidate_index + 1, candidates.len(), &match_url);
+        if let Err(failure) = self
+            .retry("send:host_announcement", || {
+                self.gateway
+                    .send_message(self.config.summon_channel_id, &announcement)
+            })
+            .await
+        {
+            // 打診自体は VC に出ている。招集の通知が落ちても試合は続ける
+            error!(formation = %id, error = %failure.error, "host announcement failed; formation continues");
+            failures.push(failure);
+        }
         let event = NewEvent::new(
             FormationEventKind::HostAssigned,
             Some(candidate),
@@ -683,7 +724,11 @@ impl Adapter {
         Ok(())
     }
 
-    /// ゲートウェイから来たインタラクションを処理する。
+    /// 過去に投稿したボタンへの応答。**状態は一切変えない。**
+    ///
+    /// 新しいボタンはもう作らない（操作はサイトへ移した）。ただしチャット履歴に残った
+    /// 古いメッセージは押せてしまうので、黙って無視せず、本人にだけ行き先を返す。
+    /// ここでイベントを積んだり報告を受けたりはしない — Discord に操作を残さない。
     pub async fn handle_interaction(
         &self,
         incoming: IncomingInteraction,
@@ -694,240 +739,109 @@ impl Adapter {
             debug!(%guild, "ignoring interaction from another guild");
             return Ok(());
         }
-        let Some(custom_id) = CustomId::parse(incoming.custom_id()) else {
-            debug!(
-                custom_id = incoming.custom_id(),
-                "ignoring foreign custom id"
-            );
-            return Ok(());
-        };
-        match (custom_id.action, &incoming.kind) {
-            (Action::HostAccept, IncomingKind::Button { .. }) => {
-                self.on_host_accept(&incoming, custom_id).await
-            }
-            (Action::HostDecline, IncomingKind::Button { .. }) => {
-                self.on_host_decline(&incoming, custom_id).await
-            }
-            (Action::CodeOpen, IncomingKind::Button { .. }) => {
-                self.on_code_open(&incoming, custom_id).await
-            }
-            (Action::CodeSubmit, IncomingKind::ModalSubmit { inputs, .. }) => {
-                self.on_code_submit(&incoming, custom_id, inputs.get(ROOM_CODE_INPUT_ID))
-                    .await
-            }
-            (action, IncomingKind::Button { .. }) if action.report_outcome().is_some() => {
-                self.on_report(&incoming, custom_id, action.report_outcome().unwrap())
-                    .await
-            }
-            (action, kind) => {
-                debug!(?action, ?kind, "interaction kind does not match the action");
-                Ok(())
-            }
-        }
+        debug!(
+            custom_id = incoming.custom_id(),
+            "interaction received after the move to the site; answering with the link only"
+        );
+        self.ephemeral(&incoming, render::moved_to_the_site(&self.site_base_url))
+            .await;
+        Ok(())
     }
 
-    /// 「部屋を作る」: 検証 → モーダルを開く → 状態表示を「作成中」に → `host_accepted` を追記。
-    async fn on_host_accept(
-        &self,
-        incoming: &IncomingInteraction,
-        custom_id: CustomId,
-    ) -> Result<(), AdapterError> {
-        let CustomId {
-            formation, player, ..
-        } = custom_id;
-        let Some((entry, _)) = self.presser_is(incoming, formation, player).await? else {
+    /// ホストが承諾した後の状態表示を VC に出す（サイトからの `host_accepted` を受けて）。
+    ///
+    /// 二重投稿を避けるため、通知済みかどうかはログから導出する。既に通知済みなら何もしない。
+    /// 通知したことは `host_accepted` の再追記で残す（同じホストの再送は状態を変えないので、
+    /// 状態機械に新しい遷移を足さずに済む）。
+    async fn ensure_host_accepted_notice(&self, id: FormationId) -> Result<(), AdapterError> {
+        let log = self.repo.load_events(id).await?;
+        let snapshot = log.snapshot();
+        let FormationState::AwaitingCode { host, .. } = snapshot.state else {
             return Ok(());
         };
-        let Some(log) = self
-            .prevalidate(
-                incoming,
-                formation,
-                FormationEventKind::HostAccepted,
-                player,
-                None,
-            )
-            .await?
+        let record = DiscordRecord::from_log(&log);
+        if record.host_accept_notified {
+            return Ok(());
+        }
+        let (Some(vc), Some((channel, prompt))) = (record.vc.clone(), record.host_prompt) else {
+            return Ok(());
+        };
+        let roster = self.repo.load_roster(id).await?;
+        let Some(user) = roster
+            .iter()
+            .find(|entry| entry.player_id == host)
+            .and_then(render::user_of)
         else {
             return Ok(());
         };
-
+        let heading = render::heading(&vc, log.created_at, id);
+        let message = render::host_accepted(&heading, user, &self.match_url(id));
         let mut failures = Vec::new();
-        self.respond(
-            incoming,
-            "respond:modal",
-            InteractionResponse::Modal(render::code_modal(formation, player, None)),
-            &mut failures,
-        )
-        .await;
-        // 状態表示を「作成中」に。同じ VC の全員に承諾が分かる
-        let record = DiscordRecord::from_log(&log);
-        if let (Some(vc), Some((channel, prompt))) = (&record.vc, record.host_prompt) {
-            let heading = render::heading(vc, log.created_at, formation);
-            let message = render::host_accepted(&heading, incoming.user, formation, player);
-            if let Err(failure) = self
-                .retry("edit:host_prompt", || {
-                    self.gateway.edit_message(channel, prompt, &message)
-                })
-                .await
-            {
-                failures.push(failure);
-            }
+        if let Err(failure) = self
+            .retry("edit:host_accepted", || {
+                self.gateway.edit_message(channel, prompt, &message)
+            })
+            .await
+        {
+            failures.push(failure);
         }
-
+        let discord_user_id = roster
+            .iter()
+            .find(|entry| entry.player_id == host)
+            .map(|entry| entry.discord_user_id)
+            .unwrap_or_default();
         let event = NewEvent::new(
             FormationEventKind::HostAccepted,
-            Some(player),
+            Some(host),
             Utc::now(),
-            incoming.id.to_string(),
+            format!("host_accepted_notified:{id}"),
         )
-        .with_payload(payload::host_response(entry.discord_user_id, &failures));
-        if self.record(formation, &event).await? {
-            info!(formation = %formation, %player, "host accepted");
+        .with_payload(payload::host_accept_notified(discord_user_id, &failures));
+        if self.record(id, &event).await? {
+            info!(formation = %id, %host, "host acceptance announced in the voice chat");
         }
         Ok(())
     }
 
-    /// 「今回はパスする」: 検証 → 受領 → `host_declined` を追記 → 次の候補を打診。
-    async fn on_host_decline(
-        &self,
-        incoming: &IncomingInteraction,
-        custom_id: CustomId,
-    ) -> Result<(), AdapterError> {
-        let CustomId {
-            formation, player, ..
-        } = custom_id;
-        let Some((entry, _)) = self.presser_is(incoming, formation, player).await? else {
-            return Ok(());
-        };
-        if self
-            .prevalidate(
-                incoming,
-                formation,
-                FormationEventKind::HostDeclined,
-                player,
-                None,
-            )
-            .await?
-            .is_none()
-        {
-            return Ok(());
-        }
-
-        // 打診メッセージは nominate_next が編集する（新しいメッセージは積まない）
-        let mut failures = Vec::new();
-        self.respond(
-            incoming,
-            "respond:acknowledge",
-            InteractionResponse::Acknowledge,
-            &mut failures,
-        )
-        .await;
-        let event = NewEvent::new(
-            FormationEventKind::HostDeclined,
-            Some(player),
-            Utc::now(),
-            incoming.id.to_string(),
-        )
-        .with_payload(payload::host_response(entry.discord_user_id, &failures));
-        if !self.record(formation, &event).await? {
-            return Ok(());
-        }
-        info!(formation = %formation, %player, "host declined");
-        self.nominate_next(formation).await
-    }
-
-    /// 「ルーム ID を入力 / 修正」: ホスト本人ならモーダルを開く。イベントは積まない。
-    async fn on_code_open(
-        &self,
-        incoming: &IncomingInteraction,
-        custom_id: CustomId,
-    ) -> Result<(), AdapterError> {
-        let CustomId {
-            formation, player, ..
-        } = custom_id;
-        let Some(_) = self.presser_is(incoming, formation, player).await? else {
-            return Ok(());
-        };
-        let log = self.repo.load_events(formation).await?;
+    /// ルーム ID を両 VC に開示し、報告の催促を出す（サイトからの `code_posted` を受けて）。
+    ///
+    /// 開示済みかどうかは「最後に開示したコード」をログから導出して判定する。**打ち直しは
+    /// コードが変わるので必ず再投稿（編集）される**。同じコードで何度呼ばれても 1 回で済む。
+    async fn ensure_code_revealed(&self, id: FormationId) -> Result<(), AdapterError> {
+        let log = self.repo.load_events(id).await?;
         let snapshot = log.snapshot();
-        let (host, current) = match &snapshot.state {
-            FormationState::AwaitingCode { host, .. } => (*host, None),
-            FormationState::InProgress { host, room_code } => (*host, Some(room_code.as_str())),
-            _ => {
-                self.ephemeral(incoming, render::stale()).await;
-                return Ok(());
-            }
-        };
-        if host != player {
-            self.ephemeral(incoming, render::not_the_host()).await;
-            return Ok(());
-        }
-        // 記録するイベントが無いので、この応答の失敗は payload に残らない（本人が押し直せば済む）
-        let mut failures = Vec::new();
-        self.respond(
-            incoming,
-            "respond:modal",
-            InteractionResponse::Modal(render::code_modal(formation, player, current)),
-            &mut failures,
-        )
-        .await;
-        Ok(())
-    }
-
-    /// モーダル送信: 検証 → 両 VC に開示（投稿または編集）→ 状態表示を更新 → `code_posted` を追記。
-    async fn on_code_submit(
-        &self,
-        incoming: &IncomingInteraction,
-        custom_id: CustomId,
-        input: Option<&String>,
-    ) -> Result<(), AdapterError> {
-        let CustomId {
-            formation, player, ..
-        } = custom_id;
-        let Some((entry, roster)) = self.presser_is(incoming, formation, player).await? else {
-            return Ok(());
-        };
-        let room_code = input.map(|value| value.trim()).unwrap_or_default();
-        if room_code.is_empty() {
-            self.ephemeral(incoming, render::code_invalid()).await;
-            return Ok(());
-        }
-        let Some(log) = self
-            .prevalidate(
-                incoming,
-                formation,
-                FormationEventKind::CodePosted,
-                player,
-                Some(room_code),
-            )
-            .await?
-        else {
+        let FormationState::InProgress { host, room_code } = snapshot.state.clone() else {
             return Ok(());
         };
         let record = DiscordRecord::from_log(&log);
-        let vc = record.vc.clone().ok_or_else(|| {
-            AdapterError::Inconsistent(formation, "no voice channels recorded".into())
-        })?;
-        let heading = render::heading(&vc, log.created_at, formation);
+        if record.revealed_code.as_deref() == Some(room_code.as_str()) {
+            return Ok(());
+        }
+        let Some(vc) = record.vc.clone() else {
+            return Ok(());
+        };
+        let roster = self.repo.load_roster(id).await?;
+        let Some(host_entry) = roster.iter().find(|entry| entry.player_id == host) else {
+            return Ok(());
+        };
+        let Some(host_user) = render::user_of(host_entry) else {
+            return Ok(());
+        };
+        let heading = render::heading(&vc, log.created_at, id);
+        let match_url = self.match_url(id);
+        let report_prompt = render::report_prompt(&heading, &match_url);
 
-        // 副作用（両 VC にコードと報告入口を投稿）→ 記録（code_posted に全メッセージ ID）
-        let others: Vec<UserId> = roster
-            .iter()
-            .filter(|other| other.player_id != player)
-            .filter_map(render::user_of)
-            .collect();
-        let reveal = render::code_reveal(&heading, incoming.user, &others, room_code, &vc);
-        let report_prompt = render::report_prompt(&heading, formation);
         let mut code_message_ids = HashMap::new();
         let mut report_message_ids = HashMap::new();
         let mut failures = Vec::new();
         for team in Team::ALL {
-            let what = format!("code_reveal:{team}");
+            // 開示もチーム側の文面にする（集合先はそのチームの VC だけを書く）
+            let reveal = render::code_reveal(&heading, host_user, &room_code, &vc, team);
             match self
                 .post_or_edit(
                     vc.channel(team),
                     record.code_message_ids.get(&team).copied(),
-                    &what,
+                    &format!("code_reveal:{team}"),
                     &reveal,
                 )
                 .await
@@ -937,12 +851,11 @@ impl Adapter {
                 }
                 Err(failure) => failures.push(failure),
             }
-            let report_what = format!("report_prompt:{team}");
             match self
                 .post_or_edit(
                     vc.channel(team),
                     record.report_message_ids.get(&team).copied(),
-                    &report_what,
+                    &format!("report_prompt:{team}"),
                     &report_prompt,
                 )
                 .await
@@ -955,100 +868,28 @@ impl Adapter {
         }
         if !failures.is_empty() {
             // 片側でも見えなければ試合にならない
-            error!(formation = %formation, count = failures.len(), "room code could not be revealed; abandoning");
-            self.ephemeral(incoming, render::reveal_failed()).await;
+            error!(formation = %id, count = failures.len(), "room code could not be revealed; abandoning");
             return self
-                .abandon_in_vc(
-                    formation,
-                    &vc,
-                    &record,
-                    AbandonReason::DiscordCallFailed,
-                    failures,
-                )
+                .abandon_in_vc(id, &vc, &record, AbandonReason::DiscordCallFailed, failures)
                 .await;
         }
-        self.respond(
-            incoming,
-            "respond:update_status",
-            InteractionResponse::UpdateMessage(render::code_status(
-                &heading,
-                incoming.user,
-                room_code,
-                formation,
-                player,
-            )),
-            &mut failures,
-        )
-        .await;
+        // 開示したコードと、投稿したメッセージ ID を同じ種別の追記で残す。
+        // 同じホスト・同じコードの再追記なので状態は変わらない（状態機械はそのまま）
         let event = NewEvent::new(
             FormationEventKind::CodePosted,
-            Some(player),
+            Some(host),
             Utc::now(),
-            incoming.id.to_string(),
+            format!("code_revealed:{id}:{}", short_key(&room_code)),
         )
         .with_payload(payload::code_posted(
-            room_code,
+            &room_code,
             &code_message_ids,
             &report_message_ids,
-            entry.discord_user_id,
+            host_entry.discord_user_id,
             &failures,
         ));
-        if self.record(formation, &event).await? {
-            info!(formation = %formation, %player, "room code posted to both voice chats");
-        }
-        Ok(())
-    }
-
-    /// Discord の3択報告。参加者だけを受け付け、外向きには判定や件数を返さない。
-    async fn on_report(
-        &self,
-        incoming: &IncomingInteraction,
-        custom_id: CustomId,
-        outcome: Outcome,
-    ) -> Result<(), AdapterError> {
-        let formation = custom_id.formation;
-        let Some((entry, _)) = self.participant_for_user(incoming, formation).await? else {
-            return Ok(());
-        };
-        let report = NewReport {
-            formation_id: formation,
-            player_id: entry.player_id,
-            reported_at: Utc::now(),
-            outcome,
-            raw_result: serde_json::json!({
-                "source": "discord_button",
-                "interaction_id": incoming.id.to_string(),
-                "choice": outcome.as_str(),
-            }),
-            idempotency_key: incoming.id.to_string(),
-            supersedes_id: None,
-        };
-        let appended = match self.repo.append_latest_report(report).await {
-            Ok(appended) => appended,
-            Err(RepositoryError::ReportsNotAccepted { .. }) => {
-                self.ephemeral(incoming, render::report_unavailable()).await;
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let evaluation = self
-            .repo
-            .evaluate_reports(
-                formation,
-                false,
-                Utc::now(),
-                format!("report_evaluation:all:{}", incoming.id),
-            )
-            .await?;
-        self.ephemeral(incoming, render::report_received()).await;
-        info!(
-            formation = %formation,
-            player = %entry.player_id,
-            duplicate = appended.already_recorded,
-            "report accepted"
-        );
-        if evaluation.event.is_some() {
-            info!(formation = %formation, decision = ?evaluation.decision, "all-player report evaluation advanced");
+        if self.record(id, &event).await? {
+            info!(formation = %id, %host, "room code revealed in both voice chats");
         }
         Ok(())
     }
@@ -1182,101 +1023,6 @@ impl Adapter {
             }
         }
     }
-
-    /// 押した人が `player` 本人か。本人なら編成の行と編成全体を返す。
-    /// 違えば本人にだけ理由を返して `None`。
-    async fn presser_is(
-        &self,
-        incoming: &IncomingInteraction,
-        formation: FormationId,
-        player: PlayerId,
-    ) -> Result<Option<(RosterEntry, Vec<RosterEntry>)>, AdapterError> {
-        let roster = match self.repo.load_roster(formation).await {
-            Ok(roster) => roster,
-            Err(RepositoryError::FormationNotFound(_)) => {
-                self.ephemeral(incoming, render::stale()).await;
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let Some(entry) = roster
-            .iter()
-            .find(|entry| entry.player_id == player)
-            .cloned()
-        else {
-            self.ephemeral(incoming, render::stale()).await;
-            return Ok(None);
-        };
-        let addressee = render::user_of(&entry);
-        if addressee != Some(incoming.user) {
-            self.ephemeral(incoming, render::not_addressed_to_you(addressee))
-                .await;
-            return Ok(None);
-        }
-        Ok(Some((entry, roster)))
-    }
-
-    /// 共有の報告ボタンを押した Discord ユーザーを、凍結済みの10人編成から特定する。
-    async fn participant_for_user(
-        &self,
-        incoming: &IncomingInteraction,
-        formation: FormationId,
-    ) -> Result<Option<(RosterEntry, Vec<RosterEntry>)>, AdapterError> {
-        let roster = match self.repo.load_roster(formation).await {
-            Ok(roster) => roster,
-            Err(RepositoryError::FormationNotFound(_)) => {
-                self.ephemeral(incoming, render::report_unavailable()).await;
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let entry = roster
-            .iter()
-            .find(|entry| render::user_of(entry) == Some(incoming.user))
-            .cloned();
-        let Some(entry) = entry else {
-            self.ephemeral(incoming, render::report_not_participant())
-                .await;
-            return Ok(None);
-        };
-        Ok(Some((entry, roster)))
-    }
-
-    /// 応答する前の検証（ロック無し。正式な検証は `append_event` が同じ `apply` で行う）。
-    /// 通れば現在のログを返す。弾かれたら本人にだけ知らせて `None`。
-    async fn prevalidate(
-        &self,
-        incoming: &IncomingInteraction,
-        formation: FormationId,
-        kind: FormationEventKind,
-        player: PlayerId,
-        room_code: Option<&str>,
-    ) -> Result<Option<FormationLog>, AdapterError> {
-        let log = self.repo.load_events(formation).await?;
-        let snapshot = log.snapshot();
-        log_anomalies(formation, &snapshot.anomalies);
-        let candidate = FormationEvent {
-            kind,
-            subject: Some(player),
-            occurred_at: Utc::now(),
-            idempotency_key: incoming.id.to_string(),
-            payload: room_code.map_or(EventPayload::Empty, |code| {
-                EventPayload::RoomCode(code.to_owned())
-            }),
-        };
-        // 同じインタラクションの再送は、状態がもう進んでいても受け付ける（append が no-op にする）
-        let already = log
-            .events
-            .iter()
-            .any(|stored| stored.event.idempotency_key == candidate.idempotency_key);
-        if !already && let Err(error) = apply(&snapshot.state, &candidate) {
-            info!(formation = %formation, %error, "interaction rejected by the state machine");
-            self.ephemeral(incoming, render::stale()).await;
-            return Ok(None);
-        }
-        Ok(Some(log))
-    }
-
     /// 追記する。事前検証を通っているので、拒否されるのは競合だけ（エラーとして記録し `false`）。
     async fn record(&self, formation: FormationId, event: &NewEvent) -> Result<bool, AdapterError> {
         match self.repo.append_event(formation, event).await {
@@ -1296,24 +1042,6 @@ impl Adapter {
                 Ok(false)
             }
             Err(error) => Err(error.into()),
-        }
-    }
-
-    /// インタラクションに応答する。失敗は `failures` に積む（呼び出し側が payload に入れる）。
-    async fn respond(
-        &self,
-        incoming: &IncomingInteraction,
-        what: &str,
-        response: InteractionResponse,
-        failures: &mut Vec<DiscordFailure>,
-    ) {
-        if let Err(error) = self.gateway.respond(&incoming.reference(), response).await {
-            warn!(interaction = %incoming.id, what, %error, "interaction response failed");
-            failures.push(DiscordFailure {
-                operation: what.to_owned(),
-                error: error.0,
-                attempts: 1,
-            });
         }
     }
 
@@ -1386,4 +1114,15 @@ fn log_anomalies(id: FormationId, anomalies: &[Anomaly]) {
     for anomaly in anomalies {
         warn!(formation = %id, %anomaly, "event log anomaly");
     }
+}
+
+/// ルーム ID を冪等キーに載せるための短い印。**同じコードなら同じキー**になり、
+/// 打ち直しでは必ず変わる（00 §5: 内容の違う打ち直しを黙って捨てない）。
+fn short_key(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{hash:016x}")
 }

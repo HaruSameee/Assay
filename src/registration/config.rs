@@ -220,6 +220,20 @@ fn validate_cookie_domain(domain: &str) -> Result<(), AuthConfigError> {
     Ok(())
 }
 
+/// リダイレクト URI からサイトの起点（scheme + host[:port]）を取り出す。
+///
+/// **これ専用の環境変数を作らない。**別に持たせると、リダイレクト URI と食い違ったまま
+/// 起動でき、Discord の通知が別のホストを指す。導出しておけば構造的にずれない。
+/// URI は [`validate_redirect_uri`] を通っているので scheme とホストは必ずある。
+pub fn site_base_url(redirect_uri: &str) -> String {
+    let Some((scheme, rest)) = redirect_uri.split_once("://") else {
+        // 検証を通っていれば起きない。起きても panic しない
+        return redirect_uri.trim_end_matches('/').to_owned();
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{authority}")
+}
+
 /// リダイレクト URI を検証する。https を要求する（loopback の開発用だけ http を許す）。
 fn validate_redirect_uri(uri: &str) -> Result<(), AuthConfigError> {
     let invalid = |reason: &str| AuthConfigError::Invalid {
@@ -287,6 +301,32 @@ mod tests {
         assert!(validate_redirect_uri("http://match.aynm.dev/auth/callback").is_err());
         assert!(validate_redirect_uri("/auth/callback").is_err());
         assert!(validate_redirect_uri("https://").is_err());
+    }
+
+    #[test]
+    fn the_site_base_url_is_derived_from_the_redirect_uri() {
+        // Discord の通知に載せる URL は、ログインの行き先と必ず同じホストになる
+        assert_eq!(
+            site_base_url("https://match.aynm.dev/auth/callback"),
+            "https://match.aynm.dev"
+        );
+        assert_eq!(
+            site_base_url("http://localhost:8080/auth/callback"),
+            "http://localhost:8080"
+        );
+        assert_eq!(
+            site_base_url("http://127.0.0.1:8080/auth/callback"),
+            "http://127.0.0.1:8080"
+        );
+        // パスが無くても、末尾に / があっても同じ形になる
+        assert_eq!(
+            site_base_url("https://match.aynm.dev"),
+            "https://match.aynm.dev"
+        );
+        assert_eq!(
+            site_base_url("https://match.aynm.dev/"),
+            "https://match.aynm.dev"
+        );
     }
 
     #[test]

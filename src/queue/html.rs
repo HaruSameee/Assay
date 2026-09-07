@@ -194,8 +194,11 @@ fn blocked_page(viewer: Viewer, status: &StatusView) -> String {
         );
         gates.push_str(&format!(
             "<section class=\"gate-block\" data-gate=\"active_formation\"><h2>進行中のマッチ</h2>\n\
-             <p>試合がまだ始まっていません。Discordの案内を確認し、割り当てられたVCへ向かってください。</p>\n\
-             {destination}<p class=\"fine-print\">formation: {formation}</p></section>\n",
+             <p>割り当てられたVCへ向かい、<strong>マッチ画面</strong>で進行してください。\
+             ホストの返事・ルーム ID・結果の報告はすべてマッチ画面から行います。</p>\n\
+             {destination}\
+             <div class=\"actions\"><a class=\"button button-primary\" href=\"/match/{formation}\">マッチ画面へ</a></div>\n\
+             <p class=\"fine-print\">formation: {formation}</p></section>\n",
             formation = escape(&formation.to_string()),
         ));
     }

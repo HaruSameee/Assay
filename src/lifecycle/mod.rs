@@ -25,7 +25,11 @@ mod host;
 mod ids;
 mod state;
 
-pub use config::{Deadline, HostAction, LifecycleConfig, next_deadline, next_host_action};
+pub use config::{
+    DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS, DEFAULT_HOST_CANDIDATE_LIMIT, Deadline,
+    HOST_ACCEPT_TIMEOUT_SECONDS, HOST_CANDIDATE_LIMIT, HostAction, LifecycleConfig,
+    LifecycleConfigError, next_deadline, next_host_action,
+};
 pub use error::{TransitionError, UnknownValue};
 pub use host::{
     DefaultHostSelector, Formation, FormationPlayer, HighestRating, HostSelector,

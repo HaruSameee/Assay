@@ -124,12 +124,15 @@ fn three_consecutive_host_timeouts_end_in_abandoned() {
                 let host = candidates[candidate_index];
                 events.push(ev(seq, K::HostAssigned, Some(host)));
 
-                // 承諾期限は設定値（90秒）から出る
+                // 承諾期限は設定値（既定 180 秒）から出る。定数を埋め込まない
                 let snapshot = derive_snapshot(&events);
                 let (deadline, due) =
                     next_deadline(&snapshot.state, snapshot.since.unwrap(), None, &config).unwrap();
                 assert_eq!(deadline, Deadline::HostAccept);
-                assert_eq!(due, at(seq) + TimeDelta::seconds(90));
+                assert_eq!(
+                    due,
+                    at(seq) + TimeDelta::from_std(config.host_accept_timeout).unwrap()
+                );
 
                 events.push(ev(seq + 1, K::HostTimeout, Some(host)));
                 seq += 2;
