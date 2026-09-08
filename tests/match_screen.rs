@@ -1013,3 +1013,130 @@ fn the_site_base_url_matches_the_login_host() {
         "https://match.example.test"
     );
 }
+
+// ----------------------------------------------------------------------
+// 確定後の訂正
+// ----------------------------------------------------------------------
+
+/// **確定した後の訂正は 409 で断る。**受理したのに何も起きない応答を返さない。
+///
+/// 確定・無効試合は追記された事実であって、後から引き直さない（docs/02 §4）。
+/// `evaluate_reports` は `in_progress` 以外では何もしないので、200 で通すと
+/// 「受理したのに確定もレートも動かない」状態になる。画面はボタンを隠していたが、
+/// API を直接叩けば通っていた。
+///
+/// **既に追記された行は消さない。**追記専用のまま、新しい訂正を断るだけ。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_correction_after_confirmation_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    for reporter in 1..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+    let rows_before = report_rows(&db, 1, player(1)).await;
+    assert_eq!(rows_before, 1);
+
+    // 逆の内容を追記しようとしても 409
+    let (status, payload) = post(&app, 1, player(1), "/report", json!({ "outcome": "blue" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+    assert_eq!(payload["error"], json!("already_settled"), "{payload}");
+    println!("確定後の訂正: {status} {payload}");
+
+    // 同じ内容でも通さない（訂正かどうかで判定しない）
+    let (status, _) = post(&app, 1, player(1), "/report", json!({ "outcome": "red" })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // **行は増えていないし、減ってもいない**
+    assert_eq!(report_rows(&db, 1, player(1)).await, rows_before);
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    db.done().await;
+}
+
+/// **まだ報告していない人は、確定した後でも報告できる。**
+///
+/// ここを閉じると、未報告のままキューのゲートが開かなくなる
+/// （00 §5「報告ゲートの解除条件を『確定』にしない」）。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn an_unreported_player_is_still_accepted_after_confirmation(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    // 9 人が報告 → 期限を待たずには確定しないので、確定イベントを直接積む
+    for reporter in 1..=9u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    db.formations
+        .append_event(
+            fid(1),
+            &NewEvent::new(K::Confirmed, None, at(30), "confirmed-1")
+                .with_payload(json!({ "outcome": "red" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    // 10 人目（未報告）は通る
+    assert_eq!(report(&app, 1, 10, "red").await, StatusCode::OK);
+    assert_eq!(report_rows(&db, 1, player(10)).await, 1);
+    println!("未報告の10人目は確定後でも 200 で受理される");
+
+    // その 10 人目が続けて訂正しようとすると、今度は 409
+    let (status, payload) =
+        post(&app, 1, player(10), "/report", json!({ "outcome": "blue" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+    assert_eq!(report_rows(&db, 1, player(10)).await, 1);
+
+    db.done().await;
+}
+
+/// 係争中（`disputed`）は訂正を受け付ける。運営の裁定の材料になる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_correction_is_still_accepted_while_disputed(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    assert_eq!(report(&app, 1, 1, "red").await, StatusCode::OK);
+    db.formations
+        .append_event(
+            fid(1),
+            &NewEvent::new(K::Disputed, None, at(30), "disputed-1")
+                .with_payload(json!({ "outcome": "disputed" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(&db, 1).await, S::Disputed);
+
+    assert_eq!(report(&app, 1, 1, "blue").await, StatusCode::OK);
+    assert_eq!(report_rows(&db, 1, player(1)).await, 2, "訂正は追記");
+    println!("係争中の訂正は受理される（追記され、裁定の材料になる）");
+
+    db.done().await;
+}
+
+/// あるプレイヤーの `match_reports` の行数。
+async fn report_rows(db: &AppDb, n: u128, who: PlayerId) -> i64 {
+    sqlx::query_scalar!(
+        "select count(*) as \"count!\" from match_reports \
+         where formation_id = $1 and player_id = $2",
+        fid(n).0,
+        who.0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
