@@ -1013,3 +1013,71 @@ fn the_site_base_url_matches_the_login_host() {
         "https://match.example.test"
     );
 }
+
+// ----------------------------------------------------------------------
+// 報告完了 → キュー画面（行き先はサーバが返す）
+// ----------------------------------------------------------------------
+
+/// **本人の報告が追記された時点で**キュー画面へ戻す。確定は待たない。
+///
+/// 行き先はサーバの応答（`next`）で返す。クライアントに遷移条件もタイマーも持たせない。
+/// 戻した後も結果を追えるよう、`reported` を付けてマッチ画面への導線を残す。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_report_sends_the_player_back_to_the_queue(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    let (status, payload) = post(&app, 1, player(1), "/report", json!({ "outcome": "red" })).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["ok"], json!(true));
+    assert_eq!(
+        payload["next"],
+        json!(format!("/queue?reported={}", fid(1).0)),
+        "行き先をサーバが返していない: {payload}"
+    );
+    println!("報告の応答: {payload}");
+
+    // この時点で試合はまだ未確定（他の9人が未報告）
+    assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
+
+    // **戻った後もマッチ画面は開ける。**確定・disputed・裁定はここで確認する
+    let (status, view) = get_json(&app, 1, player(1)).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["i_reported"], json!(true));
+    assert_eq!(view["actions"]["report"], json!(false));
+
+    // 残り9人が報告して確定 → 同じ URL で結果が読める
+    for reporter in 2..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+    let (status, view) = get_json(&app, 1, player(1)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["stage"], "confirmed", "{view}");
+    println!("遷移後に開き直したマッチ画面: stage={} ", view["stage"]);
+
+    // disputed も同じ経路で読める（/status には確定した試合しか出ない）
+    formation_at(&db, 2, Stage::InProgress).await;
+    db.formations
+        .append_event(
+            fid(2),
+            &NewEvent::new(K::Disputed, None, at(20), "disputed-2")
+                .with_payload(json!({ "outcome": "disputed" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(&db, 2).await, S::Disputed);
+    let (status, view) = get_json(&app, 2, player(1)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["stage"], "disputed", "{view}");
+    println!(
+        "係争になった試合も同じ URL で読める: stage={}",
+        view["stage"]
+    );
+
+    db.done().await;
+}

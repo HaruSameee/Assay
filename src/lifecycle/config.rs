@@ -411,4 +411,44 @@ mod tests {
         );
         assert_eq!(next_host_action(&S::Abandoned, &config), None);
     }
+
+    /// **キュー画面からマッチ画面への遷移の遅れが、打診の 180 秒を食わないこと。**
+    ///
+    /// キュー画面は10秒ポーリングなので、成立から最大10秒遅れてマッチ画面へ移る。
+    /// 承諾期限は `host_assigned` を起点に測るので、遷移の遅れは期限の**外側**にある。
+    /// ここではホストが最悪ケース（10秒）で画面に着いたときの残り時間を出す。
+    #[test]
+    fn a_ten_second_transition_does_not_eat_the_host_window() {
+        let config = LifecycleConfig::default();
+        let assigned_at = t0();
+        let (deadline, at) = next_deadline(
+            &FormationState::AwaitingHost {
+                pending: Some(super::super::PlayerId(uuid::Uuid::nil())),
+                tried: 1,
+            },
+            assigned_at,
+            None,
+            &config,
+        )
+        .expect("a host accept deadline");
+        assert_eq!(deadline, Deadline::HostAccept);
+        // 期限は host_assigned から 180 秒
+        assert_eq!(at, assigned_at + TimeDelta::seconds(180));
+
+        // キュー画面のポーリング間隔（最悪ケース）
+        let polling_delay = TimeDelta::seconds(10);
+        let arrives_at = assigned_at + polling_delay;
+        let remaining = at - arrives_at;
+        assert_eq!(remaining, TimeDelta::seconds(170));
+        assert!(
+            remaining >= TimeDelta::seconds(120),
+            "遷移の遅れが打診の窓を食っている: 残り {remaining}"
+        );
+        println!(
+            "打診の窓 {}秒 / 遷移の最悪遅れ {}秒 / 画面に着いた時点の残り {}秒",
+            (at - assigned_at).num_seconds(),
+            polling_delay.num_seconds(),
+            remaining.num_seconds()
+        );
+    }
 }

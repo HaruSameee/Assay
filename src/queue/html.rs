@@ -2,7 +2,7 @@
 //!
 //! ヘッダーは共有のシェル（[`page_with_styles`]）が出す。ここでは書かない。
 
-use crate::lifecycle::Timestamp;
+use crate::lifecycle::{FormationId, Timestamp};
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
 
@@ -62,17 +62,41 @@ const ROLE_OPTIONS: [(&str, &str); 5] = [
     ("bot_tank", "タンク"),
 ];
 
-pub(super) fn queue_page(viewer: Viewer, status: &StatusView, now: Timestamp) -> String {
+pub(super) fn queue_page(
+    viewer: Viewer,
+    status: &StatusView,
+    now: Timestamp,
+    reported: Option<FormationId>,
+) -> String {
     if status.eligibility.registration.is_some()
         || status.eligibility.active_formation.is_some()
         || !status.eligibility.pending_reports.is_empty()
     {
-        blocked_page(viewer, status)
+        blocked_page(viewer, status, reported)
     } else if let Some(entry) = &status.entry {
-        queued_page(viewer, status, entry, now)
+        queued_page(viewer, status, entry, now, reported)
     } else {
-        unqueued_page(viewer, status)
+        unqueued_page(viewer, status, reported)
     }
+}
+
+/// 直前に報告した試合への導線。
+///
+/// 報告が済んだらキュー画面へ戻す（報告ゲートは本人の報告で解除されるので、確定を
+/// 待たせない）。ただし戻したきりでは、**自分の報告後に確定した結果・disputed に
+/// なったこと・運営の裁定**を知る手段が無くなる。`/status` は
+/// `player_match_rating_deltas` を読むので**確定した試合しか出ない**（disputed も
+/// 未確定も出てこない）。そこでマッチ画面へ戻る導線をここに残す。
+fn reported_notice(reported: Option<FormationId>) -> String {
+    reported.map_or_else(String::new, |formation| {
+        format!(
+            "<div class=\"notice\" data-notice=\"reported\"><p><strong>報告を受け付けました。</strong>\
+             確定を待たずにキューへ戻れます。</p>\n\
+             <p class=\"fine-print\">結果・係争・運営の裁定は\
+             <a href=\"/match/{formation}\">この試合のマッチ画面</a>で確認できます。</p></div>\n",
+            formation = escape(&formation.to_string()),
+        )
+    })
 }
 
 fn role_options(selected: Option<&str>) -> String {
@@ -90,7 +114,7 @@ fn role_options(selected: Option<&str>) -> String {
     output
 }
 
-fn unqueued_page(viewer: Viewer, status: &StatusView) -> String {
+fn unqueued_page(viewer: Viewer, status: &StatusView, reported: Option<FormationId>) -> String {
     let in_range = status.in_range.unwrap_or(0);
     let first = role_options(None);
     let second = role_options(None);
@@ -100,7 +124,7 @@ fn unqueued_page(viewer: Viewer, status: &StatusView) -> String {
          <div class=\"form-header\">\n<p class=\"eyebrow\">Match queue</p>\n\
          <h1 id=\"queue-title\">キューに参加</h1>\n\
          <p class=\"lead\">希望ロールを選びます。</p>\n</div>\n\
-         {removal}\
+         {reported}{removal}\
          <form id=\"queue-form\" class=\"queue-form\" novalidate>\n\
          <fieldset class=\"field\"><legend>ロール希望</legend>\n\
          <p class=\"field-help\">第1希望は必須です。第2・第3希望は必要な分だけ選べます。</p>\n\
@@ -116,6 +140,7 @@ fn unqueued_page(viewer: Viewer, status: &StatusView) -> String {
          </form>\n<p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
         range = UP_RANGE,
+        reported = reported_notice(reported),
         removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
     );
@@ -147,7 +172,13 @@ fn removal_notice(status: &StatusView) -> String {
     )
 }
 
-fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Timestamp) -> String {
+fn queued_page(
+    viewer: Viewer,
+    status: &StatusView,
+    entry: &EntryView,
+    now: Timestamp,
+    reported: Option<FormationId>,
+) -> String {
     let roles = entry
         .roles
         .iter()
@@ -165,6 +196,7 @@ fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Time
         "<section id=\"queue-app\" data-view=\"queued\" data-enqueued-at=\"{enqueued}\" aria-labelledby=\"queue-title\">\n\
          <p class=\"eyebrow\">Waiting for match</p>\n<h1 id=\"queue-title\">キュー参加中</h1>\n\
          <p class=\"lead\">マッチ成立までこの画面を開いたまま待機してください。</p>\n\
+         {reported}\
          <div class=\"metrics\">\n<div class=\"metric\"><span class=\"metric-label\">待ち時間</span><strong id=\"wait-time\" class=\"metric-value\">{waiting}</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">範囲内でキュー中</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
@@ -176,12 +208,13 @@ fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Time
          <script>{script}</script>\n",
         enqueued = escape(&entry.enqueued_at),
         up_range = entry.up_range,
+        reported = reported_notice(reported),
         script = QUEUED_SCRIPT,
     );
     page_with_styles(viewer, "キュー参加中", &body, QUEUE_STYLES)
 }
 
-fn blocked_page(viewer: Viewer, status: &StatusView) -> String {
+fn blocked_page(viewer: Viewer, status: &StatusView, reported: Option<FormationId>) -> String {
     let matched = status.eligibility.active_formation.is_some();
     let title = if matched {
         "マッチが成立しました"
@@ -257,6 +290,7 @@ fn blocked_page(viewer: Viewer, status: &StatusView) -> String {
         "<section id=\"queue-app\"{view_class} data-view=\"blocked\" data-registration=\"{registration_code}\" data-active=\"{active}\" data-pending=\"{pending}\" data-destination=\"{destination_name}\" aria-labelledby=\"queue-title\">\n\
          <p class=\"eyebrow\">{eyebrow}</p>\n<h1 id=\"queue-title\">{title}</h1>\n\
          <p class=\"lead\">{lead}</p>\n\
+         {reported}\
          <div class=\"gate-list\">{gates}</div>\n\
          <p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
@@ -265,6 +299,7 @@ fn blocked_page(viewer: Viewer, status: &StatusView) -> String {
         pending = status.eligibility.pending_reports.len(),
         destination_name = escape(destination),
         title = escape(title),
+        reported = reported_notice(reported),
         script = BLOCKED_SCRIPT,
     );
     page_with_styles(viewer, title, &body, QUEUE_STYLES)
@@ -387,6 +422,9 @@ const QUEUED_SCRIPT: &str = r#"
       const response = await fetch('/queue', { headers: { Accept: 'application/json' } });
       if (!response.ok) throw new Error('status failed');
       const state = await response.json();
+      // 成立したらマッチ画面へ。行き先はサーバの状態（active_formation）から来る
+      const matched = state.eligibility.active_formation;
+      if (matched) return window.location.assign('/match/' + encodeURIComponent(matched));
       if (!state.queued || blocked(state)) return window.location.reload();
       inRange.textContent = `${state.in_range ?? 0}人`;
       pollStatus.textContent = '';
@@ -424,6 +462,8 @@ const BLOCKED_SCRIPT: &str = r#"
       const state = await response.json();
       const registration = state.eligibility.registration?.code || '';
       const active = state.eligibility.active_formation || '';
+      // 成立していればマッチ画面へ。この画面に留めない
+      if (active) return window.location.assign('/match/' + encodeURIComponent(active));
       const pending = String(state.eligibility.pending_reports.length);
       const destination = state.destination?.channel_name || '';
       if (state.queued || registration !== root.dataset.registration || active !== root.dataset.active ||
@@ -437,6 +477,8 @@ const BLOCKED_SCRIPT: &str = r#"
     }
   };
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+  // 直接この画面を開いた場合に、10秒待たずにマッチ画面へ移る
+  poll();
   setInterval(poll, 10000);
 })();
 "#;
@@ -467,7 +509,7 @@ mod tests {
 
     #[test]
     fn the_unqueued_page_has_all_roles_range_and_resilient_polling() {
-        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
         for (role, label) in ROLE_OPTIONS {
             assert!(rendered.contains(&format!("value=\"{role}\"")));
             assert!(rendered.contains(label));
@@ -501,6 +543,7 @@ mod tests {
             Viewer::MEMBER,
             &queued,
             Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap(),
+            None,
         );
         assert!(rendered.contains("02:03"));
         assert!(rendered.contains("第1希望: 中央"));
@@ -527,7 +570,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now(), None);
         for gate in ["registration", "active_formation", "pending_reports"] {
             assert!(rendered.contains(&format!("data-gate=\"{gate}\"")));
         }
@@ -547,7 +590,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(Viewer::MEMBER, &matched, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &matched, Utc::now(), None);
         assert!(rendered.contains("class=\"matched\""), "{rendered}");
         // ゲートの側は一切変えていない
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -562,7 +605,7 @@ mod tests {
         // 成立していないブロックは従来どおり
         let mut plain = status();
         plain.eligibility.pending_reports = vec![Uuid::from_u128(9)];
-        let rendered = queue_page(Viewer::MEMBER, &plain, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &plain, Utc::now(), None);
         assert!(!rendered.contains("class=\"matched\""));
         assert!(rendered.contains("現在止まっている条件"));
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -591,8 +634,8 @@ mod tests {
                 })
                 .collect(),
         });
-        let selecting = queue_page(Viewer::MEMBER, &status(), Utc::now());
-        let selected = queue_page(Viewer::MEMBER, &queued, Utc::now());
+        let selecting = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
+        let selected = queue_page(Viewer::MEMBER, &queued, Utc::now(), None);
         for (role, label) in ROLE_OPTIONS {
             // 選ぶ側は日本語のラベル。識別子は value 属性の中だけ
             assert!(
@@ -641,7 +684,7 @@ mod tests {
 
     #[test]
     fn mobile_layout_is_explicit() {
-        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
         assert!(rendered.contains("@media (max-width: 600px)"));
         assert!(rendered.contains(".role-grid { grid-template-columns: 1fr"));
     }
@@ -678,16 +721,16 @@ mod tests {
              <button type=\"submit\">ログアウト</button></form>\n\
              </nav>\n</header>\n";
         for rendered in [
-            queue_page(Viewer::MEMBER, &status(), now),
-            queue_page(Viewer::MEMBER, &queued, now),
-            queue_page(Viewer::MEMBER, &blocked, now),
+            queue_page(Viewer::MEMBER, &status(), now, None),
+            queue_page(Viewer::MEMBER, &queued, now, None),
+            queue_page(Viewer::MEMBER, &blocked, now, None),
         ] {
             assert!(rendered.contains(expected), "{rendered}");
             // 非管理者にパネルの存在を知らせない
             assert!(!rendered.contains("href=\"/admin\""), "{rendered}");
         }
         // 管理者にはヘッダーにだけ管理リンクが増える
-        let admin = queue_page(Viewer::ADMIN, &status(), now);
+        let admin = queue_page(Viewer::ADMIN, &status(), now, None);
         assert!(admin.contains("<a href=\"/admin\">管理</a>"), "{admin}");
     }
 
@@ -700,7 +743,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
 
         println!("========== 1. 未投入 (data-view=unqueued) ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &status(), now));
+        println!("{}", queue_page(Viewer::MEMBER, &status(), now, None));
 
         let mut queued = status();
         queued.queued = true;
@@ -723,7 +766,7 @@ mod tests {
             ],
         });
         println!("========== 2. キュー中 (data-view=queued) ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &queued, now));
+        println!("{}", queue_page(Viewer::MEMBER, &queued, now, None));
 
         let mut matched = status();
         matched.eligibility.active_formation = Some(Uuid::from_u128(8));
@@ -734,7 +777,7 @@ mod tests {
             channel_id: "123".into(),
         });
         println!("========== 3. マッチ成立 ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &matched, now));
+        println!("{}", queue_page(Viewer::MEMBER, &matched, now, None));
 
         let mut blocked = status();
         blocked.eligibility = EligibilityView {
@@ -747,6 +790,74 @@ mod tests {
             pending_reports: vec![Uuid::from_u128(9)],
         };
         println!("========== 4. ゲートで停止 ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &blocked, now));
+        println!("{}", queue_page(Viewer::MEMBER, &blocked, now, None));
+    }
+
+    /// **成立したらマッチ画面へ移す。**行き先はサーバの状態（`active_formation`）から来る。
+    ///
+    /// クライアントにタイマーも遷移条件も持たせない。ポーリングは既存の10秒のまま。
+    #[test]
+    fn the_queue_page_moves_to_the_match_screen_once_one_forms() {
+        // キュー中の画面
+        let mut queued = status();
+        queued.queued = true;
+        queued.entry = Some(EntryView {
+            id: Uuid::nil(),
+            player_id: Uuid::nil(),
+            enqueued_at: "2026-09-12T12:00:00+00:00".to_owned(),
+            updated_at: "2026-09-12T12:00:00+00:00".to_owned(),
+            down_range: 50,
+            up_range: 50,
+            roles: vec![RolePreference {
+                role: "jungle".to_owned(),
+                priority: 1,
+            }],
+        });
+        let rendered = queue_page(Viewer::MEMBER, &queued, Utc::now(), None);
+        assert!(
+            rendered.contains("state.eligibility.active_formation"),
+            "サーバの状態を見ていない: {rendered}"
+        );
+        assert!(
+            rendered.contains("window.location.assign('/match/'"),
+            "マッチ画面へ移していない: {rendered}"
+        );
+        // クライアント側のタイマーで遷移していない（間隔は既存のポーリングだけ）
+        assert_eq!(rendered.matches("setInterval(poll, 10000)").count(), 1);
+
+        // ゲートで止まっている画面（直接開いた場合）も同じ経路で移る
+        let mut blocked = status();
+        blocked.eligibility.active_formation = Some(Uuid::from_u128(7));
+        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now(), None);
+        assert!(
+            rendered.contains("window.location.assign('/match/'"),
+            "{rendered}"
+        );
+        // 10 秒待たずに、開いた直後に一度だけ評価する
+        assert!(rendered.contains("\n  poll();\n"), "{rendered}");
+    }
+
+    /// 報告後に戻ったキュー画面から、その試合の結果を追える導線が残ること。
+    ///
+    /// `/status` は確定した試合しか出さないので、disputed と未確定はここからしか辿れない。
+    #[test]
+    fn the_reported_notice_links_back_to_the_match_screen() {
+        let formation = FormationId(Uuid::from_u128(0xabc));
+        for view in [status(), {
+            let mut blocked = status();
+            blocked.eligibility.pending_reports = vec![Uuid::from_u128(1)];
+            blocked
+        }] {
+            let rendered = queue_page(Viewer::MEMBER, &view, Utc::now(), Some(formation));
+            assert!(
+                rendered.contains(&format!("/match/{}", formation.0)),
+                "{rendered}"
+            );
+            assert!(rendered.contains("報告を受け付けました"), "{rendered}");
+            assert!(rendered.contains("運営の裁定"), "{rendered}");
+        }
+        // 付いていなければ何も出さない
+        let plain = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
+        assert!(!plain.contains("報告を受け付けました"), "{plain}");
     }
 }

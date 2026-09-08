@@ -395,7 +395,15 @@ const POLL_SCRIPT: &str = r#"
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (response.ok) { window.location.reload(); return; }
+      if (response.ok) {
+        // 行き先はサーバが決める（報告を受け付けたらキュー画面へ戻す）。
+        // クライアント側に遷移条件もタイマーも持たない
+        let next = null;
+        try { const payload = await response.json(); next = payload && payload.next; } catch (_) {}
+        if (next) { window.location.assign(next); return; }
+        window.location.reload();
+        return;
+      }
       let message = '受け付けられませんでした。画面を更新して確認してください。';
       try {
         const payload = await response.json();
