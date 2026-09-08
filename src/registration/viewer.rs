@@ -23,6 +23,9 @@ use super::model::PlayerProfile;
 pub struct Viewer {
     signed_in: bool,
     admin: bool,
+    /// ランキングを公開しているか。**導線を出すかどうかだけ**に使う
+    /// （`/ranking` 自体の可否はルート側の判定が正）。
+    ranking_public: bool,
 }
 
 impl Viewer {
@@ -30,18 +33,21 @@ impl Viewer {
     pub const ANONYMOUS: Self = Self {
         signed_in: false,
         admin: false,
+        ranking_public: false,
     };
 
     /// ログイン済みの一般参加者。
     pub const MEMBER: Self = Self {
         signed_in: true,
         admin: false,
+        ranking_public: false,
     };
 
     /// ログイン済みの管理者。**[`Audience`] の照合を通ったときだけ作ること。**
     pub const ADMIN: Self = Self {
         signed_in: true,
         admin: true,
+        ranking_public: false,
     };
 
     /// セッションがあるか。
@@ -53,6 +59,17 @@ impl Viewer {
     pub fn is_admin(self) -> bool {
         self.signed_in && self.admin
     }
+
+    /// ランキングへの導線を出すか。**未ログインでも出す**（公開ページなので）。
+    pub fn ranking_public(self) -> bool {
+        self.ranking_public
+    }
+
+    /// ランキングの公開状態を載せる。
+    pub fn with_ranking(mut self, public: bool) -> Self {
+        self.ranking_public = public;
+        self
+    }
 }
 
 /// 管理者リストを持ち回るための入れ物。各トラックの `*State` が 1 つ持つ。
@@ -62,12 +79,28 @@ impl Viewer {
 #[derive(Debug, Clone, Default)]
 pub struct Audience {
     admins: Option<AdminIds>,
+    /// ランキングを公開しているか。既定は**非公開**（導線を出さない側に倒す）。
+    ranking_public: bool,
 }
 
 impl Audience {
     /// 起動時に確定したリストから作る。
     pub fn new(admins: Option<AdminIds>) -> Self {
-        Self { admins }
+        Self {
+            admins,
+            ranking_public: false,
+        }
+    }
+
+    /// ランキングの公開状態を渡す。**渡さなければ非公開**（導線は出ない）。
+    pub fn with_ranking(mut self, public: bool) -> Self {
+        self.ranking_public = public;
+        self
+    }
+
+    /// 公開状態だけ差し替える（各トラックの `*State` が使う）。
+    pub fn set_ranking(&mut self, public: bool) {
+        self.ranking_public = public;
     }
 
     /// Discord ID（snowflake 文字列）から見ている人を決める。
@@ -78,14 +111,15 @@ impl Audience {
             .admins
             .as_ref()
             .is_some_and(|admins| admins.contains_snowflake(discord_user_id));
-        if admin { Viewer::ADMIN } else { Viewer::MEMBER }
+        let viewer = if admin { Viewer::ADMIN } else { Viewer::MEMBER };
+        viewer.with_ranking(self.ranking_public)
     }
 
     /// プロフィールから決める。`None`（セッションはあるが行が無い）は未ログイン扱い。
     pub fn viewer_of(&self, profile: Option<&PlayerProfile>) -> Viewer {
         match profile {
             Some(profile) => self.viewer_for(&profile.discord_user_id),
-            None => Viewer::ANONYMOUS,
+            None => Viewer::ANONYMOUS.with_ranking(self.ranking_public),
         }
     }
 }

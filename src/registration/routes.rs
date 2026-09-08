@@ -97,6 +97,12 @@ impl AuthState {
         self
     }
 
+    /// ランキングの公開状態を渡す。共通ヘッダーに導線を出すかどうかだけに使う。
+    pub fn with_ranking(mut self, public: bool) -> Self {
+        self.audience.set_ranking(public);
+        self
+    }
+
     /// ログインのたびに Discord 側の見た目を積む先を渡す。
     ///
     /// **渡さなければ何も積まない。**積む処理が失敗してもログインは通す
