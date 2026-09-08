@@ -1495,3 +1495,70 @@ async fn the_role_preference_log_is_append_only(owner: PgPool) {
     }
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// 「報告の反映が遅い」の切り分け（実測）
+// ----------------------------------------------------------------------
+
+/// **報告ゲートは本人の報告と同じ HTTP リクエストで解除される。**確定を待たない。
+///
+/// 「報告してもすぐ次のキューに入れない」という報告の切り分けに使う。ここで測るのは
+/// サーバ側の解除までの時間で、画面に見えるまでの遅れ（キュー画面の10秒ポーリング）は
+/// 含まない。両者を混ぜると、直す場所を取り違える。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_report_gate_opens_within_the_same_request(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let body = json!({ "roles": [wish("jungle", 1)] });
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+    formation_at(&db, 0xf1, me, Stage::InProgress).await;
+
+    let (status, denied) = post_queue(&app, me, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied["pending_reports"].as_array().unwrap().len(), 1);
+
+    let reported_at = std::time::Instant::now();
+    db.formations
+        .append_latest_report(NewReport {
+            formation_id: fid(0xf1),
+            player_id: me,
+            reported_at: at(10),
+            outcome: Outcome::Win(Team::Red),
+            raw_result: json!({ "outcome": "red" }),
+            idempotency_key: "latency-report".into(),
+            supersedes_id: None,
+        })
+        .await
+        .unwrap();
+    let append_elapsed = reported_at.elapsed();
+
+    let gate_checked = std::time::Instant::now();
+    let (status, allowed) = post_queue(&app, me, body).await;
+    let gate_elapsed = gate_checked.elapsed();
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["queued"], true);
+
+    let state = db
+        .formations
+        .load_events(fid(0xf1))
+        .await
+        .unwrap()
+        .snapshot()
+        .state;
+    assert!(
+        matches!(
+            state,
+            unite_matchsystem::lifecycle::FormationState::InProgress { .. }
+        ),
+        "確定を待たずに解除されること: {state:?}"
+    );
+
+    println!("報告の追記: {append_elapsed:?}");
+    println!("報告 → キュー再投入が通るまで: {gate_elapsed:?}");
+    println!("この時点の formation の状態: {state:?}（未確定）");
+    db.done().await;
+}
