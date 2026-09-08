@@ -352,6 +352,38 @@ async fn submit_report(
         }
     };
 
+    // **確定した後の訂正は受け付けない。**
+    //
+    // 確定・無効試合は追記された事実であって、後から引き直さない（docs/02 §4）。
+    // `evaluate_reports` は `in_progress` 以外では何もしないので、ここを 200 で
+    // 通すと「受理したのに何も起きない」応答になる。画面はボタンを隠しているが、
+    // API を直接叩けば通っていた。
+    //
+    // **まだ報告していない人は通す。**確定後に入口を閉じると、未報告のまま
+    // キューのゲートが開かなくなる（00 §5「報告ゲートの解除条件を『確定』にしない」）。
+    let state = match current_state(&app, formation).await {
+        Ok(state) => state,
+        Err(error) => {
+            error!(%error, "could not read the formation state");
+            return internal_error(false);
+        }
+    };
+    if matches!(state, FormationState::Confirmed | FormationState::Nullified) {
+        match app.matches.has_reported(formation, player_id).await {
+            Ok(true) => {
+                return conflict(
+                    "already_settled",
+                    "この試合はすでに結果が出ています。報告の訂正は反映されません。",
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                error!(%error, "could not read the report status");
+                return internal_error(false);
+            }
+        }
+    }
+
     let now = Utc::now();
     let report = NewReport {
         formation_id: formation,
