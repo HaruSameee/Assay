@@ -600,7 +600,6 @@ mod tests {
     /// `the_report_prompt_only_points_at_the_site` が勝敗を名指ししないことを見る。
     fn all_messages() -> Vec<OutgoingMessage> {
         let host = UserId::new(1001);
-        let checklist = vec!["設定 A".to_owned(), "設定 B".to_owned()];
         let heading = head();
         let url = SITE;
         let mut messages = vec![
@@ -980,7 +979,6 @@ mod tests {
     #[test]
     fn dump_notifications_for_review() {
         let host = UserId::new(1001);
-        let checklist = vec!["大会モード".to_owned(), "ドラフト3枠ban".to_owned()];
         println!("========== 招集チャンネル: 成立（red） ==========");
         println!("{}", summon(&roster(), &vc(), Team::Red, SITE).content);
         println!("\n========== 招集チャンネル: 成立（blue） ==========");
