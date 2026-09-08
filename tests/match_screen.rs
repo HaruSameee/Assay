@@ -1013,3 +1013,85 @@ fn the_site_base_url_matches_the_login_host() {
         "https://match.example.test"
     );
 }
+
+// ----------------------------------------------------------------------
+// 確定後に訂正が追記されたときの挙動（実測。修正はしない）
+// ----------------------------------------------------------------------
+
+/// **確定した後に訂正を追記しても、確定は動かない。**
+///
+/// 「訂正は追記、確定判定は各プレイヤーの最新報告」というルールがあるが、確定後に
+/// 訂正が来たときの扱いは仕様に書かれていない。ここは事実を測るだけのテストで、
+/// 挙動の是非は人間が判断する（docs/02 §4「勝敗の確定は追記された事実であって、
+/// 確定ルールを変えても過去の勝敗は引き直さない」との関係）。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_correction_after_confirmation_is_appended_but_does_not_reopen_it(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    // 10 人全員が red で報告 → 確定
+    for reporter in 1..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+    let confirmed_events = kinds(&db, 1).await;
+    let outcome_before = final_outcome(&db, 1).await;
+    println!("確定直後の状態: {:?}", state_of(&db, 1).await);
+    println!("確定直後の終端イベント payload の outcome: {outcome_before:?}");
+
+    // 確定した後に、1 人が **逆の内容** を追記する
+    let status = report(&app, 1, 1, "blue").await;
+    println!("確定後の訂正の HTTP ステータス: {status}");
+
+    let rows: i64 = sqlx::query_scalar!(
+        "select count(*) as \"count!\" from match_reports \
+         where formation_id = $1 and player_id = $2",
+        fid(1).0,
+        player(1).0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    println!("player(1) の match_reports 行数: {rows}");
+
+    let after = state_of(&db, 1).await;
+    let events_after = kinds(&db, 1).await;
+    println!("訂正後の状態: {after:?}");
+    println!("イベント列（確定前後で変化があるか）: {confirmed_events:?} -> {events_after:?}");
+    println!(
+        "訂正後の終端イベント payload の outcome: {:?}",
+        final_outcome(&db, 1).await
+    );
+
+    // レートは終端イベントの outcome から導出するので、訂正では動かない
+    let delta: Option<f64> = sqlx::query_scalar!(
+        "select sum(delta) from player_match_rating_deltas where player_id = $1",
+        player(1).0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    println!("player(1) のレート増減の合計: {delta:?}");
+
+    // 事実の固定: 確定は覆らない
+    assert_eq!(after, S::Confirmed, "確定が覆っている");
+    assert_eq!(
+        events_after, confirmed_events,
+        "終端イベントが増えている（確定が引き直されている）"
+    );
+    db.done().await;
+}
+
+/// 終端イベント（`confirmed` / `nullified`）の payload に入った最終結果。
+async fn final_outcome(db: &AppDb, n: u128) -> Option<String> {
+    let log = db.formations.load_events(fid(n)).await.unwrap();
+    log.events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event.kind, K::Confirmed | K::Nullified))
+        .and_then(|event| event.payload["outcome"].as_str().map(ToOwned::to_owned))
+}
