@@ -54,6 +54,10 @@ pub struct FakeOAuth {
     user_id: Mutex<String>,
     exchanged_codes: Mutex<Vec<String>>,
     fail: AtomicBool,
+    /// 返すアバターのハッシュ。`None` なら未設定（既定アバター）。
+    avatar: Mutex<Option<String>>,
+    /// 返す表示名。
+    display_name: Mutex<Option<String>>,
 }
 
 impl FakeOAuth {
@@ -62,12 +66,24 @@ impl FakeOAuth {
             user_id: Mutex::new(user_id.to_owned()),
             exchanged_codes: Mutex::new(Vec::new()),
             fail: AtomicBool::new(false),
+            avatar: Mutex::new(None),
+            display_name: Mutex::new(Some("表示名".to_owned())),
         }
     }
 
     /// 同じ偽 Discord で別ユーザーとしてログインし直す。
     pub fn set_user_id(&self, user_id: &str) {
         *self.user_id.lock().unwrap() = user_id.to_owned();
+    }
+
+    /// Discord 側のアバターを差し替える（`None` は未設定）。
+    pub fn set_avatar(&self, avatar: Option<&str>) {
+        *self.avatar.lock().unwrap() = avatar.map(ToOwned::to_owned);
+    }
+
+    /// Discord 側の表示名を差し替える。
+    pub fn set_display_name(&self, name: Option<&str>) {
+        *self.display_name.lock().unwrap() = name.map(ToOwned::to_owned);
     }
 }
 
@@ -88,7 +104,8 @@ impl OAuthClient for FakeOAuth {
         Ok(DiscordUser {
             id: self.user_id.lock().unwrap().clone(),
             username: "handle".into(),
-            global_name: Some("表示名".into()),
+            global_name: self.display_name.lock().unwrap().clone(),
+            avatar: self.avatar.lock().unwrap().clone(),
         })
     }
 }

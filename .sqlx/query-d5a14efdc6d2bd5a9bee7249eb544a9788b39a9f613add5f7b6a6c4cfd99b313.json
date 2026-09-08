@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select display_name, avatar_hash from player_discord_snapshots where player_id = $1 order by id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_discord_snapshots",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "avatar_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_discord_snapshots",
+            "name": "avatar_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "d5a14efdc6d2bd5a9bee7249eb544a9788b39a9f613add5f7b6a6c4cfd99b313"
+}

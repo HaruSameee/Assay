@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into player_discord_snapshots (player_id, display_name, avatar_hash, captured_at) values ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d3b84103aaadb16b2d6f95c438c09ff9dc00c6a5ce7bc1e7ccae0b6bf3db5b8e"
+}

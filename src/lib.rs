@@ -9,6 +9,7 @@ pub mod lifecycle;
 pub mod match_screen;
 pub mod matchmaker;
 pub mod persistence;
+pub mod profiles;
 pub mod queue;
 pub mod rating;
 pub mod registration;

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select bio, x_id, main_roles, main_roles_public from player_profiles where player_id = $1 order by id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bio",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_profiles",
+            "name": "bio"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "x_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_profiles",
+            "name": "x_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "main_roles",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "player_profiles",
+            "name": "main_roles"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "main_roles_public",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "player_profiles",
+            "name": "main_roles_public"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "85bd3d866469d2fadd528fa2284d96425a1b0458697e55e179e3e6eb942d1b16"
+}

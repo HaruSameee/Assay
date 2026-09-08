@@ -22,6 +22,7 @@ use unite_matchsystem::matchmaker::{
     MATCHMAKING_PARAMS_VERSION, Matchmaker, MatchmakerConfig, MatchmakerRepository,
 };
 use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
+use unite_matchsystem::profiles::{ProfileRepository, ProfileState, router as profile_router};
 use unite_matchsystem::queue::{
     DOWN_RANGE, QueueRepository, QueueState, UP_RANGE, router as queue_router,
 };
@@ -100,7 +101,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let status_repo = StatusRepository::new(pool.clone());
     let admin_store = AdminRepository::new(pool.clone());
     let match_pool = pool.clone();
-    let matchmaker_repo = MatchmakerRepository::new(pool);
+    let matchmaker_repo = MatchmakerRepository::new(pool.clone());
 
     // 停止状態は DB が正（メモリに持たない）。**起動ログに必ず出す** — 止めたまま再起動して
     // 「動いているつもりで動いていない」ことに気付かないのが、当日いちばん危ない
@@ -159,12 +160,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 管理者リストは全トラックの State に配る。共通ヘッダーが管理パネルの導線を
     // 出すかどうかの判定に使うだけで、`/admin` のアクセス制御は admin ルート側の
     // 照合が正（リンクが無くても 404 は 404）。
+    // ログインのたびに Discord 側の見た目を積む。**積めなくてもログインは通す**
+    let profile_repo = ProfileRepository::new(pool.clone());
     let auth = AuthState::new(
         auth_config.clone(),
         Arc::new(HttpOAuthClient::new(&auth_config)?),
         registration_repo.clone(),
     )
-    .with_admins(admin_ids.clone());
+    .with_admins(admin_ids.clone())
+    .with_profiles(profile_repo.clone());
     info!(
         redirect_uri = %auth_config.redirect_uri,
         cookie_domain = %auth_config.cookie_domain,
@@ -179,7 +183,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .merge(registration_router(auth))
     .merge(queue_router(
-        QueueState::new(auth_config.clone(), registration_repo, queue_repo)
+        QueueState::new(auth_config.clone(), registration_repo.clone(), queue_repo)
             .with_admins(admin_ids.clone()),
     ))
     .merge(status_router(
@@ -197,6 +201,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &room_checklist,
         )
         .with_admins(admin_ids.clone()),
+    ))
+    .merge(profile_router(
+        ProfileState::new(auth_config.clone(), profile_repo, registration_repo.clone())
+            .with_admins(admin_ids.clone()),
     ));
     info!(site = %site, "status and match routes mounted");
     // fail-closed: 管理者 ID が未設定ならルート自体をマウントしない

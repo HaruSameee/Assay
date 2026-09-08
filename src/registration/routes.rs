@@ -68,6 +68,9 @@ pub struct AuthState {
     key: Key,
     /// ヘッダーに管理パネルの導線を出す相手の判定。既定は「管理者なし」。
     audience: Audience,
+    /// Discord 側の見た目を追記する先。**渡さなければ何も積まない**
+    /// （既存のログイン経路をそのまま残せるように任意にしてある）。
+    profiles: Option<crate::profiles::ProfileRepository>,
 }
 
 impl AuthState {
@@ -84,12 +87,22 @@ impl AuthState {
             repo,
             key,
             audience: Audience::default(),
+            profiles: None,
         }
     }
 
     /// 管理者リストを渡す。**渡さなければ誰にも管理パネルの導線を出さない。**
     pub fn with_admins(mut self, admins: Option<AdminIds>) -> Self {
         self.audience = Audience::new(admins);
+        self
+    }
+
+    /// ログインのたびに Discord 側の見た目を積む先を渡す。
+    ///
+    /// **渡さなければ何も積まない。**積む処理が失敗してもログインは通す
+    /// （ここで落とすと、スナップショットの不具合だけで全員が入れなくなる）。
+    pub fn with_profiles(mut self, profiles: crate::profiles::ProfileRepository) -> Self {
+        self.profiles = Some(profiles);
         self
     }
 }
@@ -260,6 +273,22 @@ async fn callback(
             );
         }
     };
+    // Discord 側の見た目を追記する。**失敗してもログインは通す。**
+    // ここで落とすと、スナップショットの不具合だけで全員が入れなくなる。
+    // 表示名の履歴を残すのは、係争の裁定で discord_user_id しか手掛かりが
+    // 無いという問題への対処（当時の名前が分からないと後から追えない）
+    if let Some(profiles) = app.profiles.as_ref()
+        && let Err(error) = profiles
+            .record_appearance(
+                player_id,
+                user.display_name(),
+                user.avatar.as_deref(),
+                Utc::now(),
+            )
+            .await
+    {
+        warn!(%error, %player_id, "could not record the discord appearance; sign-in continues");
+    }
     info!(%player_id, "signed in");
     let jar = set_session(jar, &Session::issue(player_id), &app.config);
     // 登録済みならフォームを飛ばしてキューへ。ここで初めてセッションが張られる
