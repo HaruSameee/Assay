@@ -39,6 +39,10 @@ pub struct MatchPlayer {
     pub role_sort_order: i32,
     /// 現在のレート（表示スケール）。追記ログからの導出値。
     pub rating: f64,
+    /// Discord の表示名（最新のスナップショット）。取れていなければ `None`。
+    pub discord_name: Option<String>,
+    /// アバターの URL。**未設定でも既定アバターの URL が入る。**
+    pub avatar_url: String,
 }
 
 /// `vc_assigned` から読んだ VC の組。
@@ -136,7 +140,11 @@ impl MatchRepository {
     /// キュー側の同じ計算（`queued_players`）と式を揃えてある。
     pub async fn roster(&self, formation_id: FormationId) -> Result<Vec<MatchPlayer>, sqlx::Error> {
         let rows = sqlx::query!(
-            "select fp.player_id, fp.team, p.trainer_name, \
+            "select fp.player_id, fp.team, p.trainer_name, p.discord_user_id, \
+                    (select s.display_name from player_discord_snapshots s \
+                     where s.player_id = fp.player_id order by s.id desc limit 1) as discord_name, \
+                    (select s.avatar_hash from player_discord_snapshots s \
+                     where s.player_id = fp.player_id order by s.id desc limit 1) as avatar_hash, \
                     r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", \
                     $2::double precision \
                         + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
@@ -162,6 +170,11 @@ impl MatchRepository {
                 role_display_name: row.role_display_name,
                 role_sort_order: row.role_sort_order,
                 rating: row.rating,
+                discord_name: row.discord_name,
+                avatar_url: crate::profiles::avatar_url(
+                    row.discord_user_id,
+                    row.avatar_hash.as_deref(),
+                ),
             })
             .collect())
     }
