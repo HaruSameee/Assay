@@ -498,14 +498,8 @@ impl Adapter {
         let mut failures = Vec::new();
         // **チームごとに別の本文。**そのVCには、そのチームの構成しか載せない
         for team in Team::ALL {
-            let message = render::assignment(
-                &heading,
-                &roster,
-                vc,
-                team,
-                &self.config.room_map,
-                &self.config.room_checklist,
-            );
+            // **名前もロールも部屋設定も載せない。**割り当てはマッチ画面にある
+            let message = render::assignment(&heading, vc, team, &match_url);
             match self
                 .post_or_edit(
                     vc.channel(team),
