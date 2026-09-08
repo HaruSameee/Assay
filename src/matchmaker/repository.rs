@@ -151,6 +151,33 @@ pub struct FirstChoiceRoleCounts {
 }
 
 impl FirstChoiceRoleCounts {
+    /// 1 人ぶん数える。**第1希望のロールだけ**（希望のどこかに含まれる人ではない）。
+    ///
+    /// キュー画面のロール別内訳もここを通すので、運営が 15 分サマリで見る数字と
+    /// 参加者がキュー画面で見る数字の定義が揃う。
+    pub fn increment(&mut self, role: &str) {
+        match role {
+            "top_carry" => self.top_carry += 1,
+            "top_support" => self.top_support += 1,
+            "jungle" => self.jungle += 1,
+            "bot_carry" => self.bot_carry += 1,
+            "bot_tank" => self.bot_tank += 1,
+            _ => warn!(role, "unknown first-choice role"),
+        }
+    }
+
+    /// ロール識別子と人数の組。**5 ロールすべてを返す**（0 人でも 0 を返す。
+    /// 出ないと「集計されていない」と読まれる）。並びは画面の並びに揃えてある。
+    pub fn all(&self) -> [(&'static str, usize); 5] {
+        [
+            ("top_carry", self.top_carry),
+            ("top_support", self.top_support),
+            ("jungle", self.jungle),
+            ("bot_carry", self.bot_carry),
+            ("bot_tank", self.bot_tank),
+        ]
+    }
+
     fn set(&mut self, role: &str, count: usize) {
         match role {
             "top_carry" => self.top_carry = count,

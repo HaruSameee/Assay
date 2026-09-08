@@ -530,7 +530,14 @@ async fn an_adjustment_moves_the_matching_range(owner: PgPool) {
     enqueue(&db, player(2), ROLES[0]).await;
     enqueue(&db, player(11), ROLES[1]).await;
     assert_eq!(queued_rating(&db, player(2)).await, 1500.0);
-    assert_eq!(db.queue.in_range_count(player(2)).await.unwrap(), Some(1));
+    assert_eq!(
+        db.queue
+            .in_range_summary(player(2))
+            .await
+            .unwrap()
+            .map(|s| s.total),
+        Some(1)
+    );
 
     // パネルで +100 -> 1600。差 100 は上方向の固定幅 95 の外
     admin
@@ -541,7 +548,11 @@ async fn an_adjustment_moves_the_matching_range(owner: PgPool) {
         .await;
     assert_eq!(queued_rating(&db, player(2)).await, 1600.0);
     assert_eq!(
-        db.queue.in_range_count(player(2)).await.unwrap(),
+        db.queue
+            .in_range_summary(player(2))
+            .await
+            .unwrap()
+            .map(|s| s.total),
         Some(0),
         "1600 は 1500 と組めない"
     );
@@ -555,7 +566,14 @@ async fn an_adjustment_moves_the_matching_range(owner: PgPool) {
         )
         .await;
     assert_eq!(queued_rating(&db, player(2)).await, 1500.0);
-    assert_eq!(db.queue.in_range_count(player(2)).await.unwrap(), Some(1));
+    assert_eq!(
+        db.queue
+            .in_range_summary(player(2))
+            .await
+            .unwrap()
+            .map(|s| s.total),
+        Some(1)
+    );
 
     db.done().await;
 }

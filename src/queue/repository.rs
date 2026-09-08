@@ -19,6 +19,7 @@
 use sqlx::PgPool;
 
 use crate::lifecycle::{FormationId, PlayerId, Timestamp};
+use crate::matchmaker::FirstChoiceRoleCounts;
 use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::model::{
@@ -30,6 +31,19 @@ use super::range::QueuedPlayer;
 /// PostgreSQL の SQLSTATE。
 const FOREIGN_KEY_VIOLATION: &str = "23503";
 const UNIQUE_VIOLATION: &str = "23505";
+
+/// 範囲内の待機状況。**人数と内訳を同じ判定・同じクエリから作る。**
+///
+/// 内訳は「第1希望がそのロールの人」の数で、15 分サマリと同じ定義。
+/// 「希望のどこかに含まれる人」ではないので、内訳の合計は `total` と一致する
+/// （希望を 1 つも持たない行があれば、そのぶんだけ内訳のほうが少なくなる）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InRangeSummary {
+    /// 自分の範囲内で、かつ相手からも受け入れられる人数（07 §3-1）。
+    pub total: usize,
+    /// その内訳（5 ロールすべて。0 人でも 0）。
+    pub by_first_choice: FirstChoiceRoleCounts,
+}
 
 /// キュー操作のエラー。
 #[derive(Debug, thiserror::Error)]
@@ -185,8 +199,12 @@ impl QueueRepository {
     ///
     /// 規模はキュー100人程度（07 §6）なので、全件読んで Rust 側で数える。
     pub async fn queued_players(&self) -> Result<Vec<QueuedPlayer>, QueueError> {
+        // 第1希望のロールは**同じクエリに畳む**。範囲内の人数もロール別の内訳も
+        // この1本の結果から数えるので、10秒ポーリングで往復が増えない
         let rows = sqlx::query!(
             "select q.player_id, q.down_range, \
+                    (select r.role from queue_entry_roles r \
+                     where r.entry_id = q.id and r.priority = 1) as first_choice, \
                     $1::double precision \
                         + coalesce((select sum(a.delta_mu) from rating_adjustments a \
                                     where a.player_id = q.player_id), 0::double precision) \
@@ -204,19 +222,27 @@ impl QueueRepository {
                 player_id: PlayerId(row.player_id),
                 rating: row.rating,
                 down_range: clamp_down_range(row.down_range),
+                first_choice: row.first_choice,
             })
             .collect())
     }
 
-    /// 自分の範囲内で、かつ相手からも受け入れられるキュー中の人数（07 §3-1）。
+    /// 範囲内の人数と、その**第1希望のロール別内訳**。
     ///
-    /// 自分がキュー中でなければ `None`（範囲は本人の設定なので、入る前は決まらない）。
-    pub async fn in_range_count(&self, player_id: PlayerId) -> Result<Option<usize>, QueueError> {
+    /// 人数と内訳は `queued_players` の**同じ 1 本のクエリ**の結果から数える
+    /// （画面のポーリングで往復を増やさない）。自分がキュー中でなければ `None`。
+    pub async fn in_range_summary(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Option<InRangeSummary>, QueueError> {
         let queue = self.queued_players().await?;
         let Some(me) = queue.iter().find(|player| player.player_id == player_id) else {
             return Ok(None);
         };
-        Ok(Some(super::range::count_in_range(me, &queue)))
+        Ok(Some(InRangeSummary {
+            total: super::range::count_in_range(me, &queue),
+            by_first_choice: super::range::count_by_first_choice(me, &queue),
+        }))
     }
 
     /// 未投入時のプレビュー。固定幅（上下 50）で相互に成立する人数を返す。
@@ -224,7 +250,10 @@ impl QueueRepository {
     /// 範囲はユーザーが調整できないので引数に取らない。本人のレートもキュー中のレートも
     /// 追記ログから毎回導出する。プレビューのために `queue_entries` を一時作成したり、
     /// 現在レートを保存したりしない。
-    pub async fn preview_in_range_count(&self, player_id: PlayerId) -> Result<usize, QueueError> {
+    pub async fn preview_in_range_summary(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<InRangeSummary, QueueError> {
         let queue = self.queued_players().await?;
         let Some(rating) = self.player_rating(player_id).await? else {
             return Err(QueueError::PlayerNotFound(player_id));
@@ -233,8 +262,13 @@ impl QueueRepository {
             player_id,
             rating,
             down_range: DOWN_RANGE,
+            // 未投入なので希望はまだ無い。内訳の分母には入らない
+            first_choice: None,
         };
-        Ok(super::range::count_in_range(&me, &queue))
+        Ok(InRangeSummary {
+            total: super::range::count_in_range(&me, &queue),
+            by_first_choice: super::range::count_by_first_choice(&me, &queue),
+        })
     }
 
     /// `vc_assigned` の永久ログから、成立済み formation で本人が向かう VC を読む。

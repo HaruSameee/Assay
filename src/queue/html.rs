@@ -38,6 +38,13 @@ legend { padding: 0; font-weight: 700; }
   .matched .destination strong { font-size: 1.6rem; }
 }
 .notice-removed { border-left: 3px solid var(--danger); }
+.first-choice { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.first-choice-label { margin: 0 0 8px; color: var(--muted); font-size: 0.82rem; }
+.first-choice-list { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.first-choice-list li { min-width: 0; }
+.first-choice-list .role-name { display: block; color: var(--muted); font-size: 0.78rem; overflow-wrap: anywhere; }
+.first-choice-list .role-count { font-variant-numeric: tabular-nums; }
+@media (max-width: 600px) { .first-choice-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .poll-status { min-height: 1.5em; margin-top: 14px; color: var(--danger); font-size: 0.875rem; }
 .button-danger { border-color: #7e3d43; background: transparent; color: var(--danger); }
 .button-danger:hover { border-color: var(--danger); background: var(--danger-bg); }
@@ -75,6 +82,32 @@ pub(super) fn queue_page(viewer: Viewer, status: &StatusView, now: Timestamp) ->
     }
 }
 
+/// ロール別の待機人数。**第1希望がそのロールの人の数**であることを画面に明記する。
+///
+/// 「タンク 4人」だけだと「タンクを希望に入れている人」と読まれる。5 ロールすべてを
+/// 出す（0 人でも 0。出ないと「集計されていない」と読まれる）。
+fn first_choice_breakdown(status: &StatusView) -> String {
+    let mut items = String::new();
+    for (role, label) in ROLE_OPTIONS {
+        // 0 人でも必ず出す。行ごと消えると「集計されていない」と読まれる
+        let people = status
+            .in_range_by_first_choice
+            .iter()
+            .find(|entry| entry.role == role)
+            .map_or(0, |entry| entry.count);
+        items.push_str(&format!(
+            "<li><span class=\"role-name\">{label}</span>\
+             <strong class=\"role-count\" data-count=\"{role}\">{people}人</strong></li>\n",
+            label = escape(label),
+        ));
+    }
+    format!(
+        "<div class=\"first-choice\">\n\
+         <p class=\"first-choice-label\"><strong>第1希望</strong>の内訳（この範囲内）</p>\n\
+         <ul class=\"first-choice-list\">\n{items}</ul></div>\n"
+    )
+}
+
 fn role_options(selected: Option<&str>) -> String {
     let mut output = String::from("<option value=\"\">選択しない</option>\n");
     for (value, label) in ROLE_OPTIONS {
@@ -110,12 +143,14 @@ fn unqueued_page(viewer: Viewer, status: &StatusView) -> String {
          <div class=\"field\"><label for=\"role-3\">第3希望</label>\n<select id=\"role-3\" disabled>{third}</select></div>\n\
          </div>\n</fieldset>\n\
          <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上下 ±{range} 固定です。\
-         現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p></div>\n\
+         現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p>\n\
+         {breakdown}</div>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button type=\"submit\">キューに入る</button></div>\n\
          </form>\n<p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
         range = UP_RANGE,
+        breakdown = first_choice_breakdown(status),
         removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
     );
@@ -167,6 +202,7 @@ fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Time
          <p class=\"lead\">マッチ成立までこの画面を開いたまま待機してください。</p>\n\
          <div class=\"metrics\">\n<div class=\"metric\"><span class=\"metric-label\">待ち時間</span><strong id=\"wait-time\" class=\"metric-value\">{waiting}</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">範囲内でキュー中</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
+         {breakdown}\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
          <dl class=\"details\"><div><dt>ロール希望</dt><dd><ol class=\"role-preferences\">{roles}</ol></dd></div>\n\
          <div><dt>レート範囲</dt><dd>上下 ±{up_range}（固定）</dd></div></dl></section>\n\
@@ -175,6 +211,7 @@ fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Time
          <p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
         enqueued = escape(&entry.enqueued_at),
+        breakdown = first_choice_breakdown(status),
         up_range = entry.up_range,
         script = QUEUED_SCRIPT,
     );
@@ -328,6 +365,10 @@ const UNQUEUED_SCRIPT: &str = r#"
       const state = await response.json();
       if (blocked(state) || state.queued) return window.location.reload();
       inRange.textContent = `${state.in_range ?? 0}人`;
+      for (const entry of state.in_range_by_first_choice ?? []) {
+        const cell = document.querySelector(`[data-count="${entry.role}"]`);
+        if (cell) cell.textContent = `${entry.count}人`;
+      }
       pollStatus.textContent = '';
     } catch (_) {
       pollStatus.textContent = '人数を更新できませんでした。次の更新を待っています。';
@@ -389,6 +430,10 @@ const QUEUED_SCRIPT: &str = r#"
       const state = await response.json();
       if (!state.queued || blocked(state)) return window.location.reload();
       inRange.textContent = `${state.in_range ?? 0}人`;
+      for (const entry of state.in_range_by_first_choice ?? []) {
+        const cell = document.querySelector(`[data-count="${entry.role}"]`);
+        if (cell) cell.textContent = `${entry.count}人`;
+      }
       pollStatus.textContent = '';
     } catch (_) {
       pollStatus.textContent = '状態を更新できませんでした。次の更新を待っています。';
@@ -448,13 +493,24 @@ mod tests {
 
     use super::*;
     use crate::queue::model::RolePreference;
-    use crate::queue::routes::{DestinationView, EligibilityView};
+    use crate::queue::routes::{DestinationView, EligibilityView, RoleCountView};
 
     fn status() -> StatusView {
         StatusView {
             queued: false,
             entry: None,
             in_range: Some(4),
+            // 4 人ぶんの内訳。タンクは 0 人（0 も出ることを画面のテストで見る）
+            in_range_by_first_choice: vec![
+                RoleCountView {
+                    role: "top_carry".to_owned(),
+                    count: 2,
+                },
+                RoleCountView {
+                    role: "jungle".to_owned(),
+                    count: 2,
+                },
+            ],
             eligibility: EligibilityView {
                 registration: None,
                 active_formation: None,
@@ -748,5 +804,72 @@ mod tests {
         };
         println!("========== 4. ゲートで停止 ==========");
         println!("{}", queue_page(Viewer::MEMBER, &blocked, now));
+    }
+
+    /// **5 ロールすべてを出し、0 人のロールも 0 と表示する。**
+    ///
+    /// 出ないと「集計されていない」と読まれる。数え方が第1希望であることも明記する。
+    #[test]
+    fn the_role_breakdown_shows_every_role_including_zero() {
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now());
+        // 数え方の明示
+        assert!(
+            rendered.contains("<strong>第1希望</strong>の内訳"),
+            "{rendered}"
+        );
+        // 5 ロールぶんの枠がある
+        assert_eq!(rendered.matches("class=\"role-count\"").count(), 5);
+        for (role, label) in ROLE_OPTIONS {
+            assert!(
+                rendered.contains(&format!("data-count=\"{role}\"")),
+                "{role} の枠が無い: {rendered}"
+            );
+            assert!(rendered.contains(label), "{label} が無い: {rendered}");
+        }
+        // 内訳のある2つは実数、残る3つは 0 人
+        assert!(
+            rendered.contains("data-count=\"top_carry\">2人"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("data-count=\"jungle\">2人"), "{rendered}");
+        for zero in ["top_support", "bot_carry", "bot_tank"] {
+            assert!(
+                rendered.contains(&format!("data-count=\"{zero}\">0人")),
+                "{zero} が 0 人として出ていない: {rendered}"
+            );
+        }
+    }
+
+    /// キュー中の画面にも同じ内訳が出る。ポーリングでも書き換わる。
+    #[test]
+    fn the_role_breakdown_is_on_the_queued_page_too() {
+        let mut queued = status();
+        queued.queued = true;
+        queued.entry = Some(EntryView {
+            id: Uuid::nil(),
+            player_id: Uuid::nil(),
+            enqueued_at: "2026-09-12T12:00:00+00:00".to_owned(),
+            updated_at: "2026-09-12T12:00:00+00:00".to_owned(),
+            down_range: 50,
+            up_range: 50,
+            roles: vec![RolePreference {
+                role: "jungle".to_owned(),
+                priority: 1,
+            }],
+        });
+        let rendered = queue_page(Viewer::MEMBER, &queued, Utc::now());
+        assert!(
+            rendered.contains("<strong>第1希望</strong>の内訳"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("data-count=\"bot_tank\">0人"),
+            "{rendered}"
+        );
+        // ポーリングが内訳も書き換える
+        assert!(
+            rendered.contains("state.in_range_by_first_choice"),
+            "{rendered}"
+        );
     }
 }
