@@ -417,9 +417,16 @@ pub fn host_accepted(heading: &str, host: UserId, match_url: &str) -> OutgoingMe
 /// mention 構文を本文へ持ち込まない。
 /// ルーム ID は公開 VC に出してよい。参加者以外が入室したときは、ゲーム内のルームオーナーが
 /// 退出させられる。bot は VC の権限を変更しない。
+///
+/// **通知が飛ぶのはホスト自身のチーム側の1通だけ。**開示は red / blue 両方へ出すので、
+/// 2通とも `mention_users` にホストを載せると、ホスト1人が同じ知らせで2回叩かれる
+/// （04 §「ホストのメンションだけ残す — 1人なので通知の重複にならず」が崩れる）。
+/// 相手チーム側は `<@id>` の表示だけ残す。`allowed_mentions` に載らなければ名前は
+/// 見えても通知は飛ばず、「誰に聞けばよいか」は相手チームにも伝わる。
 pub fn code_reveal(
     heading: &str,
     host: UserId,
+    host_team: Team,
     room_code: &str,
     vc: &VcPair,
     team: Team,
@@ -434,8 +441,12 @@ pub fn code_reveal(
             vc_line(vc, team),
         ),
         buttons: Vec::new(),
-        // ホスト1人だけ。9人分の重複通知は出さない
-        mention_users: vec![host],
+        // ホスト自身のチーム側だけ通知する。相手側は表示のみ
+        mention_users: if team == host_team {
+            vec![host]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -612,7 +623,7 @@ mod tests {
         ];
         for team in Team::ALL {
             messages.push(assignment(&heading, &vc(), team, SITE));
-            messages.push(code_reveal(&heading, host, "1234", &vc(), team));
+            messages.push(code_reveal(&heading, host, Team::Red, "1234", &vc(), team));
         }
         messages.extend(
             AbandonReason::ALL
@@ -1004,16 +1015,13 @@ mod tests {
         println!("{}", host_prompt(&head(), host, 1, 3, SITE).content);
         println!("\n========== ホスト候補の VC: 承諾後 ==========");
         println!("{}", host_accepted(&head(), host, SITE).content);
-        println!("\n========== red の VC: ルーム ID 開示 ==========");
-        println!(
-            "{}",
-            code_reveal(&head(), host, "12345678", &vc(), Team::Red).content
-        );
-        println!("\n========== blue の VC: ルーム ID 開示 ==========");
-        println!(
-            "{}",
-            code_reveal(&head(), host, "12345678", &vc(), Team::Blue).content
-        );
+        // ホストは red の人。通知が飛ぶのは red 側の 1 通だけ
+        for team in Team::ALL {
+            let reveal = code_reveal(&head(), host, Team::Red, "12345678", &vc(), team);
+            println!("\n========== {team} の VC: ルーム ID 開示 ==========");
+            println!("{}", reveal.content);
+            println!("通知が飛ぶ相手: {:?}", reveal.mention_users);
+        }
         println!("\n========== 両 VC: 報告の催促 ==========");
         println!("{}", report_prompt(&head(), SITE).content);
         println!("\n========== 古いボタンを押した人にだけ ==========");
@@ -1078,8 +1086,7 @@ mod tests {
     fn the_room_code_mentions_only_the_host() {
         let host = UserId::new(1001);
         for team in Team::ALL {
-            let message = code_reveal(&head(), host, "8888", &vc(), team);
-            assert_eq!(message.mention_users, vec![host]);
+            let message = code_reveal(&head(), host, Team::Red, "8888", &vc(), team);
             // ホスト以外の `<@` が本文に無い
             assert_eq!(
                 message.content.matches("<@").count(),
@@ -1108,14 +1115,50 @@ mod tests {
             assert!(message.buttons.is_empty());
         }
         // red の投稿に blue の VC が出てこない
-        let red = code_reveal(&head(), host, "8888", &vc(), Team::Red);
+        let red = code_reveal(&head(), host, Team::Red, "8888", &vc(), Team::Red);
         assert!(!red.content.contains("vc3-blue"), "{}", red.content);
+    }
+
+    /// **通知が飛ぶのはホスト自身のチーム側の1通だけ。**
+    ///
+    /// 開示は red / blue の両方へ出すので、2 通とも `mention_users` に載せると
+    /// ホスト1人が同じ知らせで 2 回叩かれる。相手チーム側では `<@id>` の表示だけ残し、
+    /// 「誰に聞けばよいか」は伝わったまま通知は飛ばさない。
+    #[test]
+    fn only_the_hosts_own_team_notifies_the_host() {
+        let host = UserId::new(1001);
+        for host_team in Team::ALL {
+            let mut notified = 0;
+            for team in Team::ALL {
+                let message = code_reveal(&head(), host, host_team, "8888", &vc(), team);
+                // 表示は両方に出る（部屋に入れなかったときに聞く相手が分かる）
+                assert!(message.content.contains("<@1001>"), "{}", message.content);
+                if team == host_team {
+                    assert_eq!(message.mention_users, vec![host], "{team} / {host_team}");
+                    notified += 1;
+                } else {
+                    assert!(
+                        message.mention_users.is_empty(),
+                        "相手チーム側で通知が飛んでいる: {team} / {host_team}"
+                    );
+                }
+            }
+            // 1 試合につきホストへの通知はちょうど 1 回
+            assert_eq!(notified, 1, "host_team = {host_team}");
+        }
     }
 
     /// ルーム ID に紛れ込んだ mention 構文を本文へ持ち込まない。
     #[test]
     fn a_hostile_room_code_cannot_mention_anyone() {
-        let message = code_reveal(&head(), UserId::new(1001), "<@&12345>", &vc(), Team::Red);
+        let message = code_reveal(
+            &head(),
+            UserId::new(1001),
+            Team::Red,
+            "<@&12345>",
+            &vc(),
+            Team::Red,
+        );
         assert_eq!(
             message.content.matches("<@").count(),
             1,
