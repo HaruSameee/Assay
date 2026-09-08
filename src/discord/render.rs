@@ -415,6 +415,8 @@ pub fn host_accepted(heading: &str, host: UserId, match_url: &str) -> OutgoingMe
 /// ホストのメンションだけ残す — 1人なので通知の重複にならず、部屋に入れなかったときに
 /// 誰へ聞けばよいかが分かる。表示名は [`plain_discord_text`] を通し、名前に紛れ込んだ
 /// mention 構文を本文へ持ち込まない。
+/// ルーム ID は公開 VC に出してよい。参加者以外が入室したときは、ゲーム内のルームオーナーが
+/// 退出させられる。bot は VC の権限を変更しない。
 pub fn code_reveal(
     heading: &str,
     host: UserId,
@@ -424,7 +426,8 @@ pub fn code_reveal(
 ) -> OutgoingMessage {
     OutgoingMessage {
         content: format!(
-            "{}ルーム ID は **{}** です（ホスト: {}）。\n{}してください。",
+            "{}ルーム ID は **{}** です（ホスト: {}）。\n{}してください。\n\
+             ホストの方へ: 参加者以外が入室していた場合は、ゲーム内で退出させてください。",
             heading,
             plain_discord_text(room_code),
             mention(host),
@@ -1093,6 +1096,13 @@ mod tests {
                 );
             }
             assert!(message.content.contains("**8888**"));
+            assert!(
+                message.content.contains(
+                    "ホストの方へ: 参加者以外が入室していた場合は、ゲーム内で退出させてください。"
+                ),
+                "{}",
+                message.content
+            );
             // 集合先はそのチームの側だけ
             assert!(message.content.contains(&vc().channel_name(team)));
             assert!(message.buttons.is_empty());
