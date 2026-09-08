@@ -92,6 +92,7 @@ impl OAuthClient for FakeOAuth {
         Ok(DiscordUser {
             id: self.user_id.lock().unwrap().clone(),
             username: "handle".into(),
+            avatar: None,
             global_name: Some("表示名".into()),
         })
     }

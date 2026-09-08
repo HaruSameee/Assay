@@ -52,6 +52,11 @@ pub struct DiscordUser {
     /// 表示名（未設定なら `None`）。
     #[serde(default)]
     pub global_name: Option<String>,
+    /// アバターのハッシュ。**未設定なら `None`**（既定アバターを出す）。
+    ///
+    /// `identify` で取れる範囲。scope は増やしていない。
+    #[serde(default)]
+    pub avatar: Option<String>,
 }
 
 impl DiscordUser {
@@ -278,18 +283,21 @@ mod tests {
         let with_global = DiscordUser {
             id: "1".into(),
             username: "handle".into(),
+            avatar: None,
             global_name: Some("表示名".into()),
         };
         assert_eq!(with_global.display_name(), "表示名");
         let without = DiscordUser {
             id: "1".into(),
             username: "handle".into(),
+            avatar: None,
             global_name: None,
         };
         assert_eq!(without.display_name(), "handle");
         let empty = DiscordUser {
             id: "1".into(),
             username: "handle".into(),
+            avatar: None,
             global_name: Some(String::new()),
         };
         assert_eq!(empty.display_name(), "handle");

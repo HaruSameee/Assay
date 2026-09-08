@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select p.discord_user_id, p.trainer_name, $2::double precision + coalesce((select sum(a.delta_mu) from season_rating_adjustments a where a.player_id = p.id), 0::double precision) + coalesce((select sum(d.delta) from player_match_rating_deltas d where d.player_id = p.id), 0::double precision) as \"rating!\", coalesce((select count(*) from player_match_rating_deltas d where d.player_id = p.id), 0)::bigint as \"matches!\" from players p where p.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "discord_user_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "discord_user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "matches!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "9c27e5b6a9239a9f1f1f0e8792ec11bec187658d1c5e3869633cfc0b53415d65"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id from roles order by sort_order, id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "72884569a2915be92c8a59278138af6d7d3042b2b7c3443cf84836d2962a1e4e"
+}
