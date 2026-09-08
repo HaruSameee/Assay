@@ -468,7 +468,7 @@ pub fn code_reveal(
 /// 報告の**催促**。集計・人数・報告者名は一切載せない。
 ///
 /// **ボタンは無く、メンションも付けない。**報告はマッチ画面で受ける。ここに残すのは
-/// 「終わったら報告してください」を伝える役目だけ（報告には 30 分の期限がある）。
+/// 「終わったら報告してください」を伝える役目だけ（報告には 15 分の期限がある。REPORT_WINDOW_MINUTES）。
 pub fn report_prompt(heading: &str, match_url: &str) -> OutgoingMessage {
     OutgoingMessage {
         content: format!(

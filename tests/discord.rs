@@ -1678,3 +1678,108 @@ async fn internal_formations_endpoint_requires_the_token_and_starts_a_formation(
     }
     db.done().await;
 }
+
+/// **報告期限を 15 分にしても、5 秒スキャンの評価経路はそのまま動く。**
+///
+/// 既定値（`LifecycleConfig::default()`）をそのまま使い、最初の報告を 15 分 + 1 秒前に
+/// 置く。確定条件は変えていないので、
+/// `unanimous && (all_reported || report_window_elapsed)` のまま:
+/// 全員一致していない9人ぶんでも、期限が過ぎていれば確定する。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    // **既定の設定のまま**（report_window = 15 分）
+    let lifecycle = LifecycleConfig::default();
+    assert_eq!(lifecycle.report_window, Duration::from_secs(15 * 60));
+    let adapter = adapter_with_lifecycle(&db, fake, 1, lifecycle);
+
+    // 最初の報告を 15 分 + 1 秒前に置く
+    let first_report_at = Utc::now() - TimeDelta::seconds(15 * 60 + 1);
+    let started = first_report_at - TimeDelta::seconds(60);
+    db.repo.create_formation(&formation(1)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, started, "vc"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), started, "host"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), started, "accepted"),
+        NewEvent::code_posted(pid(1), "1234", started, "code"),
+    ] {
+        db.repo.append_event(fid(1), &event).await.unwrap();
+    }
+    // 9 人だけが red で報告。10 人目は最後まで報告しない
+    for reporter in 1..=9u128 {
+        db.repo
+            .append_report(&NewReport {
+                formation_id: fid(1),
+                player_id: pid(reporter),
+                reported_at: first_report_at,
+                outcome: Outcome::Win(Team::Red),
+                raw_result: serde_json::json!({ "source": "test" }),
+                supersedes_id: None,
+                idempotency_key: format!("window-{reporter}"),
+            })
+            .await
+            .unwrap();
+    }
+    // 全員は報告していないので、期限が来るまでは確定しない
+    let (_, state, _) = load(&db, fid(1)).await;
+    assert!(matches!(state, S::InProgress { .. }), "{state:?}");
+
+    // 5 秒スキャンと同じ経路
+    adapter.resume_unfinished().await.unwrap();
+
+    let (log, state, _) = load(&db, fid(1)).await;
+    assert_eq!(state, S::Confirmed, "15 分の期限が評価されていない");
+    let confirmed = log
+        .events
+        .iter()
+        .rev()
+        .find(|stored| stored.event.kind == K::Confirmed)
+        .expect("confirmed event");
+    assert_eq!(confirmed.payload["outcome"], "red");
+    assert_eq!(
+        confirmed.payload["decision_basis"], "report_window_elapsed",
+        "{:?}",
+        confirmed.payload
+    );
+    println!("15 分経過で確定: {:?}", confirmed.payload);
+
+    // 割れていれば disputed（多数決にはしない）
+    db.repo.create_formation(&formation(2)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, started, "vc2"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), started, "host2"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), started, "accepted2"),
+        NewEvent::code_posted(pid(1), "1234", started, "code2"),
+    ] {
+        db.repo.append_event(fid(2), &event).await.unwrap();
+    }
+    for reporter in 1..=9u128 {
+        db.repo
+            .append_report(&NewReport {
+                formation_id: fid(2),
+                player_id: pid(reporter),
+                reported_at: first_report_at,
+                // 8 人が red、1 人が blue。多数決なら red になるが、そうはしない
+                outcome: if reporter == 9 {
+                    Outcome::Win(Team::Blue)
+                } else {
+                    Outcome::Win(Team::Red)
+                },
+                raw_result: serde_json::json!({ "source": "test" }),
+                supersedes_id: None,
+                idempotency_key: format!("split-{reporter}"),
+            })
+            .await
+            .unwrap();
+    }
+    adapter.resume_unfinished().await.unwrap();
+    let (_, state, _) = load(&db, fid(2)).await;
+    assert_eq!(state, S::Disputed, "8 対 1 が多数決で確定している");
+    println!("8 対 1 は多数決にせず disputed のまま");
+
+    db.done().await;
+}
