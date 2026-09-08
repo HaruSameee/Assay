@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select sum(delta) from player_match_rating_deltas where player_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sum",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c24d925c35494c02809e9256941bd61806e34bb416647ee231d1bd71445a4329"
+}
