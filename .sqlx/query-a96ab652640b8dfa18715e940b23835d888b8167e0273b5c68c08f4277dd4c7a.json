@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, $1::double precision + coalesce((select sum(a.delta_mu) from rating_adjustments a where a.player_id = q.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\", $2::double precision + coalesce((select sum(a.delta_sigma) from rating_adjustments a where a.player_id = q.player_id), 0::double precision) as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q left join player_match_ratings m on m.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
+  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, $1::double precision + coalesce((select sum(a.delta_mu) from season_rating_adjustments a where a.player_id = q.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\", $2::double precision + coalesce((select sum(a.delta_sigma) from season_rating_adjustments a where a.player_id = q.player_id), 0::double precision) as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q left join player_match_ratings m on m.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
   "describe": {
     "columns": [
       {
@@ -111,5 +111,5 @@
       false
     ]
   },
-  "hash": "dfd2e9fbbfcdcf7602638aec39418d6e39bdb3e10f3311ad57f764f00eda303d"
+  "hash": "a96ab652640b8dfa18715e940b23835d888b8167e0273b5c68c08f4277dd4c7a"
 }

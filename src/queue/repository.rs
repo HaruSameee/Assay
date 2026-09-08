@@ -188,7 +188,7 @@ impl QueueRepository {
         let rows = sqlx::query!(
             "select q.player_id, q.down_range, \
                     $1::double precision \
-                        + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
                                     where a.player_id = q.player_id), 0::double precision) \
                         + coalesce(m.delta, 0::double precision) \
                         as \"rating!\" \
@@ -325,7 +325,7 @@ impl QueueRepository {
     async fn player_rating(&self, player_id: PlayerId) -> Result<Option<f64>, QueueError> {
         let row = sqlx::query!(
             "select $2::double precision \
-                    + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                    + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
                                 where a.player_id = p.id), 0::double precision) \
                     + coalesce(m.delta, 0::double precision) \
                     as \"rating!\" \

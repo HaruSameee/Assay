@@ -139,7 +139,7 @@ impl MatchRepository {
             "select fp.player_id, fp.team, p.trainer_name, \
                     r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", \
                     $2::double precision \
-                        + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
                                     where a.player_id = fp.player_id), 0::double precision) \
                         + coalesce(m.delta, 0::double precision) as \"rating!\" \
              from formation_players fp \

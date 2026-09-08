@@ -171,11 +171,18 @@ impl RatingAdjustmentRepository {
         Self { pool }
     }
 
-    /// 1 プレイヤーの全調整を挿入順で読む。現在値の保存や更新は行わない。
+    /// 1 プレイヤーの、**現在のシーズンに入る**調整を挿入順で読む。
+    ///
+    /// 読むのは `season_rating_adjustments` ビュー（`rating_adjustments` を直接読まない）。
+    /// 境界より前の調整はログに残ったまま、ここに現れない。
+    ///
+    /// ビュー越しなので sqlx が NOT NULL を推論できない。元の列はすべて NOT NULL なので
+    /// `!` で明示する（`reverts_id` だけは元から nullable）。
     pub async fn load(&self, player_id: PlayerId) -> Result<Vec<RatingAdjustment>, sqlx::Error> {
         let rows = sqlx::query!(
-            "select id, delta_mu, delta_sigma, reverts_id \
-             from rating_adjustments where player_id = $1 order by id",
+            "select id as \"id!\", delta_mu as \"delta_mu!\", \
+                    delta_sigma as \"delta_sigma!\", reverts_id \
+             from season_rating_adjustments where player_id = $1 order by id",
             player_id.0,
         )
         .fetch_all(&self.pool)

@@ -21,6 +21,7 @@ use crate::queue::model::clamp_down_range;
 use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
+use super::season::{SeasonBoundary, SeasonOutcome, SeasonPreview};
 
 /// PostgreSQL の SQLSTATE。
 const UNIQUE_VIOLATION: &str = "23505";
@@ -440,7 +441,7 @@ impl AdminRepository {
             "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, \
                     p.discord_user_id, p.trainer_name, \
                     $1::double precision \
-                        + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
                                     where a.player_id = q.player_id), 0::double precision) \
                         + coalesce(m.delta, 0::double precision) \
                         as \"rating!\" \
@@ -604,4 +605,164 @@ pub(crate) async fn matchmaker_pause_on(
             since: row.occurred_at,
             reason: row.reason,
         }))
+}
+
+// ----------------------------------------------------------------------
+// シーズン境界（導出の起点）
+// ----------------------------------------------------------------------
+//
+// マイグレーション `20260909090000_season_boundaries` と対。ここでも **INSERT と
+// 読み取りだけ**。境界を適用する条件は SQL の `current_season` ビューにあり、
+// Rust 側には条件式を置かない。
+
+/// 追記する境界 1 行。`created_by` は照合を通った管理者から自動で埋める。
+#[derive(Debug, Clone)]
+pub struct NewSeasonBoundary {
+    /// この時刻以降を新しいシーズンにする。
+    pub effective_at: DateTime<Utc>,
+    /// シーズン名。2 段目でこの文字列を手入力させる。
+    pub label: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。同一キーのみ no-op（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// いま効いている境界。まだ 1 本も無ければ `None`。
+    pub async fn current_season(&self) -> Result<Option<SeasonBoundary>, sqlx::Error> {
+        let row = sqlx::query!(
+            "select id, effective_at, label, created_by, created_at \
+             from season_boundaries order by id desc limit 1"
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| SeasonBoundary {
+            id: row.id,
+            effective_at: row.effective_at,
+            label: row.label,
+            created_by: row.created_by,
+            created_at: row.created_at,
+        }))
+    }
+
+    /// 実行前に画面へ出す件数。**すべて導出値**で、どこにも保存しない。
+    ///
+    /// 進行中の判定は `list_unfinished`（イベント列を Rust の状態機械で畳む）を使う。
+    /// 状態列は無いので、最終イベントの種別だけを見て取り違えることがない。
+    pub async fn season_preview(
+        &self,
+        effective_at: DateTime<Utc>,
+    ) -> Result<SeasonPreview, sqlx::Error> {
+        let current = self.current_season().await?;
+
+        // 進行中（matched / awaiting_host / awaiting_code / in_progress）と、
+        // 報告待ち（in_progress）を 1 回の走査で数える
+        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => error,
+                // list_unfinished は導出しかしないので、他の種別は起きない
+                other => sqlx::Error::Protocol(other.to_string()),
+            })?;
+        let mut active_formations = 0;
+        let mut pending_reports = 0;
+        for formation in &unfinished {
+            match &formation.snapshot.state {
+                crate::lifecycle::FormationState::Matched
+                | crate::lifecycle::FormationState::AwaitingHost { .. }
+                | crate::lifecycle::FormationState::AwaitingCode { .. } => active_formations += 1,
+                crate::lifecycle::FormationState::InProgress { .. } => {
+                    active_formations += 1;
+                    pending_reports += 1;
+                }
+                crate::lifecycle::FormationState::Disputed
+                | crate::lifecycle::FormationState::Confirmed
+                | crate::lifecycle::FormationState::Nullified
+                | crate::lifecycle::FormationState::Voided
+                | crate::lifecycle::FormationState::Abandoned => {}
+            }
+        }
+
+        // 集計から外れる試合と、その参加者。いま導出に入っているものだけを数える
+        // （`player_match_rating_deltas` が現在の境界で既に絞られている）
+        let leaving = sqlx::query!(
+            "select count(distinct d.formation_id)::bigint as \"matches!\", \
+                    count(distinct d.player_id)::bigint as \"players!\" \
+             from player_match_rating_deltas d \
+             join formations f on f.id = d.formation_id \
+             where f.created_at < $1",
+            effective_at,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(SeasonPreview {
+            active_formations,
+            pending_reports,
+            matches_leaving: usize::try_from(leaving.matches).unwrap_or(usize::MAX),
+            players_affected: usize::try_from(leaving.players).unwrap_or(usize::MAX),
+            current,
+        })
+    }
+
+    /// 境界を追記する。**進行中の formation が 1 件でもあれば何も書かない。**
+    ///
+    /// 境界の追記と `admin_actions` への記録を同じトランザクションで行う。
+    /// 冪等は「同一 `idempotency_key` のみ no-op」。
+    pub async fn start_season(
+        &self,
+        input: &NewSeasonBoundary,
+    ) -> Result<SeasonOutcome, AdminStoreError> {
+        let preview = self.season_preview(input.effective_at).await?;
+        if !preview.can_start() {
+            return Ok(SeasonOutcome::Blocked {
+                active_formations: preview.active_formations,
+            });
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar!(
+            "insert into season_boundaries \
+             (effective_at, label, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.effective_at,
+            input.label,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(SeasonOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::SeasonStarted,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.label.clone()),
+                payload: serde_json::json!({
+                    "season_boundary_id": id,
+                    "effective_at": input.effective_at.to_rfc3339(),
+                    "matches_leaving": preview.matches_leaving,
+                    "players_affected": preview.players_affected,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("season:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(SeasonOutcome::Started { id })
+    }
 }

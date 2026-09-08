@@ -34,12 +34,15 @@ use super::actions::{
 };
 use super::config::AdminIds;
 use super::html::{
-    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, SearchView, player_page, queue_page,
-    search_page,
+    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, SearchView, SeasonView, player_page,
+    queue_page, search_page, season_page,
 };
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    RemovalOutcome,
+    NewSeasonBoundary, RemovalOutcome,
+};
+use super::season::{
+    MAX_SEASON_LABEL_LENGTH, SeasonOutcome, confirmation_matches, normalize_label,
 };
 
 /// 検索のヒット上限と、一覧に出す直近ログの件数。
@@ -93,6 +96,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/matchmaker", post(control_matchmaker))
         .route("/admin/queue/remove", post(remove_from_queue))
         .route("/admin/blocks", post(set_block_allowance))
+        // シーズン境界（導出の起点）。2 段階の確認。実行は POST /admin/season
+        .route("/admin/season", get(show_season).post(start_season))
+        .route("/admin/season/confirm", post(confirm_season))
         .with_state(state)
 }
 
@@ -694,4 +700,154 @@ async fn set_block_allowance(
         }
     };
     render_player(&app, player_id, Some(notice)).await
+}
+
+// ----------------------------------------------------------------------
+// シーズン境界（導出の起点を追記する）
+// ----------------------------------------------------------------------
+//
+// **レートのリセットではない。**画面の文言も「新しいシーズンを開始する
+// （ここより前の試合を集計から外す）」で統一する。
+//
+// 2 段階の確認: 1 段目は警告と件数、2 段目は**同じラベルの打ち直し**。
+// クリック 2 回だと誤操作がそのまま通る。
+
+/// シーズン画面を描画する。件数は毎回数え直す（保存しない）。
+async fn render_season(
+    app: &AdminState,
+    confirming: Option<&str>,
+    notice: Option<Notice>,
+) -> Response {
+    let effective_at = Utc::now();
+    let preview = match app.store.season_preview(effective_at).await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not count the season preview");
+            return internal_error();
+        }
+    };
+    let key = form_key();
+    Html(season_page(&SeasonView {
+        preview: &preview,
+        effective_at,
+        form_key: &key,
+        confirming,
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_season(State(app): State<AdminState>, session: Option<CurrentSession>) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_season(&app, None, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct SeasonConfirmForm {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// 1 段目 → 2 段目。ラベルを検証して確認画面を出すだけで、まだ何も書かない。
+async fn confirm_season(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<SeasonConfirmForm>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    let Some(label) = normalize_label(&form.label) else {
+        let notice = fail(format!(
+            "シーズン名を 1〜{MAX_SEASON_LABEL_LENGTH} 文字で入力してください（改行は使えません）。"
+        ));
+        return render_season(&app, None, Some(notice)).await;
+    };
+    // 冪等キーは 1 段目で発行したものを 2 段目へ持ち越す（同じ操作は 1 行にしかならない）
+    render_season_with_key(&app, &label, &form.key, None).await
+}
+
+/// 2 段目の描画。冪等キーを引き継ぐので [`render_season`] とは別にしてある。
+async fn render_season_with_key(
+    app: &AdminState,
+    label: &str,
+    key: &str,
+    notice: Option<Notice>,
+) -> Response {
+    let effective_at = Utc::now();
+    let preview = match app.store.season_preview(effective_at).await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not count the season preview");
+            return internal_error();
+        }
+    };
+    Html(season_page(&SeasonView {
+        preview: &preview,
+        effective_at,
+        form_key: key,
+        confirming: Some(label),
+        notice,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SeasonStartForm {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    confirm_label: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// 2 段目の送信。ラベルの打ち直しが一致したときだけ追記する。
+async fn start_season(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<SeasonStartForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let Some(label) = normalize_label(&form.label) else {
+        return render_season(&app, None, Some(fail("シーズン名が不正です。".to_owned()))).await;
+    };
+    if !confirmation_matches(&label, &form.confirm_label) {
+        let notice = fail("シーズン名が一致しません。同じ文字列を入力してください。".to_owned());
+        return render_season_with_key(&app, &label, &form.key, Some(notice)).await;
+    }
+
+    let now = Utc::now();
+    let input = NewSeasonBoundary {
+        effective_at: now,
+        label: label.clone(),
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: now,
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.start_season(&input).await {
+        Ok(SeasonOutcome::Started { id }) => info(format!(
+            "シーズン「{label}」を開始しました（境界 #{id}）。ここより前の試合は集計から外れます。\
+             ログは 1 行も消えていません。"
+        )),
+        Ok(SeasonOutcome::Duplicate) => {
+            info("この操作は既に記録されています。境界は増やしていません。".to_owned())
+        }
+        Ok(SeasonOutcome::Blocked { active_formations }) => fail(format!(
+            "進行中の formation が {active_formations} 件あるため実行しませんでした。\
+             終わってからやり直してください。"
+        )),
+        Err(err) => {
+            error!(%err, "could not append the season boundary");
+            return internal_error();
+        }
+    };
+    render_season(&app, None, Some(notice)).await
 }

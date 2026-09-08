@@ -621,12 +621,12 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
     let rows = sqlx::query!(
         "select q.id, q.player_id, q.down_range, q.enqueued_at, \
                 $1::double precision \
-                    + coalesce((select sum(a.delta_mu) from rating_adjustments a \
+                    + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
                                 where a.player_id = q.player_id), 0::double precision) \
                     + coalesce(m.delta, 0::double precision) \
                     as \"rating!\", \
                 $2::double precision \
-                    + coalesce((select sum(a.delta_sigma) from rating_adjustments a \
+                    + coalesce((select sum(a.delta_sigma) from season_rating_adjustments a \
                                 where a.player_id = q.player_id), 0::double precision) \
                     as \"sigma!\", \
                 latest.formation_id as \"latest_formation?\", \
