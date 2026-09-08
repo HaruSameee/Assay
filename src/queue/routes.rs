@@ -295,16 +295,32 @@ async fn show_queue(
     // 範囲は固定なので、未投入時の人数プレビューに指定するものが無い。画面（HTML）を
     // 開いたときだけ数える（JSON のポーリングは投入前の人数を要求しない）
     match status(&app, player_id).await {
-        Some(status) if html => (
-            StatusCode::OK,
-            Html(super::html::queue_page(
-                // ヘッダーの描画にだけ必要。ポーリングされる JSON 側では引かない
-                viewer(&app, player_id).await,
-                &status,
-                Utc::now(),
-            )),
-        )
-            .into_response(),
+        Some(status) if html => {
+            // 前回のロール希望でフォームを埋める。**画面にしか使わない**ので
+            // JSON の `StatusView` には載せない。読めなければ空のまま出す
+            let prefill = if status.entry.is_none() {
+                app.queue
+                    .last_role_preferences(player_id)
+                    .await
+                    .inspect_err(|error| {
+                        error!(%error, "could not read the previous role preferences");
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (
+                StatusCode::OK,
+                Html(super::html::queue_page(
+                    // ヘッダーの描画にだけ必要。ポーリングされる JSON 側では引かない
+                    viewer(&app, player_id).await,
+                    &status,
+                    Utc::now(),
+                    &prefill,
+                )),
+            )
+                .into_response()
+        }
         Some(status) => (StatusCode::OK, Json(status)).into_response(),
         None => internal_error(),
     }

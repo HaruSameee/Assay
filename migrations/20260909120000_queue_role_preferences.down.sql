@@ -1,0 +1,2 @@
+drop trigger if exists queue_role_preferences_forbid_update_delete on queue_role_preferences;
+drop table if exists queue_role_preferences;
