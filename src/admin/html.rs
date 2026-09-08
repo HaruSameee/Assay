@@ -13,6 +13,7 @@ use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
 use super::repository::{AdjustmentRow, FoundPlayer, QueuedEntry};
+use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
 
 /// 検索画面に渡すデータ。
 #[derive(Debug, Clone)]
@@ -360,9 +361,10 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/queue", "キューと運用"),
+        link("/admin/season", "シーズン"),
     )
 }
 
@@ -552,6 +554,148 @@ pub fn queue_page(view: &QueueView<'_>) -> String {
             count = view.entries.len(),
             queue = queue_table(view),
             actions = actions_table(view.actions),
+        ),
+    )
+}
+
+// ----------------------------------------------------------------------
+// シーズン境界（導出の起点を追記する）
+// ----------------------------------------------------------------------
+
+/// シーズン画面（`/admin/season`）に渡すデータ。
+#[derive(Debug, Clone)]
+pub struct SeasonView<'a> {
+    /// 実行前の件数。すべて導出値。
+    pub preview: &'a SeasonPreview,
+    /// 境界に入れる時刻（＝この操作を行う時刻）。
+    pub effective_at: DateTime<Utc>,
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    /// 2 段目なら、1 段目で入力されたラベル。1 段目では `None`。
+    pub confirming: Option<&'a str>,
+    pub notice: Option<Notice>,
+}
+
+/// いま効いている境界の説明。まだ無ければ「全履歴が対象」。
+fn current_season_line(preview: &SeasonPreview) -> String {
+    match &preview.current {
+        Some(boundary) => format!(
+            "<p class=\"fine-print\">現在のシーズン: <strong>{label}</strong>（{at} 以降。\
+             discord:{by} が開始）</p>\n",
+            label = escape(&boundary.label),
+            at = escape(&display_time(boundary.effective_at)),
+            by = escape(boundary.created_by.trim_start_matches("discord:")),
+        ),
+        None => String::from(
+            "<p class=\"fine-print\">シーズン境界はまだ 1 本もありません。\
+             現在は<strong>全履歴</strong>が集計対象です。</p>\n",
+        ),
+    }
+}
+
+/// 実行前に数える 4 つの値。
+fn season_counts(preview: &SeasonPreview) -> String {
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>項目</th><th>件数</th></tr></thead>\n<tbody>\n\
+         <tr><td>進行中の formation（matched / awaiting_host / awaiting_code / in_progress）</td>\
+         <td class=\"num\">{active}</td></tr>\n\
+         <tr><td>未報告の試合</td><td class=\"num\">{pending}</td></tr>\n\
+         <tr><td>集計から外れる試合</td><td class=\"num\">{leaving}</td></tr>\n\
+         <tr><td>影響を受けるプレイヤー</td><td class=\"num\">{players}</td></tr>\n\
+         </tbody>\n</table></div>\n",
+        active = preview.active_formations,
+        pending = preview.pending_reports,
+        leaving = preview.matches_leaving,
+        players = preview.players_affected,
+    )
+}
+
+/// 進行中があるときの停止表示。**件数を出して止める。**
+fn blocked_by_active(preview: &SeasonPreview) -> String {
+    format!(
+        "<p class=\"notice notice-error\">進行中の formation が <strong>{}</strong> 件あります。\
+         終わるまで開始できません。（進行中のまま境界を入れると、その試合は集計から外れるのに\
+         進行だけ続き、報告しても何にも反映されません）</p>\n",
+        preview.active_formations
+    )
+}
+
+/// シーズン画面。1 段目は警告と件数、2 段目はラベルの打ち直し。
+pub fn season_page(view: &SeasonView<'_>) -> String {
+    let body = if let Some(label) = view.confirming {
+        // 2 段目: 同じラベルを手で入力させる
+        format!(
+            "<h2>確認</h2>\n\
+             <p class=\"notice notice-error\"><strong>この操作は取り消せません。</strong>\
+             追記専用なので、間違えた場合は「別の境界をもう 1 本追記して戻す」ことになります。</p>\n\
+             <p>開始するシーズン: <strong>{label}</strong><br>\
+             起点: <strong>{at}</strong>（この時刻より前に作られた試合と、この時刻より前に\
+             追記された調整が集計から外れます）</p>\n\
+             {counts}\
+             <form method=\"post\" action=\"/admin/season\">\
+             <input type=\"hidden\" name=\"label\" value=\"{label}\">\
+             <input type=\"hidden\" name=\"key\" value=\"season:{key}\">\
+             <label for=\"confirm_label\">確認のため、シーズン名をもう一度入力してください</label>\
+             <input id=\"confirm_label\" name=\"confirm_label\" type=\"text\" autocomplete=\"off\" required>\
+             <div class=\"actions\">\
+             <button class=\"button button-primary\" type=\"submit\">新しいシーズンを開始する</button>\
+             <a class=\"button button-secondary\" href=\"/admin/season\">やめる</a>\
+             </div></form>\n",
+            label = escape(label),
+            at = escape(&display_time(view.effective_at)),
+            counts = season_counts(view.preview),
+            key = escape(view.form_key),
+        )
+    } else if view.preview.can_start() {
+        // 1 段目: 警告と件数、ラベルの入力
+        format!(
+            "<p class=\"lead\">新しいシーズンを開始すると、<strong>ここより前の試合が集計から\
+             外れます</strong>。レートだけが戻るのではありません。試合数・勝率・ランキング・\
+             キューのゲートも、すべて新しい起点から数え直しになります。</p>\n\
+             <p class=\"notice\"><strong>試合のログは 1 行も消えません。</strong>\
+             formations / formation_players / formation_events / match_reports / \
+             rating_adjustments はそのまま残り、集計に入らなくなるだけです。\
+             境界そのものも追記されるので、後から完全に再構築できます。</p>\n\
+             {current}\
+             <h2>この操作で外れるもの</h2>\n\
+             {counts}\
+             <form method=\"post\" action=\"/admin/season/confirm\">\
+             <input type=\"hidden\" name=\"key\" value=\"{key}\">\
+             <label for=\"label\">新しいシーズンの名前（最大 {max} 文字）</label>\
+             <input id=\"label\" name=\"label\" type=\"text\" maxlength=\"{max}\" autocomplete=\"off\" required>\
+             <div class=\"actions\">\
+             <button class=\"button button-primary\" type=\"submit\">確認へ進む</button>\
+             </div></form>\n",
+            current = current_season_line(view.preview),
+            counts = season_counts(view.preview),
+            key = escape(view.form_key),
+            max = MAX_SEASON_LABEL_LENGTH,
+        )
+    } else {
+        format!(
+            "{blocked}{current}<h2>現在の状況</h2>\n{counts}",
+            blocked = blocked_by_active(view.preview),
+            current = current_season_line(view.preview),
+            counts = season_counts(view.preview),
+        )
+    };
+
+    // この画面は管理者しか到達しない（非管理者は 404）。ヘッダーも管理者のもの
+    page(
+        Viewer::ADMIN,
+        "管理 / シーズン",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-season-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-season-title\">新しいシーズンを開始する</h1>\n\
+             {nav}\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/season"),
+            notice = notice_html(view.notice.as_ref()),
         ),
     )
 }

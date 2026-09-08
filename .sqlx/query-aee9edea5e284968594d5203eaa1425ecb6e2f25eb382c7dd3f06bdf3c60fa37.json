@@ -1,37 +1,37 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, delta_mu, delta_sigma, reverts_id from rating_adjustments where player_id = $1 order by id",
+  "query": "select id as \"id!\", delta_mu as \"delta_mu!\", delta_sigma as \"delta_sigma!\", reverts_id from season_rating_adjustments where player_id = $1 order by id",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "id!",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "rating_adjustments",
+            "table": "season_rating_adjustments",
             "name": "id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "delta_mu",
+        "name": "delta_mu!",
         "type_info": "Float8",
         "origin": {
           "Table": {
-            "table": "rating_adjustments",
+            "table": "season_rating_adjustments",
             "name": "delta_mu"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "delta_sigma",
+        "name": "delta_sigma!",
         "type_info": "Float8",
         "origin": {
           "Table": {
-            "table": "rating_adjustments",
+            "table": "season_rating_adjustments",
             "name": "delta_sigma"
           }
         }
@@ -42,7 +42,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "rating_adjustments",
+            "table": "season_rating_adjustments",
             "name": "reverts_id"
           }
         }
@@ -54,11 +54,11 @@
       ]
     },
     "nullable": [
-      false,
-      false,
-      false,
+      true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "fc09a95892f801c5f2a6d568d439630f5732b4fff0c2e5920e41db02f3e99fb8"
+  "hash": "aee9edea5e284968594d5203eaa1425ecb6e2f25eb382c7dd3f06bdf3c60fa37"
 }

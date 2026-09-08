@@ -284,6 +284,12 @@ impl FormationRepository {
     ///
     /// `voided` / `abandoned` を持つ formation は SQL 側で落とす（試合が成立しておらず報告義務が
     /// 生じない）。残りは状態を導出して呼び出し側が [`FormationState::requires_reports`] で絞る。
+    ///
+    /// **シーズン境界より前の formation は候補にしない**（`current_season`）。境界を入れた時点で
+    /// 進行中の formation は無い（管理パネルが 1 件でもあれば拒否する）ので、ここで落ちるのは
+    /// 「報告しないまま残った過去の試合」だけになる。落とさないと、集計から外れた試合の報告を
+    /// 待って永久にキューへ入れない人が出る。**進行中ゲートと報告ゲートはどちらもこの 1 本の
+    /// クエリから導出している**ので、境界の条件もここ 1 か所で足りる。
     pub async fn formations_without_report_from(
         &self,
         player: PlayerId,
@@ -296,7 +302,9 @@ impl FormationRepository {
         let candidates = sqlx::query!(
             "select f.id, f.created_at from formation_players fp \
              join formations f on f.id = fp.formation_id \
+             cross join current_season s \
              where fp.player_id = $1 \
+               and f.created_at >= s.started_at \
                and not exists ( \
                    select 1 from match_reports mr \
                    where mr.formation_id = f.id and mr.player_id = $1 \

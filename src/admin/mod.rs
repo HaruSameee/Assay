@@ -21,6 +21,7 @@ pub mod config;
 pub mod html;
 pub mod repository;
 pub mod routes;
+pub mod season;
 
 pub use actions::{
     AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, MAX_BLOCK_ALLOWANCE, PauseState,
@@ -31,6 +32,10 @@ pub use config::{
 };
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
-    NewAdjustment, NewAdminAction, QueuedEntry, QueuedRole, RemovalOutcome,
+    NewAdjustment, NewAdminAction, NewSeasonBoundary, QueuedEntry, QueuedRole, RemovalOutcome,
 };
 pub use routes::{AdminState, router};
+pub use season::{
+    MAX_SEASON_LABEL_LENGTH, SeasonBoundary, SeasonOutcome, SeasonPreview, confirmation_matches,
+    normalize_label,
+};

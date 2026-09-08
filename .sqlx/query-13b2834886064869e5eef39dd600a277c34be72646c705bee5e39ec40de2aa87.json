@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select fp.player_id, fp.team, p.trainer_name, r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", $2::double precision + coalesce((select sum(a.delta_mu) from rating_adjustments a where a.player_id = fp.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\" from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role left join player_match_ratings m on m.player_id = fp.player_id where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
+  "query": "select fp.player_id, fp.team, p.trainer_name, r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", $2::double precision + coalesce((select sum(a.delta_mu) from season_rating_adjustments a where a.player_id = fp.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\" from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role left join player_match_ratings m on m.player_id = fp.player_id where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
   "describe": {
     "columns": [
       {
@@ -80,5 +80,5 @@
       null
     ]
   },
-  "hash": "1f5a90c168fbd13926b3c87bb6ceb7c6825f842e36512c9d3ba1a147af6b0b26"
+  "hash": "13b2834886064869e5eef39dd600a277c34be72646c705bee5e39ec40de2aa87"
 }

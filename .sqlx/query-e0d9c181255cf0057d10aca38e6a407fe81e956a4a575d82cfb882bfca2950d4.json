@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(distinct d.formation_id)::bigint as \"matches!\", count(distinct d.player_id)::bigint as \"players!\" from player_match_rating_deltas d join formations f on f.id = d.formation_id where f.created_at < $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "matches!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "players!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "e0d9c181255cf0057d10aca38e6a407fe81e956a4a575d82cfb882bfca2950d4"
+}

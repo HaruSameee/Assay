@@ -46,6 +46,8 @@ async fn append_only_privileges_and_triggers_are_wired(owner: sqlx::PgPool) {
         "delete from formation_events",
         "update match_reports set id = id",
         "delete from match_reports",
+        "update season_boundaries set id = id",
+        "delete from season_boundaries",
         "update admin_actions set id = id",
         "delete from admin_actions",
         "update discord_failures set id = id",
