@@ -1208,3 +1208,168 @@ async fn a_report_sends_the_player_back_to_the_queue(owner: PgPool) {
 
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// カードのアイコンと、相手チームの送信順
+// ----------------------------------------------------------------------
+
+/// レートを追記で作る（レートは導出値なので現在値のテーブルには書かない）。
+async fn adjust(db: &AppDb, who: PlayerId, delta_mu: f64) {
+    sqlx::query(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+         values ($1, $2, 0, 'test seed', 'staff:test', now(), $3)",
+    )
+    .bind(who.0)
+    .bind(delta_mu)
+    .bind(format!("card-{}", who.0))
+    .execute(&db.pool)
+    .await
+    .expect("append a rating adjustment");
+}
+
+/// Discord のスナップショットを積む。
+async fn snapshot(db: &AppDb, who: PlayerId, name: &str, avatar: Option<&str>) {
+    sqlx::query(
+        "insert into player_discord_snapshots (player_id, display_name, avatar_hash, captured_at) \
+         values ($1, $2, $3, now())",
+    )
+    .bind(who.0)
+    .bind(name)
+    .bind(avatar)
+    .execute(&db.pool)
+    .await
+    .expect("record a snapshot");
+}
+
+/// **相手チームは必ずレート降順で送る。**
+///
+/// `roster` はロールの表示順（上キャリー → サポート → 中央 → 下キャリー → タンク）で
+/// 返すので、そのまま送るとラベルが無くても並び順から構成が読める。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_opposing_team_is_sent_in_rating_order(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    // blue（相手）は player(6)..player(10)。**ロールの表示順とレートの順を食い違わせる**
+    // ロール順:  6=サポート 7=中央 8=下キャリー 9=タンク 10=上キャリー
+    // レート順: 10 > 7 > 9 > 6 > 8 になるように振る
+    adjust(&db, player(6), -20.0).await; // 1480
+    adjust(&db, player(7), 30.0).await; //  1530
+    adjust(&db, player(8), -40.0).await; // 1460
+    adjust(&db, player(9), 10.0).await; //  1510
+    adjust(&db, player(10), 60.0).await; // 1560
+    for n in 6..=10u128 {
+        snapshot(&db, player(n), &format!("相手{n}"), Some("abc123")).await;
+    }
+
+    let (status, view) = get_json(&app, 1, player(1)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    println!("=== 相手チームのカード（サーバが返した JSON そのまま）");
+    println!("{:#}", view["opponents"]);
+
+    let opponents = view["opponents"].as_array().unwrap();
+    let ratings: Vec<f64> = opponents
+        .iter()
+        .map(|row| row["rating"].as_f64().unwrap())
+        .collect();
+    assert_eq!(
+        ratings,
+        vec![1560.0, 1530.0, 1510.0, 1480.0, 1460.0],
+        "レート降順で送っていない"
+    );
+    // ロールの表示順（6,7,8,9,10）とは違う並びになっている
+    let names: Vec<&str> = opponents
+        .iter()
+        .map(|row| row["discord_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["相手10", "相手7", "相手9", "相手6", "相手8"]);
+    println!("送信順: {names:?}（ロールの表示順は 相手6,7,8,9,10）");
+
+    // **ロールに相当するキーが1つも無い**
+    for row in opponents {
+        for key in row.as_object().unwrap().keys() {
+            assert!(!key.contains("role"), "ロールのキーがある: {row}");
+        }
+        assert!(
+            row["avatar_url"]
+                .as_str()
+                .unwrap()
+                .contains("cdn.discordapp.com")
+        );
+    }
+    // 相手のカードにプロフィールへのリンクを張らない
+    let (_, page) = get_html(&app, 1, player(1)).await;
+    let opponent_section = page
+        .split("id=\"opponent-title\"")
+        .nth(1)
+        .expect("opponent section")
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(
+        !opponent_section.contains("/players/"),
+        "相手のカードにプロフィールへの導線がある: {opponent_section}"
+    );
+
+    db.done().await;
+}
+
+/// 自チームはロールが出る。アイコンと表示名も両チームに出る。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn both_teams_carry_an_icon_and_a_name(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+    // 5 番だけアバター未設定にして、既定アバターに落ちることを見る
+    for n in 1..=10u128 {
+        let avatar = if n == 5 { None } else { Some("abc123") };
+        snapshot(&db, player(n), &format!("名前{n}"), avatar).await;
+    }
+
+    let (_, view) = get_json(&app, 1, player(1)).await;
+    println!("=== 自チームのカード");
+    println!("{:#}", view["teammates"]);
+
+    for row in view["teammates"].as_array().unwrap() {
+        assert!(row["role"].is_string(), "自チームにロールが無い: {row}");
+        assert!(row["discord_name"].is_string(), "{row}");
+        assert!(row["avatar_url"].as_str().unwrap().starts_with("https://"));
+    }
+    // アバター未設定の人は既定アバター
+    let fallback = view["teammates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["discord_name"] == "名前5")
+        .expect("player 5");
+    assert!(
+        fallback["avatar_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://cdn.discordapp.com/embed/avatars/"),
+        "{fallback}"
+    );
+    println!("アバター未設定の人の URL: {}", fallback["avatar_url"]);
+
+    // 「Best（最高レート）」の列は足さない
+    let body = serde_json::to_string(&view).unwrap();
+    for forbidden in ["best", "highest", "peak"] {
+        assert!(
+            !body.contains(forbidden),
+            "{forbidden} が入っている: {body}"
+        );
+    }
+    // チーム名は red / blue のまま
+    assert!(["red", "blue"].contains(&view["my_team"].as_str().unwrap()));
+
+    db.done().await;
+}

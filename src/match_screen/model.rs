@@ -34,6 +34,10 @@ pub struct TeammateView {
     pub role: String,
     /// 現在のレート（表示スケール）。追記ログから毎回導出した値。
     pub rating: f64,
+    /// Discord の表示名。取れていなければ `None`（画面はトレーナー名で出す）。
+    pub discord_name: Option<String>,
+    /// Discord のアバター。**未設定でも既定アバターの URL が入る。**
+    pub avatar_url: String,
     /// 自分自身の行か。画面で強調する。
     pub is_me: bool,
     /// この試合のホストか。
@@ -52,6 +56,10 @@ pub struct OpponentView {
     pub trainer_name: String,
     /// 現在のレート（表示スケール）。
     pub rating: f64,
+    /// Discord の表示名。取れていなければ `None`。
+    pub discord_name: Option<String>,
+    /// Discord のアバター。
+    pub avatar_url: String,
     /// この試合のホストか。**ホストは相手チームでも伝える**
     /// （誰が部屋を建てたか分からないと、入れなかったときに聞く相手が分からない）。
     pub is_host: bool,
@@ -188,6 +196,8 @@ mod tests {
             player_id: Uuid::from_u128(1),
             trainer_name: "相手".into(),
             rating: 1511.0,
+            discord_name: Some("ディスコ名".into()),
+            avatar_url: "https://cdn.discordapp.com/embed/avatars/1.png".into(),
             is_host: true,
         }
     }
@@ -204,7 +214,17 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["is_host", "player_id", "rating", "trainer_name"]);
+        assert_eq!(
+            keys,
+            [
+                "avatar_url",
+                "discord_name",
+                "is_host",
+                "player_id",
+                "rating",
+                "trainer_name"
+            ]
+        );
         assert!(!json.to_string().contains("role"), "{json}");
     }
 
@@ -219,6 +239,8 @@ mod tests {
                 trainer_name: "自分".into(),
                 role: "中央".into(),
                 rating: 1500.0,
+                discord_name: None,
+                avatar_url: "https://cdn.discordapp.com/embed/avatars/0.png".into(),
                 is_me: true,
                 is_host: false,
             }],

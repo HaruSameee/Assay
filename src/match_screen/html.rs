@@ -20,9 +20,10 @@ const MATCH_STYLES: &str = r#"
 .team-blue .team-name { color: #9db4ff; }
 .team-vc { color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
 .roster { margin: 12px 0 0; padding: 0; list-style: none; }
-.roster li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 9px 0; border-top: 1px solid var(--border); }
+.roster li { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 9px 0; border-top: 1px solid var(--border); }
+.card-avatar { grid-row: 1 / span 2; width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 50%; background: var(--surface-strong); object-fit: cover; }
 .roster .who { min-width: 0; overflow-wrap: anywhere; font-weight: 650; }
-.roster .role { grid-column: 1; color: var(--muted); font-size: 0.85rem; }
+.roster .role { grid-column: 2; color: var(--muted); font-size: 0.85rem; }
 .roster .rating { grid-row: 1 / span 2; align-self: center; font-variant-numeric: tabular-nums; font-weight: 750; }
 .roster li.me { margin: 0 -18px; padding-right: 18px; padding-left: 14px; border-left: 4px solid var(--accent); background: var(--surface-strong); }
 .roster li.me .who::after { content: "あなた"; margin-left: 8px; border-radius: 999px; padding: 1px 8px; background: var(--accent); color: #07150f; font-size: 0.72rem; font-weight: 700; }
@@ -322,23 +323,52 @@ fn voice(voice: Option<&VoiceView>) -> String {
 
 fn teammate_row(entry: &TeammateView) -> String {
     format!(
-        "<li{me}><span class=\"who\">{name}{host}</span>\
+        "<li{me}>{avatar}<span class=\"who\">{name}{host}</span>\
          <span class=\"rating\">{rating:.0}</span>\
          <span class=\"role\">{role}</span></li>\n",
         me = if entry.is_me { " class=\"me\"" } else { "" },
-        name = escape(&entry.trainer_name),
+        avatar = avatar(&entry.avatar_url),
+        name = escape(card_name(
+            entry.discord_name.as_deref(),
+            &entry.trainer_name
+        )),
         host = host_tag(entry.is_host),
         rating = entry.rating,
         role = escape(&entry.role),
     )
 }
 
+/// カードに出す名前。**Discord の表示名を優先**し、取れていなければトレーナー名。
+fn card_name<'a>(discord_name: Option<&'a str>, trainer_name: &'a str) -> &'a str {
+    discord_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(trainer_name)
+}
+
+/// アイコン。**装飾なので `alt` は空**（名前は隣に出ている）。
+///
+/// `referrerpolicy` を付けて、どのページから読んだかを CDN に渡さない。
+fn avatar(url: &str) -> String {
+    format!(
+        "<img class=\"card-avatar\" src=\"{}\" alt=\"\" width=\"32\" height=\"32\" \
+         loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+        escape(url)
+    )
+}
+
 /// 相手チームの行。**ロールを書く場所が無い**（[`OpponentView`] が持っていない）。
+///
+/// 並び順は呼ぶ側がレート降順にしてある。ロールの表示順のまま出すと、
+/// ラベルが無くても並びから構成が読める。
 fn opponent_row(entry: &OpponentView) -> String {
     format!(
-        "<li><span class=\"who\">{name}{host}</span>\
+        "<li>{avatar}<span class=\"who\">{name}{host}</span>\
          <span class=\"rating\">{rating:.0}</span></li>\n",
-        name = escape(&entry.trainer_name),
+        avatar = avatar(&entry.avatar_url),
+        name = escape(card_name(
+            entry.discord_name.as_deref(),
+            &entry.trainer_name
+        )),
         host = host_tag(entry.is_host),
         rating = entry.rating,
     )
@@ -467,6 +497,8 @@ mod tests {
             trainer_name: name.into(),
             role: role.into(),
             rating: 1511.0,
+            discord_name: Some("ディスコ名".into()),
+            avatar_url: "https://cdn.discordapp.com/embed/avatars/1.png".into(),
             is_me,
             is_host,
         }
@@ -477,6 +509,8 @@ mod tests {
             player_id: Uuid::from_u128(2),
             trainer_name: name.into(),
             rating: 1489.0,
+            discord_name: Some("相手ディスコ".into()),
+            avatar_url: "https://cdn.discordapp.com/embed/avatars/2.png".into(),
             is_host,
         }
     }
@@ -522,8 +556,8 @@ mod tests {
         // 自チームのロールは出る
         assert!(rendered.contains("中央"), "{rendered}");
         assert!(rendered.contains("上キャリー"), "{rendered}");
-        // 相手の名前とレートは出るが、行にロールの入る場所が無い
-        assert!(rendered.contains("相手A"), "{rendered}");
+        // 相手の名前（Discord の表示名）とレートは出るが、行にロールの入る場所が無い
+        assert!(rendered.contains("相手ディスコ"), "{rendered}");
         assert!(rendered.contains("1489"), "{rendered}");
         assert!(
             rendered.contains("相手のロールは部屋に入るまで表示されません"),
@@ -647,7 +681,22 @@ mod tests {
     #[test]
     fn a_hostile_trainer_name_cannot_break_out() {
         let mut state = view(in_progress(false));
+        // Discord の表示名も本人が自由に変えられる。**そちらが優先されるので両方試す**
         state.opponents[0].trainer_name = r#"<script>alert(1)</script>"#.into();
+        state.opponents[0].discord_name = Some(r#"<script>alert(2)</script>"#.into());
+        state.teammates[0].discord_name = Some(r#"<img src=x onerror=alert(3)>"#.into());
+        let rendered = match_page(Viewer::MEMBER, &state);
+        // 表示に使われるのは Discord の表示名。生のタグとして出ていない
+        assert!(!rendered.contains("<script>alert"), "{rendered}");
+        assert!(!rendered.contains("<img src=x"), "{rendered}");
+        assert!(rendered.contains("&lt;script&gt;alert(2)"), "{rendered}");
+        assert!(
+            rendered.contains("&lt;img src=x onerror=alert(3)&gt;"),
+            "{rendered}"
+        );
+
+        // Discord の表示名が取れていなければトレーナー名を出す。そちらも同じく通さない
+        state.opponents[0].discord_name = None;
         let rendered = match_page(Viewer::MEMBER, &state);
         assert!(!rendered.contains("<script>alert(1)"), "{rendered}");
         assert!(rendered.contains("&lt;script&gt;alert(1)"), "{rendered}");
@@ -664,9 +713,24 @@ mod tests {
         assert!(rendered.contains("color-scheme: dark"));
         assert!(rendered.contains("@media (max-width: 600px)"));
         assert!(rendered.contains(".teams { grid-template-columns: 1fr; }"));
-        // 外部のCSS/JSを引かない
+        // 外部の CSS / JS を引かない（`<link>` も `<script src>` も無い）
         assert!(!rendered.contains("http://"), "{rendered}");
-        assert!(!rendered.contains("cdn"), "{rendered}");
+        assert!(!rendered.contains("<link "), "{rendered}");
+        assert!(!rendered.contains("<script src"), "{rendered}");
+        // **外部から読むのは Discord のアバター画像だけ。**
+        // それ以外のホストが増えていないことを、ここで固定しておく
+        for external in rendered.match_indices("https://") {
+            let rest = &rendered[external.0..];
+            let host = rest
+                .trim_start_matches("https://")
+                .split(['/', '"'])
+                .next()
+                .unwrap_or("");
+            assert!(
+                matches!(host, "cdn.discordapp.com" | "discord.com"),
+                "外部ホストが増えている: {host}"
+            );
+        }
     }
 
     #[test]

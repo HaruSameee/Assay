@@ -496,6 +496,8 @@ async fn build_view(
                 trainer_name: display_name(entry),
                 role: entry.role_display_name.clone(),
                 rating: entry.rating,
+                discord_name: entry.discord_name.clone(),
+                avatar_url: entry.avatar_url.clone(),
                 is_me: entry.player_id == me,
                 is_host,
             });
@@ -505,10 +507,23 @@ async fn build_view(
                 player_id: entry.player_id.0,
                 trainer_name: display_name(entry),
                 rating: entry.rating,
+                discord_name: entry.discord_name.clone(),
+                avatar_url: entry.avatar_url.clone(),
                 is_host,
             });
         }
     }
+
+    // **相手チームはレート降順で送る。**`roster` はロールの表示順で返すので、
+    // そのまま送るとラベルが無くても並び順からロールが読める（上キャリー → サポート
+    // → 中央 → 下キャリー → タンク の固定順）。レートは公開情報なので、それで並べる。
+    // 同率は player_id で決めて、ポーリングのたびに順序が揺れないようにする。
+    opponents.sort_by(|a, b| {
+        b.rating
+            .partial_cmp(&a.rating)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.player_id.cmp(&b.player_id))
+    });
 
     let opponent_team = if my_team == RED { BLUE } else { RED };
     let voice_of = |team: &str| -> Option<VoiceView> {
