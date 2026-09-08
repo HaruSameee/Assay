@@ -1383,3 +1383,115 @@ async fn nine_reporters_all_get_back_to_the_queue_before_confirmation(owner: PgP
     println!("9人が報告 → 未確定のまま9人ともキューへ再投入できた（10人目だけ未報告で停止）");
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// ロール希望の保持（追記専用・最新行から導出）
+// ----------------------------------------------------------------------
+
+/// **離脱しても、次にキュー画面を開くと前回の希望で埋まっている。**
+///
+/// 保持先は `players` ではなく追記専用の `queue_role_preferences`。現在値の列は
+/// 持たず、最新行から導出する（登録フォームのプリフィルと同じ方針）。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_role_choices_survive_leaving_the_queue(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+
+    // 何も選んでいないうちは埋まらない
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(!page.contains(" selected>"), "{page}");
+
+    // 第1〜第3希望を選んでキューへ
+    let body = json!({
+        "roles": [wish("jungle", 1), wish("bot_tank", 2), wish("top_carry", 3)]
+    });
+    let (status, joined) = post_queue(&app, me, body).await;
+    assert_eq!(status, StatusCode::OK, "{joined}");
+
+    // 離脱する（queue_entries とその子行は消える）
+    let request = Request::delete("/queue")
+        .header(header::COOKIE, session_cookie(me))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, request).await.status(), StatusCode::OK);
+    let remaining: i64 = sqlx::query_scalar("select count(*) from queue_entries")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "エントリは消えている");
+
+    // それでも次に開いたときは前回の希望で埋まっている
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(
+        page.contains("<option value=\"jungle\" selected>"),
+        "第1希望が埋まっていない: {page}"
+    );
+    assert!(
+        page.contains("<option value=\"bot_tank\" selected>"),
+        "第2希望が埋まっていない: {page}"
+    );
+    assert!(
+        page.contains("<option value=\"top_carry\" selected>"),
+        "第3希望が埋まっていない: {page}"
+    );
+    println!("離脱後に開き直したキュー画面で、第1〜第3希望が復元された");
+
+    // 選び直すと最新行が正になる。**古い行は残る**（追記専用）
+    let (status, _) = post_queue(&app, me, json!({ "roles": [wish("bot_carry", 1)] })).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: i64 = sqlx::query_scalar("select count(*) from queue_role_preferences")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "追記されている（上書きではない）");
+
+    let request = Request::delete("/queue")
+        .header(header::COOKIE, session_cookie(me))
+        .body(Body::empty())
+        .unwrap();
+    send(&app, request).await;
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(
+        page.contains("<option value=\"bot_carry\" selected>"),
+        "最新行が使われていない: {page}"
+    );
+    assert!(
+        !page.contains("<option value=\"jungle\" selected>"),
+        "古い行が使われている: {page}"
+    );
+    println!("選び直すと最新行が正になり、古い行は残ったまま（行数 {rows}）");
+
+    db.done().await;
+}
+
+/// **アプリ用ロールからは書き換えも削除もできない**（追記専用）。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_role_preference_log_is_append_only(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let me = player(11);
+    register(&db, me, Rank::Legend).await;
+    let (status, _) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for sql in [
+        "update queue_role_preferences set roles = '[]'::jsonb",
+        "delete from queue_role_preferences",
+    ] {
+        let error = sqlx::query(sql).execute(&db.pool).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{sql}"
+        );
+    }
+    db.done().await;
+}

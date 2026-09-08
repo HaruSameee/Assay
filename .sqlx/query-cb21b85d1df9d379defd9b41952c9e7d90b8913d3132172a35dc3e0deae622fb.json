@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into queue_role_preferences (player_id, chosen_at, roles) values ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cb21b85d1df9d379defd9b41952c9e7d90b8913d3132172a35dc3e0deae622fb"
+}

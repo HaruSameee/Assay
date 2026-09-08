@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select roles from queue_role_preferences where player_id = $1 order by id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "roles",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "queue_role_preferences",
+            "name": "roles"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9986a45ee28be439ffe647d0543c2bef9e03ede31b554d5ccbf9da1a470ba7eb"
+}

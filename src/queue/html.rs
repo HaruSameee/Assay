@@ -6,7 +6,7 @@ use crate::lifecycle::{FormationId, Timestamp};
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
 
-use super::model::UP_RANGE;
+use super::model::{RolePreference, UP_RANGE};
 use super::routes::{EntryView, RegistrationBlockView, StatusView};
 
 const QUEUE_STYLES: &str = r#"
@@ -67,6 +67,7 @@ pub(super) fn queue_page(
     status: &StatusView,
     now: Timestamp,
     reported: Option<FormationId>,
+    prefill: &[RolePreference],
 ) -> String {
     if status.eligibility.registration.is_some()
         || status.eligibility.active_formation.is_some()
@@ -76,7 +77,7 @@ pub(super) fn queue_page(
     } else if let Some(entry) = &status.entry {
         queued_page(viewer, status, entry, now, reported)
     } else {
-        unqueued_page(viewer, status, reported)
+        unqueued_page(viewer, status, reported, prefill)
     }
 }
 
@@ -99,6 +100,14 @@ fn reported_notice(reported: Option<FormationId>) -> String {
     })
 }
 
+/// 前回選んだ `priority` 番目のロール（1 始まり）。無ければ `None`。
+fn prefilled(prefill: &[RolePreference], priority: i16) -> Option<&str> {
+    prefill
+        .iter()
+        .find(|preference| preference.priority == priority)
+        .map(|preference| preference.role.as_str())
+}
+
 fn role_options(selected: Option<&str>) -> String {
     let mut output = String::from("<option value=\"\">選択しない</option>\n");
     for (value, label) in ROLE_OPTIONS {
@@ -114,11 +123,22 @@ fn role_options(selected: Option<&str>) -> String {
     output
 }
 
-fn unqueued_page(viewer: Viewer, status: &StatusView, reported: Option<FormationId>) -> String {
+fn unqueued_page(
+    viewer: Viewer,
+    status: &StatusView,
+    reported: Option<FormationId>,
+    prefill: &[RolePreference],
+) -> String {
     let in_range = status.in_range.unwrap_or(0);
-    let first = role_options(None);
-    let second = role_options(None);
-    let third = role_options(None);
+    // 前回の希望で埋める。第3希望は第2希望が入っていないと選べない（JS と同じ条件）
+    let first = role_options(prefilled(prefill, 1));
+    let second = role_options(prefilled(prefill, 2));
+    let third = role_options(prefilled(prefill, 3));
+    let third_disabled = if prefilled(prefill, 2).is_some() {
+        ""
+    } else {
+        " disabled"
+    };
     let body = format!(
         "<section id=\"queue-app\" data-view=\"unqueued\" aria-labelledby=\"queue-title\">\n\
          <div class=\"form-header\">\n<p class=\"eyebrow\">Match queue</p>\n\
@@ -131,7 +151,7 @@ fn unqueued_page(viewer: Viewer, status: &StatusView, reported: Option<Formation
          <div class=\"role-grid\">\n\
          <div class=\"field\"><label for=\"role-1\">第1希望</label>\n<select id=\"role-1\" required>{first}</select></div>\n\
          <div class=\"field\"><label for=\"role-2\">第2希望</label>\n<select id=\"role-2\">{second}</select></div>\n\
-         <div class=\"field\"><label for=\"role-3\">第3希望</label>\n<select id=\"role-3\" disabled>{third}</select></div>\n\
+         <div class=\"field\"><label for=\"role-3\">第3希望</label>\n<select id=\"role-3\"{third_disabled}>{third}</select></div>\n\
          </div>\n</fieldset>\n\
          <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上下 ±{range} 固定です。\
          現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p></div>\n\
@@ -509,7 +529,7 @@ mod tests {
 
     #[test]
     fn the_unqueued_page_has_all_roles_range_and_resilient_polling() {
-        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &[]);
         for (role, label) in ROLE_OPTIONS {
             assert!(rendered.contains(&format!("value=\"{role}\"")));
             assert!(rendered.contains(label));
@@ -544,6 +564,7 @@ mod tests {
             &queued,
             Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap(),
             None,
+            &[],
         );
         assert!(rendered.contains("02:03"));
         assert!(rendered.contains("第1希望: 中央"));
@@ -570,7 +591,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now(), None, &[]);
         for gate in ["registration", "active_formation", "pending_reports"] {
             assert!(rendered.contains(&format!("data-gate=\"{gate}\"")));
         }
@@ -590,7 +611,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(Viewer::MEMBER, &matched, Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &matched, Utc::now(), None, &[]);
         assert!(rendered.contains("class=\"matched\""), "{rendered}");
         // ゲートの側は一切変えていない
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -605,7 +626,7 @@ mod tests {
         // 成立していないブロックは従来どおり
         let mut plain = status();
         plain.eligibility.pending_reports = vec![Uuid::from_u128(9)];
-        let rendered = queue_page(Viewer::MEMBER, &plain, Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &plain, Utc::now(), None, &[]);
         assert!(!rendered.contains("class=\"matched\""));
         assert!(rendered.contains("現在止まっている条件"));
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -634,8 +655,8 @@ mod tests {
                 })
                 .collect(),
         });
-        let selecting = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
-        let selected = queue_page(Viewer::MEMBER, &queued, Utc::now(), None);
+        let selecting = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &[]);
+        let selected = queue_page(Viewer::MEMBER, &queued, Utc::now(), None, &[]);
         for (role, label) in ROLE_OPTIONS {
             // 選ぶ側は日本語のラベル。識別子は value 属性の中だけ
             assert!(
@@ -684,7 +705,7 @@ mod tests {
 
     #[test]
     fn mobile_layout_is_explicit() {
-        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &[]);
         assert!(rendered.contains("@media (max-width: 600px)"));
         assert!(rendered.contains(".role-grid { grid-template-columns: 1fr"));
     }
@@ -721,16 +742,16 @@ mod tests {
              <button type=\"submit\">ログアウト</button></form>\n\
              </nav>\n</header>\n";
         for rendered in [
-            queue_page(Viewer::MEMBER, &status(), now, None),
-            queue_page(Viewer::MEMBER, &queued, now, None),
-            queue_page(Viewer::MEMBER, &blocked, now, None),
+            queue_page(Viewer::MEMBER, &status(), now, None, &[]),
+            queue_page(Viewer::MEMBER, &queued, now, None, &[]),
+            queue_page(Viewer::MEMBER, &blocked, now, None, &[]),
         ] {
             assert!(rendered.contains(expected), "{rendered}");
             // 非管理者にパネルの存在を知らせない
             assert!(!rendered.contains("href=\"/admin\""), "{rendered}");
         }
         // 管理者にはヘッダーにだけ管理リンクが増える
-        let admin = queue_page(Viewer::ADMIN, &status(), now, None);
+        let admin = queue_page(Viewer::ADMIN, &status(), now, None, &[]);
         assert!(admin.contains("<a href=\"/admin\">管理</a>"), "{admin}");
     }
 
@@ -743,7 +764,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
 
         println!("========== 1. 未投入 (data-view=unqueued) ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &status(), now, None));
+        println!("{}", queue_page(Viewer::MEMBER, &status(), now, None, &[]));
 
         let mut queued = status();
         queued.queued = true;
@@ -766,7 +787,7 @@ mod tests {
             ],
         });
         println!("========== 2. キュー中 (data-view=queued) ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &queued, now, None));
+        println!("{}", queue_page(Viewer::MEMBER, &queued, now, None, &[]));
 
         let mut matched = status();
         matched.eligibility.active_formation = Some(Uuid::from_u128(8));
@@ -777,7 +798,7 @@ mod tests {
             channel_id: "123".into(),
         });
         println!("========== 3. マッチ成立 ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &matched, now, None));
+        println!("{}", queue_page(Viewer::MEMBER, &matched, now, None, &[]));
 
         let mut blocked = status();
         blocked.eligibility = EligibilityView {
@@ -790,7 +811,7 @@ mod tests {
             pending_reports: vec![Uuid::from_u128(9)],
         };
         println!("========== 4. ゲートで停止 ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &blocked, now, None));
+        println!("{}", queue_page(Viewer::MEMBER, &blocked, now, None, &[]));
     }
 
     /// **成立したらマッチ画面へ移す。**行き先はサーバの状態（`active_formation`）から来る。
@@ -813,7 +834,7 @@ mod tests {
                 priority: 1,
             }],
         });
-        let rendered = queue_page(Viewer::MEMBER, &queued, Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &queued, Utc::now(), None, &[]);
         assert!(
             rendered.contains("state.eligibility.active_formation"),
             "サーバの状態を見ていない: {rendered}"
@@ -828,7 +849,7 @@ mod tests {
         // ゲートで止まっている画面（直接開いた場合）も同じ経路で移る
         let mut blocked = status();
         blocked.eligibility.active_formation = Some(Uuid::from_u128(7));
-        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now(), None);
+        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now(), None, &[]);
         assert!(
             rendered.contains("window.location.assign('/match/'"),
             "{rendered}"
@@ -848,7 +869,7 @@ mod tests {
             blocked.eligibility.pending_reports = vec![Uuid::from_u128(1)];
             blocked
         }] {
-            let rendered = queue_page(Viewer::MEMBER, &view, Utc::now(), Some(formation));
+            let rendered = queue_page(Viewer::MEMBER, &view, Utc::now(), Some(formation), &[]);
             assert!(
                 rendered.contains(&format!("/match/{}", formation.0)),
                 "{rendered}"
@@ -857,7 +878,56 @@ mod tests {
             assert!(rendered.contains("運営の裁定"), "{rendered}");
         }
         // 付いていなければ何も出さない
-        let plain = queue_page(Viewer::MEMBER, &status(), Utc::now(), None);
+        let plain = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &[]);
         assert!(!plain.contains("報告を受け付けました"), "{plain}");
+    }
+
+    /// **前回のロール希望でフォームが埋まる。**
+    #[test]
+    fn the_form_is_prefilled_with_the_previous_choices() {
+        let prefill = vec![
+            RolePreference {
+                role: "jungle".to_owned(),
+                priority: 1,
+            },
+            RolePreference {
+                role: "bot_tank".to_owned(),
+                priority: 2,
+            },
+        ];
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &prefill);
+        assert!(
+            rendered.contains("<option value=\"jungle\" selected>中央</option>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<option value=\"bot_tank\" selected>タンク</option>"),
+            "{rendered}"
+        );
+        // 第2希望が入っているので第3希望も選べる
+        assert!(rendered.contains("<select id=\"role-3\">"), "{rendered}");
+
+        // 何も無ければ従来どおり。第3希望は塞いだまま
+        let plain = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &[]);
+        assert!(!plain.contains(" selected>"), "{plain}");
+        assert!(plain.contains("<select id=\"role-3\" disabled>"), "{plain}");
+    }
+
+    /// 第1希望だけなら、第3希望は塞がったまま（JS の条件と揃える）。
+    #[test]
+    fn a_single_prefilled_choice_leaves_the_third_slot_closed() {
+        let prefill = vec![RolePreference {
+            role: "top_carry".to_owned(),
+            priority: 1,
+        }];
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now(), None, &prefill);
+        assert!(
+            rendered.contains("<option value=\"top_carry\" selected>上キャリー</option>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<select id=\"role-3\" disabled>"),
+            "{rendered}"
+        );
     }
 }

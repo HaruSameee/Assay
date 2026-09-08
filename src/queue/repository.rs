@@ -23,7 +23,7 @@ use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::model::{
     DOWN_RANGE, QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS,
-    RolePreference, StaffRemoval, VoiceDestination, clamp_down_range,
+    RolePreference, StaffRemoval, VoiceDestination, clamp_down_range, validate_request,
 };
 use super::range::QueuedPlayer;
 
@@ -115,6 +115,18 @@ impl QueueRepository {
             _ => QueueError::Database(error),
         })?;
 
+        // 選んだ内容を追記して残す。**次にキュー画面を開いたときのプリフィル用。**
+        // `queue_entry_roles` は離脱で消える可変の状態なので、そこに履歴は残らない。
+        // マッチングは従来どおり `queue_entry_roles` を読む（この表は表示にしか使わない）。
+        sqlx::query!(
+            "insert into queue_role_preferences (player_id, chosen_at, roles) values ($1, $2, $3)",
+            player_id.0,
+            now,
+            serde_json::to_value(&request.roles).unwrap_or_else(|_| serde_json::json!([])),
+        )
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(QueueEntry {
             id: QueueEntryId(entry.id),
@@ -124,6 +136,34 @@ impl QueueRepository {
             down_range: clamp_down_range(entry.down_range),
             roles: request.roles.clone(),
         })
+    }
+
+    /// 前回選んだロール希望。**最新行から導出する**（現在値の列は持たない）。
+    ///
+    /// キュー画面のプリフィルにしか使わない。読めない行や、いまは存在しないロールが
+    /// 混ざっていれば黙って空を返す — 中途半端に埋まった画面より、空のほうが誤解が無い。
+    pub async fn last_role_preferences(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Vec<RolePreference>, QueueError> {
+        let Some(row) = sqlx::query!(
+            "select roles from queue_role_preferences \
+             where player_id = $1 order by id desc limit 1",
+            player_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Ok(mut roles) = serde_json::from_value::<Vec<RolePreference>>(row.roles) else {
+            return Ok(Vec::new());
+        };
+        roles.sort_by_key(|preference| preference.priority);
+        if validate_request(&roles).is_err() {
+            return Ok(Vec::new());
+        }
+        Ok(roles)
     }
 
     /// キューを抜ける。エントリが有ったかどうかを返す。
