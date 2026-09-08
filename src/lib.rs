@@ -11,6 +11,7 @@ pub mod matchmaker;
 pub mod persistence;
 pub mod profiles;
 pub mod queue;
+pub mod ranking;
 pub mod rating;
 pub mod registration;
 pub mod status;

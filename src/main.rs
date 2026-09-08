@@ -26,6 +26,9 @@ use unite_matchsystem::profiles::{ProfileRepository, ProfileState, router as pro
 use unite_matchsystem::queue::{
     DOWN_RANGE, QueueRepository, QueueState, UP_RANGE, router as queue_router,
 };
+use unite_matchsystem::ranking::{
+    RANKING_PUBLIC, RankingRepository, RankingState, ranking_is_public, router as ranking_router,
+};
 use unite_matchsystem::rating::{BASE_DELTA, RATING_PARAMS_VERSION, RatingAdjustmentRepository};
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
@@ -101,6 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let status_repo = StatusRepository::new(pool.clone());
     let admin_store = AdminRepository::new(pool.clone());
     let match_pool = pool.clone();
+    let ranking_pool = pool.clone();
     let matchmaker_repo = MatchmakerRepository::new(pool.clone());
 
     // 停止状態は DB が正（メモリに持たない）。**起動ログに必ず出す** — 止めたまま再起動して
@@ -162,12 +166,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 照合が正（リンクが無くても 404 は 404）。
     // ログインのたびに Discord 側の見た目を積む。**積めなくてもログインは通す**
     let profile_repo = ProfileRepository::new(pool.clone());
+    // ランキングの公開スイッチ。**未設定なら非公開**（導線も出さない）
+    let ranking_public = ranking_is_public(std::env::var(RANKING_PUBLIC).ok().as_deref());
+    info!(ranking_public, "ranking visibility resolved");
     let auth = AuthState::new(
         auth_config.clone(),
         Arc::new(HttpOAuthClient::new(&auth_config)?),
         registration_repo.clone(),
     )
     .with_admins(admin_ids.clone())
+    .with_ranking(ranking_public)
     .with_profiles(profile_repo.clone());
     info!(
         redirect_uri = %auth_config.redirect_uri,
@@ -184,11 +192,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .merge(registration_router(auth))
     .merge(queue_router(
         QueueState::new(auth_config.clone(), registration_repo.clone(), queue_repo)
-            .with_admins(admin_ids.clone()),
+            .with_admins(admin_ids.clone())
+            .with_ranking(ranking_public),
     ))
     .merge(status_router(
         StatusState::new(auth_config.clone(), ratings_repo, status_repo)
-            .with_admins(admin_ids.clone()),
+            .with_admins(admin_ids.clone())
+            .with_ranking(ranking_public),
     ))
     // 操作はすべてここ。Discord にはインタラクションを残さない
     .merge(match_router(
@@ -200,11 +210,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             &room_map,
             &room_checklist,
         )
-        .with_admins(admin_ids.clone()),
+        .with_admins(admin_ids.clone())
+        .with_ranking(ranking_public),
     ))
     .merge(profile_router(
         ProfileState::new(auth_config.clone(), profile_repo, registration_repo.clone())
-            .with_admins(admin_ids.clone()),
+            .with_admins(admin_ids.clone())
+            .with_ranking(ranking_public),
+    ))
+    .merge(ranking_router(
+        RankingState::new(
+            auth_config.clone(),
+            RankingRepository::new(ranking_pool),
+            registration_repo,
+            ranking_public,
+        )
+        .with_admins(admin_ids.clone())
+        .with_ranking(ranking_public),
     ));
     info!(site = %site, "status and match routes mounted");
     // fail-closed: 管理者 ID が未設定ならルート自体をマウントしない

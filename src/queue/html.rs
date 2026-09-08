@@ -738,6 +738,7 @@ mod tests {
              <a class=\"brand\" href=\"/queue\">Assay</a>\n\
              <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
              <a href=\"/status\">戦績</a>\n\
+             <a href=\"/profile\">プロフィール</a>\n\
              <form method=\"post\" action=\"/auth/logout\">\
              <button type=\"submit\">ログアウト</button></form>\n\
              </nav>\n</header>\n";

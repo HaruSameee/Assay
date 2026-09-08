@@ -60,6 +60,12 @@ impl ProfileState {
         self.audience = Audience::new(admins);
         self
     }
+
+    /// ランキングの公開状態を渡す。共通ヘッダーに導線を出すかどうかだけに使う。
+    pub fn with_ranking(mut self, public: bool) -> Self {
+        self.audience.set_ranking(public);
+        self
+    }
 }
 
 impl FromRef<ProfileState> for Key {

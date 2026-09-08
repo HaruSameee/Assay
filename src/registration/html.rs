@@ -228,11 +228,26 @@ pub fn escape(value: &str) -> String {
 /// 未ログインには導線をひとつも出さない（行き先がどれもログインを要求するため）。
 /// 代わりに、これまでどおりサービスの説明だけを添える。
 fn site_header(viewer: Viewer) -> String {
+    // ランキングは**公開ページ**なので、公開しているなら未ログインにも導線を出す。
+    // 非公開のあいだはリンクを出さない（`/ranking` 自体もルート側が 404 を返す。
+    // リンクが無いことはアクセス制御ではない）
+    let ranking = if viewer.ranking_public() {
+        "<a href=\"/ranking\">ランキング</a>\n"
+    } else {
+        ""
+    };
     if !viewer.signed_in() {
-        return String::from(
+        if ranking.is_empty() {
+            return String::from(
+                "<header class=\"site-header\">\n\
+                 <a class=\"brand\" href=\"/\">Assay</a>\n\
+                 <span class=\"context\">Pokemon UNITE community match</span>\n</header>\n",
+            );
+        }
+        return format!(
             "<header class=\"site-header\">\n\
              <a class=\"brand\" href=\"/\">Assay</a>\n\
-             <span class=\"context\">Pokemon UNITE community match</span>\n</header>\n",
+             <nav class=\"site-nav\" aria-label=\"メニュー\">\n{ranking}</nav>\n</header>\n"
         );
     }
     // 管理パネルはリンクを消すだけ。アクセス制御は /admin 側の照合が正（非管理者には 404）
@@ -245,7 +260,8 @@ fn site_header(viewer: Viewer) -> String {
         "<header class=\"site-header\">\n\
          <a class=\"brand\" href=\"/queue\">Assay</a>\n\
          <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
-         <a href=\"/status\">戦績</a>\n{admin}\
+         <a href=\"/status\">戦績</a>\n{ranking}\
+         <a href=\"/profile\">プロフィール</a>\n{admin}\
          <form method=\"post\" action=\"/auth/logout\">\
          <button type=\"submit\">ログアウト</button></form>\n\
          </nav>\n</header>\n"

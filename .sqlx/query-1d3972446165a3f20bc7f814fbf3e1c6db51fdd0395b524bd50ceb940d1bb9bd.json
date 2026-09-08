@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*) as \"count!\" from ( select player_id from player_match_rating_deltas group by player_id having count(*) >= $1 ) qualified",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1d3972446165a3f20bc7f814fbf3e1c6db51fdd0395b524bd50ceb940d1bb9bd"
+}
