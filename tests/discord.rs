@@ -625,8 +625,13 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         let channel = vc.channel(team);
         let reveal = fake.message(channel, record.code_message_ids[&team]);
         assert!(reveal.content.contains("**1234**"), "{}", reveal.content);
-        // **参加者10人のメンションは付けない。ホストだけ**
-        assert_eq!(reveal.mention_users, vec![user(1)], "{reveal:?}");
+        // **参加者10人のメンションは付けない。通知はホスト自身のチーム側だけ**
+        // （2通とも載せると、ホスト1人が同じ知らせで2回叩かれる）
+        if team == Team::Red {
+            assert_eq!(reveal.mention_users, vec![user(1)], "{reveal:?}");
+        } else {
+            assert!(reveal.mention_users.is_empty(), "{reveal:?}");
+        }
         assert_eq!(
             reveal.content.matches("<@").count(),
             1,
@@ -856,11 +861,17 @@ async fn a_candidate_on_the_other_team_gets_the_prompt_in_their_own_voice_chat(o
             room_code: "6666".into()
         }
     );
-    // 開示は両チームに出る。メンションはホスト（blue の人）だけ
+    // 開示は両チームに出るが、通知が飛ぶのはホスト（blue の人）の側の1通だけ
     for team in Team::ALL {
         let reveal = fake.message(vc.channel(team), record.code_message_ids[&team]);
         assert!(reveal.content.contains("**6666**"), "{}", reveal.content);
-        assert_eq!(reveal.mention_users, vec![user(6)]);
+        // 表示はどちらにも出る（誰に聞けばよいかは相手チームにも要る）
+        assert!(reveal.content.contains("<@1006>"), "{}", reveal.content);
+        if team == Team::Blue {
+            assert_eq!(reveal.mention_users, vec![user(6)]);
+        } else {
+            assert!(reveal.mention_users.is_empty(), "{reveal:?}");
+        }
     }
     db.done().await;
 }
@@ -1676,5 +1687,74 @@ async fn internal_formations_endpoint_requires_the_token_and_starts_a_formation(
         assert!(Instant::now() < deadline, "start_formation did not run");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    db.done().await;
+}
+
+/// **同じ状態から何度再開しても、ホストへの通知はちょうど 1 回だけ。**
+///
+/// 本番で「ロビー ID を入れると自チーム VC と相手チーム VC の両方でメンションが飛ぶ」
+/// という報告があった。切り分けた結果、経路も冪等判定も正しく、原因は開示の 2 通とも
+/// `mention_users` にホストを載せていたことだった（`allowed_mentions` に載った側だけが
+/// 通知される）。ここでは投稿経路の冪等と、通知が 1 回であることを同時に測る。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn revealing_the_room_code_notifies_the_host_exactly_once(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 2);
+
+    let (vc, _, _) = started(&db, &adapter, 1).await;
+    accept_host(&db, &adapter, 1, 1).await;
+    let sends_before_reveal = fake.total_sends();
+    post_room_code(&db, &adapter, 1, 1, "1234").await;
+    let sends_after_reveal = fake.total_sends();
+
+    // 開示 2 通 + 催促 2 通が出る
+    assert_eq!(sends_after_reveal - sends_before_reveal, 4);
+
+    // **同じ状態のまま再開ループを何度も回す。**投稿は 1 通も増えない
+    for _ in 0..5 {
+        adapter.resume_unfinished().await.unwrap();
+    }
+    assert_eq!(
+        fake.total_sends(),
+        sends_after_reveal,
+        "同じ状態から再投稿されている"
+    );
+
+    // ホストは red（pid(1)）。開示は両 VC に出るが、通知は red 側の 1 通だけ
+    let (_, _, record) = load(&db, fid(1)).await;
+    let mut notified = 0;
+    for team in Team::ALL {
+        let reveal = fake.message(vc.channel(team), record.code_message_ids[&team]);
+        assert!(reveal.content.contains("<@1001>"), "{}", reveal.content);
+        if reveal.mention_users.contains(&user(1)) {
+            notified += 1;
+            assert_eq!(team, Team::Red, "通知は自チーム側だけ");
+        }
+    }
+    assert_eq!(notified, 1, "ホストが 2 回叩かれている");
+
+    // 催促にはメンションを付けない（全員分の通知にならない）
+    for team in Team::ALL {
+        let report = fake.message(vc.channel(team), record.report_message_ids[&team]);
+        assert!(report.mention_users.is_empty(), "{report:?}");
+    }
+
+    // 打ち直しは別の内容なので必ず届く。それでも通知は 1 回のまま
+    post_room_code(&db, &adapter, 1, 1, "9999").await;
+    let (_, _, record) = load(&db, fid(1)).await;
+    let mut notified = 0;
+    for team in Team::ALL {
+        let reveal = fake.message(vc.channel(team), record.code_message_ids[&team]);
+        assert!(reveal.content.contains("**9999**"), "{}", reveal.content);
+        if reveal.mention_users.contains(&user(1)) {
+            notified += 1;
+        }
+    }
+    assert_eq!(notified, 1, "打ち直しでもホストは 1 回だけ");
+
     db.done().await;
 }

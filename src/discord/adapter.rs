@@ -835,8 +835,10 @@ impl Adapter {
         let mut report_message_ids = HashMap::new();
         let mut failures = Vec::new();
         for team in Team::ALL {
-            // 開示もチーム側の文面にする（集合先はそのチームの VC だけを書く）
-            let reveal = render::code_reveal(&heading, host_user, &room_code, &vc, team);
+            // 開示もチーム側の文面にする（集合先はそのチームの VC だけを書く）。
+            // 通知はホスト自身のチーム側だけ（両方に載せるとホストが2回叩かれる）
+            let reveal =
+                render::code_reveal(&heading, host_user, host_entry.team, &room_code, &vc, team);
             match self
                 .post_or_edit(
                     vc.channel(team),
