@@ -1099,7 +1099,14 @@ async fn exactly_fifty_apart_counts_but_one_hundred_does_not(owner: PgPool) {
     assert_eq!(from_middle["in_range"], 2, "{from_middle}");
 
     // 自分自身は数えない
-    assert_eq!(db.queue.in_range_count(high).await.unwrap(), Some(1));
+    assert_eq!(
+        db.queue
+            .in_range_summary(high)
+            .await
+            .unwrap()
+            .map(|s| s.total),
+        Some(1)
+    );
 
     // 1 だけ動かして 1551 にすると、1500 からは外れる（差 51）
     adjust_rating_with_key(&db, middle, 1.0, "nudge").await;

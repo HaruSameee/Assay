@@ -341,7 +341,11 @@ async fn one_win_is_not_enough_to_bridge_the_two_pools(owner: PgPool) {
     assert_eq!(queued_rating(&db, climber).await, 1500.0);
     assert_eq!(queued_rating(&db, seeded).await, 1600.0);
     assert_eq!(
-        db.queue.in_range_count(climber).await.unwrap(),
+        db.queue
+            .in_range_summary(climber)
+            .await
+            .unwrap()
+            .map(|s| s.total),
         Some(0),
         "the two pools must not mix before anyone plays"
     );
@@ -355,11 +359,22 @@ async fn one_win_is_not_enough_to_bridge_the_two_pools(owner: PgPool) {
         "1 勝で 1507（params v3 は ±7 フラット）"
     );
     assert_eq!(
-        db.queue.in_range_count(climber).await.unwrap(),
+        db.queue
+            .in_range_summary(climber)
+            .await
+            .unwrap()
+            .map(|s| s.total),
         Some(0),
         "**1 勝では届かない。**1507 と 1600 は差 93 で、窓 50 の外"
     );
-    assert_eq!(db.queue.in_range_count(seeded).await.unwrap(), Some(0));
+    assert_eq!(
+        db.queue
+            .in_range_summary(seeded)
+            .await
+            .unwrap()
+            .map(|s| s.total),
+        Some(0)
+    );
 
     db.done().await;
 }
@@ -559,7 +574,12 @@ async fn five_hundred_matches_stay_within_budget(owner: PgPool) {
         let started = Instant::now();
         let entry = db.queue.find(player(1)).await.unwrap();
         let range_started = Instant::now();
-        let count = db.queue.in_range_count(player(1)).await.unwrap();
+        let count = db
+            .queue
+            .in_range_summary(player(1))
+            .await
+            .unwrap()
+            .map(|s| s.total);
         in_range_samples.push(range_started.elapsed());
         let eligibility = registration.queue_eligibility(player(1)).await.unwrap();
         queue_samples.push(started.elapsed());

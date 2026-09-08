@@ -12,11 +12,12 @@
 //! 現在値を保存する仕組みを置かない——呼び出し側が導出したものを渡す。
 
 use crate::lifecycle::PlayerId;
+use crate::matchmaker::FirstChoiceRoleCounts;
 
 use super::model::UP_RANGE;
 
 /// 範囲判定に必要な、キュー中プレイヤー1人分の値。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueuedPlayer {
     /// 誰か。自分自身を数えないためだけに使う。
     pub player_id: PlayerId,
@@ -24,6 +25,11 @@ pub struct QueuedPlayer {
     pub rating: f64,
     /// 下方向の幅。いまは 50 固定（`clamp_down_range` を通した値が入る）。
     pub down_range: i32,
+    /// 第1希望のロール（`roles.id`）。希望が 1 つも無ければ `None`。
+    ///
+    /// **第1希望だけを持つ。**「希望のどこかに含まれる」を数えると、1 人が複数の
+    /// ロールに計上されて合計が人数と合わなくなる。
+    pub first_choice: Option<String>,
 }
 
 /// `viewer` から見て `other` が範囲内か。**片方向**。
@@ -48,11 +54,33 @@ pub fn mutually_in_range(a: &QueuedPlayer, b: &QueuedPlayer) -> bool {
 ///
 /// 自分自身は数えない（`queue` に自分が入っていてもよい）。
 pub fn count_in_range(me: &QueuedPlayer, queue: &[QueuedPlayer]) -> usize {
+    in_range_with(me, queue).count()
+}
+
+/// 範囲内の人だけを返す。人数と内訳を**同じ判定**から数えるための共通部分。
+fn in_range_with<'a>(
+    me: &'a QueuedPlayer,
+    queue: &'a [QueuedPlayer],
+) -> impl Iterator<Item = &'a QueuedPlayer> {
     queue
         .iter()
-        .filter(|other| other.player_id != me.player_id)
-        .filter(|other| mutually_in_range(me, other))
-        .count()
+        .filter(move |other| other.player_id != me.player_id)
+        .filter(move |other| mutually_in_range(me, other))
+}
+
+/// 範囲内の人を**第1希望のロール別**に数える。
+///
+/// 絞り込みは [`count_in_range`] と同じ条件（上下 50 の相互条件）。数え方は
+/// 15 分サマリと同じ「第1希望がそのロールの人」で、希望のどこかに含まれる人ではない。
+/// 希望を 1 つも持たない行は、どのロールにも数えない。
+pub fn count_by_first_choice(me: &QueuedPlayer, queue: &[QueuedPlayer]) -> FirstChoiceRoleCounts {
+    let mut counts = FirstChoiceRoleCounts::default();
+    for other in in_range_with(me, queue) {
+        if let Some(role) = other.first_choice.as_deref() {
+            counts.increment(role);
+        }
+    }
+    counts
 }
 
 #[cfg(test)]
@@ -67,6 +95,15 @@ mod tests {
             player_id: PlayerId(Uuid::from_u128(n)),
             rating,
             down_range: DOWN_RANGE,
+            first_choice: None,
+        }
+    }
+
+    /// 第1希望つきのキュー中の人。
+    fn wanting(n: u128, rating: f64, role: &str) -> QueuedPlayer {
+        QueuedPlayer {
+            first_choice: Some(role.to_owned()),
+            ..player(n, rating)
         }
     }
 
@@ -95,7 +132,7 @@ mod tests {
         assert!(!mutually_in_range(&low, &high), "1500 と 1600（差 100）");
 
         // 中間層から見れば両方が範囲内。上下の群は互いに見えない
-        let queue = [low, middle, high];
+        let queue = [low.clone(), middle.clone(), high.clone()];
         assert_eq!(count_in_range(&middle, &queue), 2);
         assert_eq!(count_in_range(&low, &queue), 1);
         assert_eq!(count_in_range(&high, &queue), 1);
@@ -120,7 +157,7 @@ mod tests {
     fn the_count_excludes_yourself_and_out_of_range_players() {
         let me = player(1, 1500.0);
         let queue = [
-            me,                // 自分は数えない
+            me.clone(),        // 自分は数えない
             player(2, 1500.0), // 同レート
             player(3, 1550.0), // +50 ちょうど
             player(4, 1550.1), // +50 を超える
@@ -141,18 +178,49 @@ mod tests {
             player_id: PlayerId(Uuid::from_u128(1)),
             rating: 1600.0,
             down_range: 200,
+            first_choice: None,
         };
         let below = player(2, 1450.0);
         assert!(accepts(&wide, &below), "片方向では通る");
         assert!(!accepts(&below, &wide), "上方向 +50 の外");
         assert!(!mutually_in_range(&wide, &below));
-        assert_eq!(count_in_range(&wide, &[wide, below]), 0);
+        assert_eq!(count_in_range(&wide, &[wide.clone(), below]), 0);
     }
 
     #[test]
     fn an_empty_queue_counts_zero() {
         let me = player(1, 1500.0);
         assert_eq!(count_in_range(&me, &[]), 0);
-        assert_eq!(count_in_range(&me, &[me]), 0);
+        assert_eq!(count_in_range(&me, std::slice::from_ref(&me)), 0);
+    }
+
+    /// **内訳は第1希望だけを数える。**希望のどこかに含まれる人ではない。
+    ///
+    /// 絞り込みは [`count_in_range`] と同じ条件なので、内訳の合計は範囲内の人数と
+    /// 一致する（希望を持たない行があるぶんだけ内訳が少なくなる）。
+    #[test]
+    fn the_breakdown_counts_only_the_first_choice_of_players_in_range() {
+        let me = wanting(1, 1500.0, "jungle");
+        let queue = [
+            me.clone(),                     // 自分は数えない
+            wanting(2, 1500.0, "jungle"),   // 範囲内
+            wanting(3, 1550.0, "jungle"),   // +50 ちょうど。範囲内
+            wanting(4, 1550.1, "jungle"),   // 範囲外
+            wanting(5, 1450.0, "bot_tank"), // -50 ちょうど。範囲内
+            wanting(6, 1449.9, "bot_tank"), // 範囲外
+            player(7, 1500.0),              // 希望なし。どのロールにも入らない
+        ];
+        let counts = super::count_by_first_choice(&me, &queue);
+        assert_eq!(counts.jungle, 2, "範囲外の 1550.1 を数えていない");
+        assert_eq!(counts.bot_tank, 1, "範囲外の 1449.9 を数えていない");
+        // 0 人のロールも 0 として返る（画面が行ごと落とさないため）
+        assert_eq!(counts.top_carry, 0);
+        assert_eq!(counts.top_support, 0);
+        assert_eq!(counts.bot_carry, 0);
+
+        // 範囲内は 4 人（希望なしの 1 人を含む）。内訳の合計は 3
+        assert_eq!(count_in_range(&me, &queue), 4);
+        let total: usize = counts.all().into_iter().map(|(_, count)| count).sum();
+        assert_eq!(total, 3, "希望を持たない行はどのロールにも入らない");
     }
 }

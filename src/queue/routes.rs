@@ -223,6 +223,9 @@ pub(super) struct StatusView {
     ///
     /// 範囲は上下 50 固定なので、キューに入る前でも決まる（読み取りに失敗したときだけ `null`）。
     pub(super) in_range: Option<usize>,
+    /// その内訳。**第1希望がそのロールの人の数**で、15 分サマリと同じ定義。
+    /// 5 ロールすべてを返す（0 人でも 0。出ないと「集計されていない」と読まれる）。
+    pub(super) in_range_by_first_choice: Vec<RoleCountView>,
     /// 3つのゲートの現在の状態。キュー中でも進行中・報告ゲートは後から立ちうる。
     pub(super) eligibility: EligibilityView,
     /// 成立済みなら、`vc_assigned` のログから読んだ本人側の集合先。
@@ -231,6 +234,15 @@ pub(super) struct StatusView {
     /// 運営にキューから外された直後なら、その通知。**黙って消さない。**
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) removed_by_staff: Option<RemovalView>,
+}
+
+/// ロール別の待機人数。**第1希望がそのロールの人の数。**
+#[derive(Debug, Serialize)]
+pub(super) struct RoleCountView {
+    /// `roles.id`。
+    pub(super) role: String,
+    /// 第1希望がこのロールの人数（範囲内）。
+    pub(super) count: usize,
 }
 
 /// 「運営によってキューから外されました」。本人にだけ返す。
@@ -456,9 +468,12 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
         .ok()?;
     // 範囲は固定なので、キューに入る前でも人数が決まる（旧仕様の「プレビュー」は不要）
     let in_range = if entry.is_some() {
-        app.queue.in_range_count(player_id).await
+        app.queue.in_range_summary(player_id).await
     } else {
-        app.queue.preview_in_range_count(player_id).await.map(Some)
+        app.queue
+            .preview_in_range_summary(player_id)
+            .await
+            .map(Some)
     }
     .inspect_err(|error| error!(%error, "could not count the players in range"))
     .ok()?;
@@ -489,10 +504,25 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
     } else {
         None
     };
+    let in_range_by_first_choice = in_range
+        .as_ref()
+        .map(|summary| {
+            summary
+                .by_first_choice
+                .all()
+                .into_iter()
+                .map(|(role, count)| RoleCountView {
+                    role: role.to_owned(),
+                    count,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Some(StatusView {
         queued: entry.is_some(),
         entry: entry.map(EntryView::from),
-        in_range,
+        in_range: in_range.map(|summary| summary.total),
+        in_range_by_first_choice,
         eligibility: EligibilityView::from(&eligibility),
         destination,
         removed_by_staff,
