@@ -14,7 +14,7 @@
 //! CSRF: セッション Cookie は `SameSite=Lax` なので、他サイトからの POST / DELETE には
 //! 送られない。登録トラックのフォームと同じ前提に拠る。
 
-use axum::extract::{FromRef, State};
+use axum::extract::{FromRef, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -271,9 +271,21 @@ impl From<VoiceDestination> for DestinationView {
 // ----------------------------------------------------------------------
 
 /// 状態取得。
+/// `/queue` のクエリ。**表示にしか使わない。**
+#[derive(Debug, Default, Deserialize)]
+struct ShowQueueParams {
+    /// 直前に報告した試合。マッチ画面へ戻る導線をこの id で描く。
+    ///
+    /// 値は本人が持ち込むが、リンクを描くだけで権限判断には使わない
+    /// （`/match/{id}` 側が、参加者でなければ 404 を返す）。
+    #[serde(default)]
+    reported: Option<Uuid>,
+}
+
 async fn show_queue(
     State(app): State<QueueState>,
     session: Option<CurrentSession>,
+    Query(params): Query<ShowQueueParams>,
     headers: HeaderMap,
 ) -> Response {
     let html = accepts_html(&headers);
@@ -302,6 +314,7 @@ async fn show_queue(
                 viewer(&app, player_id).await,
                 &status,
                 Utc::now(),
+                params.reported.map(FormationId),
             )),
         )
             .into_response(),

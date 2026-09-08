@@ -417,7 +417,19 @@ async fn submit_report(
         Err(error) => error!(%error, "report evaluation failed after a web report"),
     }
     info!(formation = %formation, player = %player_id, "report accepted from the site");
-    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+    // **本人の報告が追記された時点で**キュー画面へ戻す。試合の確定は待たない
+    // （報告ゲートはプレイヤー単位なので、確定を待つと10人目が報告するまで拘束される）。
+    // 行き先はサーバが決める。クライアントに遷移条件もタイマーも持たせない。
+    // `reported` を付けて、戻った先から結果を追える導線を残す（/status には
+    // 確定した試合しか出ないので、disputed と未確定はここからしか辿れない）
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "next": format!("/queue?reported={formation}"),
+        })),
+    )
+        .into_response()
 }
 
 /// ルーム ID の最大文字数（Discord のモーダルと同じ上限に揃える）。

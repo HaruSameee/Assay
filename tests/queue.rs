@@ -1293,3 +1293,93 @@ async fn widening_past_the_upward_cap_does_not_add_candidates(owner: PgPool) {
 
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// 報告完了 → キュー画面 → 再投入（実測）
+// ----------------------------------------------------------------------
+
+/// **9人が報告して未確定のままでも、9人ともキュー画面へ戻って再投入できる。**
+///
+/// 報告ゲートはプレイヤー単位なので、確定を待たせない。10人目が報告するまで
+/// マッチ画面に留めると、最大で報告受付時間ぶん拘束することになる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn nine_reporters_all_get_back_to_the_queue_before_confirmation(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let body = json!({ "roles": [wish("jungle", 1)] });
+
+    // formation の参加者は player(1)..player(10)。全員を登録しておく
+    for n in 1..=10u128 {
+        register(&db, player(n), Rank::Legend).await;
+    }
+    formation_at(&db, 0xc1, player(1), Stage::InProgress).await;
+
+    // 報告前は 10 人ともキューに入れない
+    for n in 1..=10u128 {
+        let (status, denied) = post_queue(&app, player(n), body.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "player {n}: {denied}");
+    }
+
+    // 9 人が報告する。10 人目は報告しないので**確定しない**
+    for n in 1..=9u128 {
+        db.formations
+            .append_latest_report(NewReport {
+                formation_id: fid(0xc1),
+                player_id: player(n),
+                reported_at: at(10),
+                outcome: Outcome::Win(Team::Red),
+                raw_result: json!({ "outcome": "red" }),
+                idempotency_key: format!("nine-{n}"),
+                supersedes_id: None,
+            })
+            .await
+            .unwrap();
+    }
+    let state = db
+        .formations
+        .load_events(fid(0xc1))
+        .await
+        .unwrap()
+        .snapshot()
+        .state;
+    assert!(
+        matches!(
+            state,
+            unite_matchsystem::lifecycle::FormationState::InProgress { .. }
+        ),
+        "未確定であること: {state:?}"
+    );
+
+    // 9 人ともキュー画面へ戻り、そのまま再投入できる
+    for n in 1..=9u128 {
+        let (status, page) = get_queue_html(
+            &app,
+            player(n),
+            &format!("/queue?reported={}", fid(0xc1).0.simple()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "player {n}");
+        assert!(
+            page.contains("報告を受け付けました"),
+            "player {n} に導線が出ていない"
+        );
+        assert!(
+            page.contains(&format!("/match/{}", fid(0xc1).0)),
+            "player {n} からマッチ画面へ戻れない"
+        );
+        let (status, allowed) = post_queue(&app, player(n), body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "player {n}: {allowed}");
+        assert_eq!(allowed["queued"], true, "player {n}");
+    }
+
+    // 10 人目だけは報告していないので、まだ塞がれたまま
+    let (status, denied) = post_queue(&app, player(10), body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(denied["pending_reports"].as_array().unwrap().len(), 1);
+
+    println!("9人が報告 → 未確定のまま9人ともキューへ再投入できた（10人目だけ未報告で停止）");
+    db.done().await;
+}
