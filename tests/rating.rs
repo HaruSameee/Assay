@@ -188,7 +188,6 @@ async fn enqueue(db: &AppDb, who: PlayerId, role: &str, at_time: Timestamp) {
         .enqueue(
             who,
             &QueueRequest {
-                down_range: 95,
                 roles: vec![RolePreference {
                     role: role.to_owned(),
                     priority: 1,
@@ -257,22 +256,18 @@ async fn the_view_produces_the_documented_numbers(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 10).await;
 
-    // 差 0: ±7（params v2）
+    // params v3: 差に関わらず ±7
     confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
     assert_eq!(view_delta(&db, player(1), fid(1)).await, 7.0);
     assert_eq!(view_delta(&db, player(6), fid(1)).await, -7.0);
 
-    // red 1500 / blue 1600 で red 勝ち。
-    // red から見れば格上に勝って +8、blue から見れば**格下に負けて** -8
     confirmed_match(&db, 2, 1500.0, 1600.0, "red").await;
-    assert_eq!(view_delta(&db, player(1), fid(2)).await, 8.0);
-    assert_eq!(view_delta(&db, player(6), fid(2)).await, -8.0);
-
-    // red 1600 / blue 1500 で red 勝ち。
-    // red は格下に勝って +6、blue は**格上に負けて** -6
+    assert_eq!(view_delta(&db, player(1), fid(2)).await, 7.0);
+    assert_eq!(view_delta(&db, player(6), fid(2)).await, -7.0);
+    // red 1600 / blue 1500 で red 勝ち。**格下でも +7 のまま**
     confirmed_match(&db, 3, 1600.0, 1500.0, "red").await;
-    assert_eq!(view_delta(&db, player(1), fid(3)).await, 6.0);
-    assert_eq!(view_delta(&db, player(6), fid(3)).await, -6.0);
+    assert_eq!(view_delta(&db, player(1), fid(3)).await, 7.0);
+    assert_eq!(view_delta(&db, player(6), fid(3)).await, -7.0);
 
     // 引き分けは双方 0
     confirmed_match(&db, 4, 1500.0, 1600.0, "draw").await;
@@ -313,11 +308,11 @@ async fn only_confirmed_matches_move_the_rating(owner: PgPool) {
     assert_eq!(db.ratings.display_rating(player(6)).await.unwrap(), 1500.0);
 
     // スタッフ裁定で disputed から confirmed へ進めば、その時点で効き始める（04 §1）。
-    // formation 2 は red 1500 / blue 1600 で red 勝ち。red は格上に勝って +8、
-    // blue は格下に負けて -8
+    // formation 2 は red 1500 / blue 1600 で red 勝ち。v3 は分岐が無いので red +7、
+    // blue は -7
     finish(&db, 2, K::Confirmed, "red").await;
-    assert_eq!(db.ratings.display_rating(player(1)).await.unwrap(), 1508.0);
-    assert_eq!(db.ratings.display_rating(player(6)).await.unwrap(), 1492.0);
+    assert_eq!(db.ratings.display_rating(player(1)).await.unwrap(), 1507.0);
+    assert_eq!(db.ratings.display_rating(player(6)).await.unwrap(), 1493.0);
 
     db.done().await;
 }
@@ -330,7 +325,7 @@ async fn only_confirmed_matches_move_the_rating(owner: PgPool) {
 ///
 /// これが起きないと、初日は 1500 プールと 1600 プールが分かれたまま固定される。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn one_win_bridges_the_fifteen_hundred_and_sixteen_hundred_pools(owner: PgPool) {
+async fn one_win_is_not_enough_to_bridge_the_two_pools(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 11).await;
 
@@ -342,7 +337,7 @@ async fn one_win_bridges_the_fifteen_hundred_and_sixteen_hundred_pools(owner: Pg
     enqueue(&db, climber, "jungle", at(0)).await;
     enqueue(&db, seeded, "top_carry", at(0)).await;
 
-    // 勝つ前: 1500 と 1600 は差 100 で、上方向の固定幅 95 の外
+    // 勝つ前: 1500 と 1600 は差 100 で、固定幅 50 の外
     assert_eq!(queued_rating(&db, climber).await, 1500.0);
     assert_eq!(queued_rating(&db, seeded).await, 1600.0);
     assert_eq!(
@@ -357,14 +352,14 @@ async fn one_win_bridges_the_fifteen_hundred_and_sixteen_hundred_pools(owner: Pg
     assert_eq!(
         queued_rating(&db, climber).await,
         1507.0,
-        "07 §3-2: one win takes 1500 to 1507（params v2）"
+        "1 勝で 1507（params v3 は ±7 フラット）"
     );
     assert_eq!(
         db.queue.in_range_count(climber).await.unwrap(),
-        Some(1),
-        "1511 and 1600 are 89 apart, so the pools fuse on their own"
+        Some(0),
+        "**1 勝では届かない。**1507 と 1600 は差 93 で、窓 50 の外"
     );
-    assert_eq!(db.queue.in_range_count(seeded).await.unwrap(), Some(1));
+    assert_eq!(db.queue.in_range_count(seeded).await.unwrap(), Some(0));
 
     db.done().await;
 }
@@ -398,12 +393,12 @@ async fn the_matchmaker_sees_the_updated_rating(owner: PgPool) {
             .unwrap()
             .created
             .is_empty(),
-        "1500 and 1600 are 100 apart"
+        "1500 と 1600 は差 100 で窓 50 の外"
     );
 
-    // 6〜10 が 1 勝ぶん上がれば 1511 になり、1600 と組める
+    // 6〜10 が +50 で 1550 になれば、1600 との差はちょうど 50 で組める
     for n in 6..=10u128 {
-        adjust_rating(&db, player(n), 11.0, &format!("win-{n}")).await;
+        adjust_rating(&db, player(n), 50.0, &format!("win-{n}")).await;
     }
     let outcome = matchmaker.run_once(at(600)).await.unwrap();
     assert_eq!(outcome.created.len(), 1, "{outcome:?}");

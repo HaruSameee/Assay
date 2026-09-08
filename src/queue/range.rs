@@ -2,9 +2,11 @@
 //!
 //! 10人の組が成立する条件は**全ペアが相互に相手を受け入れること**であり、
 //! キュー画面に出す「現在あなたの範囲内でキュー中: N人」も同じ定義で数える。
-//! **片方向で数えないこと。**自分の下方向を 200 まで広げても、相手の下方向が 95 のままなら
-//! そのペアは成立しない。片方向で数えると、実際には組めない人数を画面に出すことになり、
-//! 「範囲を広げたのに待たされる」という形で効く。
+//! 範囲が上下とも 50 固定になった現在、相互条件は「差が 50 以内」と同値だが、
+//! **片方向の判定を残してある**（範囲がまた非対称になったときに、ここだけで直せる）。
+//!
+//! **境界は両端とも含む（`<=` / `>=`）。**差ちょうど 50 は組める側。seed の差 100 と
+//! 組み合わせると、1500 と 1600 は組めず、1550 は 1500 とも 1600 とも組める。
 //!
 //! レートは**表示スケール**（1500 スタート）。レーティングは導出値なので、ここには
 //! 現在値を保存する仕組みを置かない——呼び出し側が導出したものを渡す。
@@ -20,7 +22,7 @@ pub struct QueuedPlayer {
     pub player_id: PlayerId,
     /// 表示スケールのレート（導出値）。
     pub rating: f64,
-    /// 本人が設定した下方向の幅。95〜200。
+    /// 下方向の幅。いまは 50 固定（`clamp_down_range` を通した値が入る）。
     pub down_range: i32,
 }
 
@@ -28,6 +30,9 @@ pub struct QueuedPlayer {
 ///
 /// 単体で人数を数える用途には使わない（[`mutually_in_range`] を使う）。相互条件の
 /// 半分であることを明示するために公開してある。
+///
+/// **境界を含む。**`other.rating` が `viewer.rating ± 50` ちょうどでも範囲内
+/// （比較は `>=` / `<=`）。
 pub fn accepts(viewer: &QueuedPlayer, other: &QueuedPlayer) -> bool {
     let upper = viewer.rating + f64::from(UP_RANGE);
     let lower = viewer.rating - f64::from(viewer.down_range);
@@ -55,94 +60,98 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::queue::model::DOWN_RANGE;
 
-    fn player(n: u128, rating: f64, down_range: i32) -> QueuedPlayer {
+    fn player(n: u128, rating: f64) -> QueuedPlayer {
         QueuedPlayer {
             player_id: PlayerId(Uuid::from_u128(n)),
             rating,
-            down_range,
+            down_range: DOWN_RANGE,
         }
     }
 
+    /// 上下とも 50。**境界ちょうどは範囲内**（比較は `>=` / `<=`）。
     #[test]
-    fn the_upward_range_is_fixed_at_ninety_five() {
-        let me = player(1, 1500.0, 200);
-        // +95 ちょうどは範囲内、+96 は外。下方向をいくら広げても上方向は動かない
-        assert!(accepts(&me, &player(2, 1595.0, 95)));
-        assert!(!accepts(&me, &player(3, 1596.0, 95)));
+    fn the_range_is_fifty_in_both_directions_and_includes_the_boundary() {
+        let me = player(1, 1500.0);
+        assert!(accepts(&me, &player(2, 1550.0)), "+50 ちょうどは範囲内");
+        assert!(!accepts(&me, &player(3, 1550.1)), "+50 を超えたら外");
+        assert!(accepts(&me, &player(4, 1450.0)), "-50 ちょうどは範囲内");
+        assert!(!accepts(&me, &player(5, 1449.9)), "-50 を超えたら外");
     }
 
+    /// **1-2 の実測対象。**seed の差 100 と幅 50 の噛み合わせ。
     #[test]
-    fn the_downward_range_is_what_the_player_set() {
-        let narrow = player(1, 1500.0, 95);
-        let wide = player(2, 1500.0, 200);
-        assert!(accepts(&narrow, &player(3, 1405.0, 95)));
-        assert!(!accepts(&narrow, &player(4, 1404.0, 95)));
-        assert!(accepts(&wide, &player(5, 1300.0, 95)));
+    fn the_seed_gap_of_one_hundred_separates_the_two_pools() {
+        let low = player(1, 1500.0);
+        let middle = player(2, 1550.0);
+        let high = player(3, 1600.0);
+
+        // 1550 と 1600 は差ちょうど 50 → 組める
+        assert!(mutually_in_range(&middle, &high), "1550 と 1600（差 50）");
+        // 1550 と 1500 も差ちょうど 50 → 組める
+        assert!(mutually_in_range(&middle, &low), "1550 と 1500（差 50）");
+        // 1500 と 1600 は差 100 → 組めない
+        assert!(!mutually_in_range(&low, &high), "1500 と 1600（差 100）");
+
+        // 中間層から見れば両方が範囲内。上下の群は互いに見えない
+        let queue = [low, middle, high];
+        assert_eq!(count_in_range(&middle, &queue), 2);
+        assert_eq!(count_in_range(&low, &queue), 1);
+        assert_eq!(count_in_range(&high, &queue), 1);
     }
 
-    /// 片方向で数えると通ってしまうケース。**これが相互条件の意味。**
+    /// 相互条件は対称。範囲が全員同じなので、片方向と結論が一致する。
     #[test]
-    fn a_one_directional_count_would_overcount_the_wide_player() {
-        // 自分は 1600 で下方向 200。相手は 1450 で下方向 95（既定のまま）
-        let me = player(1, 1600.0, 200);
-        let below = player(2, 1450.0, 95);
-
-        // 自分から見れば範囲内（1600 - 200 = 1400 ≦ 1450）
-        assert!(accepts(&me, &below), "one direction passes");
-        // だが相手から見ると、自分は上方向 +95 の外（1450 + 95 = 1545 < 1600）
-        assert!(!accepts(&below, &me), "the other direction fails");
-
-        assert!(!mutually_in_range(&me, &below));
-        assert_eq!(
-            count_in_range(&me, &[me, below]),
-            0,
-            "counting one-directionally would report 1 here"
-        );
-        // 相手側から数えても同じ 0 でなければならない（対称）
-        assert_eq!(count_in_range(&below, &[me, below]), 0);
-    }
-
-    #[test]
-    fn widening_only_helps_when_the_other_side_is_close_enough() {
-        let me = player(1, 1600.0, 200);
-        // 相手が下方向を広げれば、同じレート差でも両立する
-        let widened = player(2, 1450.0, 200);
-        assert!(!accepts(&widened, &me), "up is still +95 for them");
-        assert!(!mutually_in_range(&me, &widened), "the cap is symmetric");
-
-        // 上方向 95 に収まる相手なら、下方向の設定に関わらず両立する
-        let near = player(3, 1520.0, 95);
-        assert!(mutually_in_range(&me, &near));
+    fn the_condition_is_symmetric() {
+        let a = player(1, 1500.0);
+        for rating in [1400.0, 1449.9, 1450.0, 1500.0, 1550.0, 1550.1, 1600.0] {
+            let b = player(2, rating);
+            assert_eq!(
+                mutually_in_range(&a, &b),
+                mutually_in_range(&b, &a),
+                "{rating}"
+            );
+            assert_eq!(accepts(&a, &b), accepts(&b, &a), "{rating}");
+        }
     }
 
     #[test]
     fn the_count_excludes_yourself_and_out_of_range_players() {
-        let me = player(1, 1500.0, 150);
+        let me = player(1, 1500.0);
         let queue = [
-            me,                     // 自分は数えない
-            player(2, 1500.0, 95),  // 同レート
-            player(3, 1595.0, 95),  // +95 ちょうど
-            player(4, 1596.0, 95),  // +96。自分の上方向の外
-            player(5, 1405.0, 95),  // -95。相手の上方向 1405+95=1500 でちょうど両立
-            player(6, 1404.0, 95),  // 相手の上方向 1499 < 1500 なので相互には外
-            player(7, 1404.0, 200), // 自分の下方向 1350 の内。相手は 1404+95=1499 < 1500 で外
+            me,                // 自分は数えない
+            player(2, 1500.0), // 同レート
+            player(3, 1550.0), // +50 ちょうど
+            player(4, 1550.1), // +50 を超える
+            player(5, 1450.0), // -50 ちょうど
+            player(6, 1449.9), // -50 を超える
+            player(7, 1600.0), // 上の群
         ];
         assert_eq!(count_in_range(&me, &queue), 3);
+    }
 
-        // 相互条件は対称: どちらから数えても同じ結論になる
-        for other in &queue[1..] {
-            assert_eq!(
-                mutually_in_range(&me, other),
-                mutually_in_range(other, &me),
-                "{other:?}"
-            );
-        }
+    /// 旧仕様の広い `down_range` が万一残っていても、丸めた値が渡る前提。
+    ///
+    /// ここは丸め忘れたときの挙動を記録するためのテスト。`down_range` に 200 が入れば
+    /// 下方向だけ広がるが、**上方向は 50 のままなので相互条件は成立しない**。
+    #[test]
+    fn an_unclamped_wide_value_still_cannot_widen_the_pair() {
+        let wide = QueuedPlayer {
+            player_id: PlayerId(Uuid::from_u128(1)),
+            rating: 1600.0,
+            down_range: 200,
+        };
+        let below = player(2, 1450.0);
+        assert!(accepts(&wide, &below), "片方向では通る");
+        assert!(!accepts(&below, &wide), "上方向 +50 の外");
+        assert!(!mutually_in_range(&wide, &below));
+        assert_eq!(count_in_range(&wide, &[wide, below]), 0);
     }
 
     #[test]
     fn an_empty_queue_counts_zero() {
-        let me = player(1, 1500.0, 95);
+        let me = player(1, 1500.0);
         assert_eq!(count_in_range(&me, &[]), 0);
         assert_eq!(count_in_range(&me, &[me]), 0);
     }

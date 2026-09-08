@@ -22,8 +22,8 @@ use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::model::{
-    QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS, RolePreference,
-    StaffRemoval, VoiceDestination, clamp_down_range,
+    DOWN_RANGE, QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS,
+    RolePreference, StaffRemoval, VoiceDestination, clamp_down_range,
 };
 use super::range::QueuedPlayer;
 
@@ -80,7 +80,7 @@ impl QueueRepository {
             uuid::Uuid::new_v4(),
             player_id.0,
             now,
-            request.down_range,
+            DOWN_RANGE,
         )
         .fetch_one(&mut *tx)
         .await
@@ -121,7 +121,7 @@ impl QueueRepository {
             player_id,
             enqueued_at: entry.enqueued_at,
             updated_at: entry.updated_at,
-            down_range: entry.down_range,
+            down_range: clamp_down_range(entry.down_range),
             roles: request.roles.clone(),
         })
     }
@@ -219,15 +219,12 @@ impl QueueRepository {
         Ok(Some(super::range::count_in_range(me, &queue)))
     }
 
-    /// 未投入時のプレビュー。指定した下方向範囲で相互に成立する人数を返す。
+    /// 未投入時のプレビュー。固定幅（上下 50）で相互に成立する人数を返す。
     ///
-    /// 本人のレートもキュー中のレートも追記ログから毎回導出する。プレビューのために
-    /// `queue_entries` を一時作成したり、現在レートを保存したりしない。
-    pub async fn preview_in_range_count(
-        &self,
-        player_id: PlayerId,
-        down_range: i32,
-    ) -> Result<usize, QueueError> {
+    /// 範囲はユーザーが調整できないので引数に取らない。本人のレートもキュー中のレートも
+    /// 追記ログから毎回導出する。プレビューのために `queue_entries` を一時作成したり、
+    /// 現在レートを保存したりしない。
+    pub async fn preview_in_range_count(&self, player_id: PlayerId) -> Result<usize, QueueError> {
         let queue = self.queued_players().await?;
         let Some(rating) = self.player_rating(player_id).await? else {
             return Err(QueueError::PlayerNotFound(player_id));
@@ -235,7 +232,7 @@ impl QueueRepository {
         let me = QueuedPlayer {
             player_id,
             rating,
-            down_range,
+            down_range: DOWN_RANGE,
         };
         Ok(super::range::count_in_range(&me, &queue))
     }

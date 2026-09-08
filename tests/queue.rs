@@ -7,10 +7,10 @@
 //!
 //! 検証すること:
 //! - 二重キューを `queue_entries.player_id` の unique が拒否する
-//! - 下方向のマッチング範囲が 30〜100 の外なら CHECK が拒否する（旧範囲の値は読み出しで丸める）
+//! - マッチング範囲は上下 50 固定。50 以外の down_range は CHECK が拒否する（旧仕様の値は読み出しで丸める）
 //! - 登録ゲート・進行中ゲート・報告ゲートの拒否が**畳まれず別々に**返る
 //! - 成立済みでまだ始まっていない formation を持つ人はキューに入れない（二重割当を防ぐ）
-//! - 「範囲内で N 人」が**相互条件**で数えられる（片方向なら通ってしまうケースを含む）
+//! - 「範囲内で N 人」が差ちょうど 50 を含めて数えられる（境界は `<=`）
 //! - 既にキュー中なら新規作成ではなく設定の更新。`enqueued_at` は動かない
 //! - 他人のエントリを操作できない
 
@@ -32,7 +32,7 @@ use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerI
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
 };
-use unite_matchsystem::queue::model::{MAX_DOWN_RANGE, QueueRequest, RolePreference};
+use unite_matchsystem::queue::model::{DOWN_RANGE, QueueRequest, RolePreference};
 use unite_matchsystem::queue::{QueueError, QueueRepository, QueueState, router};
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
 use unite_matchsystem::registration::{AuthConfig, NewDeclaration, Rank, RegistrationRepository};
@@ -221,6 +221,11 @@ async fn register(db: &AppDb, player_id: PlayerId, rank: Rank) {
 ///
 /// レートは導出値なので、現在値のテーブルには書かない（書ける列も無い）。
 async fn adjust_rating(db: &AppDb, player_id: PlayerId, delta_mu: f64) {
+    adjust_rating_with_key(db, player_id, delta_mu, "seed").await;
+}
+
+/// 同じプレイヤーに 2 回以上追記する用（冪等キーは追記ごとに変える）。
+async fn adjust_rating_with_key(db: &AppDb, player_id: PlayerId, delta_mu: f64, key: &str) {
     sqlx::query(
         "insert into rating_adjustments \
          (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
@@ -228,7 +233,7 @@ async fn adjust_rating(db: &AppDb, player_id: PlayerId, delta_mu: f64) {
     )
     .bind(player_id.0)
     .bind(delta_mu)
-    .bind(format!("seed-{}", player_id.0))
+    .bind(format!("{key}-{}", player_id.0))
     .execute(&db.pool)
     .await
     .expect("append a rating adjustment");
@@ -346,7 +351,7 @@ async fn a_player_cannot_hold_two_queue_entries(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let me = player(1);
 
-    sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), 95)")
+    sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), 50)")
         .bind(Uuid::new_v4())
         .bind(me.0)
         .execute(&db.pool)
@@ -368,7 +373,7 @@ async fn a_player_cannot_hold_two_queue_entries(owner: PgPool) {
     db.done().await;
 }
 
-/// 下方向のマッチング範囲は 30〜100（07 §3）。CHECK で強制する。
+/// 下方向のマッチング範囲は 50 固定（07 §3）。CHECK で強制する。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
@@ -376,7 +381,7 @@ async fn a_player_cannot_hold_two_queue_entries(owner: PgPool) {
 async fn the_downward_range_is_bounded_by_a_check_constraint(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
 
-    for (index, down_range) in [30, 95, 100].into_iter().enumerate() {
+    for (index, down_range) in [50].into_iter().enumerate() {
         sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), $3)")
             .bind(Uuid::new_v4())
             .bind(player(index as u128 + 1).0)
@@ -386,7 +391,7 @@ async fn the_downward_range_is_bounded_by_a_check_constraint(owner: PgPool) {
             .unwrap_or_else(|error| panic!("{down_range} must be accepted: {error}"));
     }
 
-    for down_range in [29, 101, 200, 0, -1] {
+    for down_range in [30, 49, 51, 95, 100, 200, 0, -1] {
         let error = sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), $3)")
             .bind(Uuid::new_v4())
             .bind(player(9).0)
@@ -412,7 +417,7 @@ async fn the_downward_range_is_bounded_by_a_check_constraint(owner: PgPool) {
 async fn role_preferences_are_unique_per_entry(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let entry = Uuid::new_v4();
-    sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), 95)")
+    sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), 50)")
         .bind(entry)
         .bind(player(1).0)
         .execute(&db.pool)
@@ -478,10 +483,13 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
     let me = player(11);
     register(&db, me, Rank::Legend).await;
 
-    let (status, unqueued) = get_queue_html(&app, me, "/queue?down_range=50").await;
+    let (status, unqueued) = get_queue_html(&app, me, "/queue").await;
     assert_eq!(status, StatusCode::OK);
     assert!(unqueued.contains("data-view=\"unqueued\""), "{unqueued}");
-    assert!(unqueued.contains("value=\"50\""), "{unqueued}");
+    assert!(
+        unqueued.contains("マッチング範囲は上下 ±50 固定です"),
+        "{unqueued}"
+    );
     assert!(unqueued.contains("top_carry"), "{unqueued}");
     assert!(unqueued.contains("document.hidden"), "{unqueued}");
 
@@ -489,7 +497,6 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
         &app,
         me,
         json!({
-            "down_range": 50,
             "roles": [wish("jungle", 1), wish("top_support", 2)]
         }),
     )
@@ -500,7 +507,7 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
     assert!(queued.contains("data-view=\"queued\""), "{queued}");
     assert!(queued.contains("第1希望: 中央"), "{queued}");
     assert!(queued.contains("第2希望: サポート"), "{queued}");
-    assert!(queued.contains("-50"), "{queued}");
+    assert!(queued.contains("上下 ±50（固定）"), "{queued}");
 
     let (status, _) = delete_queue(&app, me).await;
     assert_eq!(status, StatusCode::OK);
@@ -525,7 +532,7 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
 async fn the_registration_and_report_gates_are_reported_separately(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let app = db.router();
-    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+    let body = json!({ "roles": [wish("jungle", 1)] });
 
     // 登録ゲートだけ: ログイン済みだが未登録
     let unregistered = player(1);
@@ -615,7 +622,7 @@ async fn the_registration_and_report_gates_are_reported_separately(owner: PgPool
 async fn a_formation_that_has_not_started_blocks_the_queue(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let app = db.router();
-    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+    let body = json!({ "roles": [wish("jungle", 1)] });
 
     // fixture の players は 1〜12。formation の頭数（2〜10）と重ならない 3 人を用意する
     sqlx::query("insert into players (id, discord_user_id, created_at) values ($1, 1013, now())")
@@ -673,7 +680,7 @@ async fn a_formation_that_has_not_started_blocks_the_queue(owner: PgPool) {
 async fn the_report_gate_takes_over_once_the_match_starts(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let app = db.router();
-    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+    let body = json!({ "roles": [wish("jungle", 1)] });
     let me = player(11);
     register(&db, me, Rank::Legend).await;
 
@@ -737,7 +744,7 @@ async fn a_disabled_report_gate_hands_in_progress_to_the_active_gate(owner: PgPo
     register(&db, me, Rank::Legend).await;
     formation_at(&db, 0xc1, me, Stage::InProgress).await;
 
-    let body = json!({ "down_range": 95, "roles": [wish("jungle", 1)] });
+    let body = json!({ "roles": [wish("jungle", 1)] });
 
     // 通常時: 報告ゲートが塞ぐ
     let (status, denied) = post_queue(&db.router(), me, body.clone()).await;
@@ -802,9 +809,8 @@ async fn joining_reading_and_leaving_the_queue(owner: PgPool) {
     assert_eq!(before["queued"], false);
     assert_eq!(before["entry"], Value::Null);
     assert_eq!(
-        before["in_range"],
-        Value::Null,
-        "the range is the player's own setting, so it is undefined before joining"
+        before["in_range"], 0,
+        "範囲は固定なので、入る前でも人数が決まる"
     );
 
     // 投入
@@ -812,7 +818,6 @@ async fn joining_reading_and_leaving_the_queue(owner: PgPool) {
         &app,
         me,
         json!({
-            "down_range": 50,
             "roles": [wish("jungle", 1), wish("bot_tank", 2)],
         }),
     )
@@ -820,7 +825,7 @@ async fn joining_reading_and_leaving_the_queue(owner: PgPool) {
     assert_eq!(status, StatusCode::OK, "{joined}");
     assert_eq!(joined["queued"], true);
     assert_eq!(joined["entry"]["down_range"], 50);
-    assert_eq!(joined["entry"]["up_range"], 95, "upward range is fixed");
+    assert_eq!(joined["entry"]["up_range"], 50, "upward range is fixed");
     assert_eq!(joined["entry"]["player_id"], me.0.to_string());
     assert_eq!(joined["entry"]["roles"][0]["role"], "jungle");
     assert_eq!(joined["entry"]["roles"][1]["role"], "bot_tank");
@@ -860,17 +865,11 @@ async fn queueing_again_updates_the_settings_without_resetting_the_wait(owner: P
     let me = player(1);
     register(&db, me, Rank::Legend).await;
 
-    let (_, first) = post_queue(
-        &app,
-        me,
-        json!({ "down_range": 95, "roles": [wish("jungle", 1)] }),
-    )
-    .await;
+    let (_, first) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
     let (_, second) = post_queue(
         &app,
         me,
         json!({
-            "down_range": 100,
             "roles": [wish("bot_tank", 1), wish("top_support", 2)],
         }),
     )
@@ -881,7 +880,7 @@ async fn queueing_again_updates_the_settings_without_resetting_the_wait(owner: P
         second["entry"]["enqueued_at"], first["entry"]["enqueued_at"],
         "widening the range must not push the player to the back of the queue"
     );
-    assert_eq!(second["entry"]["down_range"], 100);
+    assert_eq!(second["entry"]["down_range"], 50, "範囲は固定");
     let roles: Vec<&str> = second["entry"]["roles"]
         .as_array()
         .unwrap()
@@ -912,24 +911,21 @@ async fn queueing_again_updates_the_settings_without_resetting_the_wait(owner: P
 async fn a_failed_update_leaves_the_entry_and_its_roles_untouched(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let me = player(1);
-    let request = |down_range: i32, roles: Vec<RolePreference>| QueueRequest { down_range, roles };
+    let request = |roles: Vec<RolePreference>| QueueRequest { roles };
 
     db.queue
         .enqueue(
             me,
-            &request(
-                95,
-                vec![
-                    RolePreference {
-                        role: "jungle".into(),
-                        priority: 1,
-                    },
-                    RolePreference {
-                        role: "bot_tank".into(),
-                        priority: 2,
-                    },
-                ],
-            ),
+            &request(vec![
+                RolePreference {
+                    role: "jungle".into(),
+                    priority: 1,
+                },
+                RolePreference {
+                    role: "bot_tank".into(),
+                    priority: 2,
+                },
+            ]),
             at(0),
         )
         .await
@@ -940,13 +936,10 @@ async fn a_failed_update_leaves_the_entry_and_its_roles_untouched(owner: PgPool)
         .queue
         .enqueue(
             me,
-            &request(
-                100,
-                vec![RolePreference {
-                    role: "midlane".into(),
-                    priority: 1,
-                }],
-            ),
+            &request(vec![RolePreference {
+                role: "midlane".into(),
+                priority: 1,
+            }]),
             at(60),
         )
         .await;
@@ -962,7 +955,7 @@ async fn a_failed_update_leaves_the_entry_and_its_roles_untouched(owner: PgPool)
         .await
         .unwrap()
         .expect("the entry survives");
-    assert_eq!(entry.down_range, 95, "the upsert rolled back too");
+    assert_eq!(entry.down_range, 50, "the upsert rolled back too");
     let roles: Vec<&str> = entry.roles.iter().map(|role| role.role.as_str()).collect();
     assert_eq!(roles, ["jungle", "bot_tank"], "the old wishes are intact");
 
@@ -989,37 +982,24 @@ async fn malformed_settings_are_rejected(owner: PgPool) {
     let app = db.router();
     let me = player(1);
     register(&db, me, Rank::Legend).await;
-
     for (body, expected) in [
-        (
-            json!({ "down_range": 29, "roles": [wish("jungle", 1)] }),
-            "down_range_out_of_bounds",
-        ),
-        (
-            json!({ "down_range": 101, "roles": [wish("jungle", 1)] }),
-            "down_range_out_of_bounds",
-        ),
-        (json!({ "down_range": 95, "roles": [] }), "no_roles"),
+        (json!({ "roles": [] }), "no_roles"),
         (
             json!({
-                "down_range": 95,
                 "roles": [wish("jungle", 1), wish("bot_tank", 2), wish("top_carry", 3), wish("bot_carry", 4)],
             }),
             "too_many_roles",
         ),
         (
-            json!({ "down_range": 95, "roles": [wish("jungle", 1), wish("jungle", 2)] }),
+            json!({ "roles": [wish("jungle", 1), wish("jungle", 2)] }),
             "duplicate_role",
         ),
         (
-            json!({ "down_range": 95, "roles": [wish("jungle", 2)] }),
+            json!({ "roles": [wish("jungle", 2)] }),
             "malformed_priorities",
         ),
         // 存在しないロールは DB の FK が拒否し、それを 400 に写す（一覧を Rust 側に複製しない）
-        (
-            json!({ "down_range": 95, "roles": [wish("midlane", 1)] }),
-            "unknown_role",
-        ),
+        (json!({ "roles": [wish("midlane", 1)] }), "unknown_role"),
     ] {
         let (status, error) = post_queue(&app, me, body.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1046,12 +1026,7 @@ async fn a_session_can_only_touch_its_own_entry(owner: PgPool) {
     register(&db, me, Rank::Legend).await;
     register(&db, someone_else, Rank::Legend).await;
 
-    post_queue(
-        &app,
-        me,
-        json!({ "down_range": 95, "roles": [wish("jungle", 1)] }),
-    )
-    .await;
+    post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
 
     // ボディに他人の player_id を書いても無視される（そもそも読まない）
     let (status, theirs) = post_queue(
@@ -1059,7 +1034,6 @@ async fn a_session_can_only_touch_its_own_entry(owner: PgPool) {
         someone_else,
         json!({
             "player_id": me.0.to_string(),
-            "down_range": 100,
             "roles": [wish("bot_tank", 1)],
         }),
     )
@@ -1069,7 +1043,7 @@ async fn a_session_can_only_touch_its_own_entry(owner: PgPool) {
 
     // 私のエントリは無傷
     let mine = db.queue.find(me).await.unwrap().expect("still queued");
-    assert_eq!(mine.down_range, 95);
+    assert_eq!(mine.down_range, 50);
     assert_eq!(mine.roles[0].role, "jungle");
 
     // 他人が離脱しても私は残る
@@ -1088,64 +1062,53 @@ async fn a_session_can_only_touch_its_own_entry(owner: PgPool) {
 // 「範囲内で N 人」
 // ----------------------------------------------------------------------
 
-/// **相互条件で数える**（07 §3-1）。片方向なら通ってしまうケースを含む。
+/// **境界の実測を DB 経由で。**上下 50 固定・seed の差 100 の噛み合わせ。
+///
+/// 1500 / 1550 / 1600 を並べ、画面に出る「範囲内でキュー中: N人」を三者から数える。
+/// 差ちょうど 50 が組める側であること（比較が `<=`）を HTTP の応答で確かめる。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
-async fn the_in_range_count_requires_both_directions(owner: PgPool) {
+async fn exactly_fifty_apart_counts_but_one_hundred_does_not(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let app = db.router();
 
     // レートは導出値。rating_adjustments への追記で作る（表示スケール、既定は 1500）
-    let wide = player(1); // 1600、下方向 100 まで広げた
-    let below = player(2); // 1500、下方向は既定の 95
-    let near = player(3); // 1520、下方向は既定の 95
-    adjust_rating(&db, wide, 100.0).await;
-    adjust_rating(&db, below, 0.0).await;
-    adjust_rating(&db, near, 20.0).await;
-    for (who, down_range) in [(wide, 100), (below, 95), (near, 95)] {
+    let high = player(1); // 1600
+    let middle = player(2); // 1550
+    let low = player(3); // 1500
+    adjust_rating(&db, high, 100.0).await;
+    adjust_rating(&db, middle, 50.0).await;
+    adjust_rating(&db, low, 0.0).await;
+    for who in [high, middle, low] {
         register(&db, who, Rank::Legend).await;
-        let (status, _) = post_queue(
-            &app,
-            who,
-            json!({ "down_range": down_range, "roles": [wish("jungle", 1)] }),
-        )
-        .await;
+        let (status, _) = post_queue(&app, who, json!({ "roles": [wish("jungle", 1)] })).await;
         assert_eq!(status, StatusCode::OK);
     }
 
-    // wide から見れば below は下方向 100 の内（1600 - 100 = 1500 ≦ 1500）。
-    // だが below から見ると wide は上方向 +95 の外（1500 + 95 = 1595 < 1600）。
-    // 片方向で数えると 2 になるところを、相互条件では 1 にしなければならない。
-    let (status, status_body) = get_queue(&app, Some(wide)).await;
+    // 1600 から見えるのは 1550 だけ（1500 とは差 100）
+    let (status, from_high) = get_queue(&app, Some(high)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        status_body["in_range"], 1,
-        "only the player who also accepts us counts: {status_body}"
-    );
-
-    // 相互条件は対称。below から見ても wide は数えない（near だけ）
-    let (_, from_below) = get_queue(&app, Some(below)).await;
-    assert_eq!(from_below["in_range"], 1, "{from_below}");
-    // near は両方と両立する
-    let (_, from_near) = get_queue(&app, Some(near)).await;
-    assert_eq!(from_near["in_range"], 2, "{from_near}");
+    assert_eq!(from_high["in_range"], 1, "{from_high}");
+    // 1500 から見えるのも 1550 だけ
+    let (_, from_low) = get_queue(&app, Some(low)).await;
+    assert_eq!(from_low["in_range"], 1, "{from_low}");
+    // 1550 からは両方が見える（どちらも差ちょうど 50）
+    let (_, from_middle) = get_queue(&app, Some(middle)).await;
+    assert_eq!(from_middle["in_range"], 2, "{from_middle}");
 
     // 自分自身は数えない
-    assert_eq!(db.queue.in_range_count(wide).await.unwrap(), Some(1));
+    assert_eq!(db.queue.in_range_count(high).await.unwrap(), Some(1));
 
-    // below が下方向を広げても、上方向 +95 は固定なので wide とは両立しない
-    post_queue(
-        &app,
-        below,
-        json!({ "down_range": 100, "roles": [wish("jungle", 1)] }),
-    )
-    .await;
-    let (_, still) = get_queue(&app, Some(wide)).await;
+    // 1 だけ動かして 1551 にすると、1500 からは外れる（差 51）
+    adjust_rating_with_key(&db, middle, 1.0, "nudge").await;
+    let (_, nudged) = get_queue(&app, Some(low)).await;
+    assert_eq!(nudged["in_range"], 0, "差 51 は範囲外: {nudged}");
+    let (_, still_high) = get_queue(&app, Some(high)).await;
     assert_eq!(
-        still["in_range"], 1,
-        "the upward cap cannot be widened by either side: {still}"
+        still_high["in_range"], 1,
+        "1600 から 1551 は差 49: {still_high}"
     );
 
     db.done().await;
@@ -1218,7 +1181,7 @@ async fn the_queue_page_carries_the_shared_header(owner: PgPool) {
 ///
 /// 新しい CHECK は `not valid` で足してあるので、既存の違反行はそのまま残る。
 /// 残った値をそのままマッチングに使うと、本人が設定できない広さで組まれてしまうため、
-/// 読み出し側（`queue::model::clamp_down_range`）が 100 に丸める。
+/// 読み出し側（`queue::model::clamp_down_range`）が 50 に丸める。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
@@ -1266,25 +1229,20 @@ async fn a_legacy_entry_outside_the_new_range_is_clamped_on_read(owner: PgPool) 
 
     // 読み出しはどの経路でも丸まる
     let entry = db.queue.find(me).await.unwrap().expect("queued");
-    assert_eq!(entry.down_range, MAX_DOWN_RANGE, "自分のエントリ");
+    assert_eq!(entry.down_range, DOWN_RANGE, "自分のエントリ");
     let queue = db.queue.queued_players().await.unwrap();
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].down_range, MAX_DOWN_RANGE, "範囲判定の入力");
+    assert_eq!(queue[0].down_range, DOWN_RANGE, "範囲判定の入力");
 
     // 画面（JSON）にも丸めた値が出る
     let app = db.router();
     let (status, body) = get_queue(&app, Some(me)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["entry"]["down_range"], 100, "{body}");
-    assert_eq!(body["entry"]["up_range"], 95, "上方向は固定のまま: {body}");
+    assert_eq!(body["entry"]["down_range"], 50, "{body}");
+    assert_eq!(body["entry"]["up_range"], 50, "上方向も 50 固定: {body}");
 
     // 本人が入れ直せば、新しい範囲の値で上書きされる（違反行は残り続けない）
-    let (status, joined) = post_queue(
-        &app,
-        me,
-        json!({ "down_range": 95, "roles": [wish("jungle", 1)] }),
-    )
-    .await;
+    let (status, joined) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
     assert_eq!(status, StatusCode::OK, "{joined}");
     let stored: i32 =
         sqlx::query_scalar("select down_range from queue_entries where player_id = $1")
@@ -1292,7 +1250,7 @@ async fn a_legacy_entry_outside_the_new_range_is_clamped_on_read(owner: PgPool) 
             .fetch_one(&owner)
             .await
             .unwrap();
-    assert_eq!(stored, 95);
+    assert_eq!(stored, 50);
 
     db.done().await;
 }
@@ -1315,12 +1273,7 @@ async fn widening_past_the_upward_cap_does_not_add_candidates(owner: PgPool) {
     for who in [me, far] {
         register(&db, who, Rank::Legend).await;
     }
-    let (status, _) = post_queue(
-        &app,
-        far,
-        json!({ "down_range": 95, "roles": [wish("jungle", 1)] }),
-    )
-    .await;
+    let (status, _) = post_queue(&app, far, json!({ "roles": [wish("jungle", 1)] })).await;
     assert_eq!(status, StatusCode::OK);
 
     // 下方向を 95 → 100 に広げても、far は上方向 +95 の外（1502 + 95 = 1597 < 1600）

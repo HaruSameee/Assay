@@ -163,7 +163,6 @@ async fn enqueue(db: &AppDb, who: PlayerId, role: &str) {
         .enqueue(
             who,
             &QueueRequest {
-                down_range: 95,
                 roles: vec![RolePreference {
                     role: role.to_owned(),
                     priority: 1,

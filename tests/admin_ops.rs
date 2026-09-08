@@ -273,7 +273,6 @@ async fn enqueue(db: &AppDb, who: PlayerId, role: &str, enqueued_at: Timestamp) 
         .enqueue(
             who,
             &QueueRequest {
-                down_range: 95,
                 roles: vec![RolePreference {
                     role: role.to_owned(),
                     priority: 1,
@@ -516,7 +515,7 @@ async fn the_queue_screen_lists_the_players_with_their_settings(owner: PgPool) {
     assert!(page.contains("キュー中（1人）"), "{page}");
     assert!(page.contains("トレーナー2"));
     assert!(page.contains("1. 中央"), "ロール希望を表示名で出す");
-    assert!(page.contains(">-95</td>"), "下方向の範囲");
+    assert!(page.contains(">-50</td>"), "下方向の範囲（50 固定）");
     assert!(page.contains(">1600</td>"), "調整が乗ったレート");
     assert!(page.contains("action=\"/admin/queue/remove\""));
     db.done().await;

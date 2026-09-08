@@ -14,7 +14,7 @@
 //! CSRF: セッション Cookie は `SameSite=Lax` なので、他サイトからの POST / DELETE には
 //! 送られない。登録トラックのフォームと同じ前提に拠る。
 
-use axum::extract::{FromRef, Query, State};
+use axum::extract::{FromRef, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -35,8 +35,8 @@ use crate::registration::{
 };
 
 use super::model::{
-    DEFAULT_DOWN_RANGE, QueueEntry, QueueRequestError, RolePreference, StaffRemoval, UP_RANGE,
-    VoiceDestination, validate_down_range, validate_request,
+    QueueEntry, QueueRequestError, RolePreference, StaffRemoval, UP_RANGE, VoiceDestination,
+    validate_request,
 };
 use super::repository::{QueueError, QueueRepository};
 
@@ -108,26 +108,14 @@ pub fn router(state: QueueState) -> Router {
 // 表現（DTO）
 // ----------------------------------------------------------------------
 
-/// 投入リクエスト。**`player_id` は受け取らない**（セッションから取る）。
+/// 投入リクエスト。**マッチング範囲は受け取らない**（上下 50 固定）。
+///
+/// 古い画面が `down_range` を送ってきても、未知のフィールドとして無視される。
 #[derive(Debug, Deserialize)]
 struct JoinRequest {
-    /// 下方向のマッチング範囲。省略時は既定（95）。上方向は固定なので受け取らない。
-    #[serde(default = "default_down_range")]
-    down_range: i32,
     /// 希望ロール。1〜3、優先度付き。
     #[serde(default)]
     roles: Vec<RolePreference>,
-}
-
-/// 未投入時の人数プレビュー。
-#[derive(Debug, Default, Deserialize)]
-struct ShowQuery {
-    /// 指定があると、その下方向範囲で人数を数えて JSON を返す。
-    down_range: Option<i32>,
-}
-
-fn default_down_range() -> i32 {
-    DEFAULT_DOWN_RANGE
 }
 
 /// 登録ゲートの理由。**報告ゲートとは別のフィールドで返す。**
@@ -227,7 +215,7 @@ pub(super) struct StatusView {
     pub(super) entry: Option<EntryView>,
     /// 自分の範囲内でキュー中の人数（相互条件、07 §3-1）。
     ///
-    /// 範囲は本人の設定なので、キューに入る前は決まらない。そのときは `null`。
+    /// 範囲は上下 50 固定なので、キューに入る前でも決まる（読み取りに失敗したときだけ `null`）。
     pub(super) in_range: Option<usize>,
     /// 3つのゲートの現在の状態。キュー中でも進行中・報告ゲートは後から立ちうる。
     pub(super) eligibility: EligibilityView,
@@ -286,7 +274,6 @@ impl From<VoiceDestination> for DestinationView {
 async fn show_queue(
     State(app): State<QueueState>,
     session: Option<CurrentSession>,
-    Query(query): Query<ShowQuery>,
     headers: HeaderMap,
 ) -> Response {
     let html = accepts_html(&headers);
@@ -305,22 +292,15 @@ async fn show_queue(
             unauthenticated()
         };
     };
-    let preview_down_range = query
-        .down_range
-        .or_else(|| html.then_some(DEFAULT_DOWN_RANGE));
-    if let Some(down_range) = preview_down_range
-        && let Err(error) = validate_down_range(down_range)
-    {
-        return invalid_request(&error);
-    }
-    match status(&app, player_id, preview_down_range).await {
+    // 範囲は固定なので、未投入時の人数プレビューに指定するものが無い。画面（HTML）を
+    // 開いたときだけ数える（JSON のポーリングは投入前の人数を要求しない）
+    match status(&app, player_id).await {
         Some(status) if html => (
             StatusCode::OK,
             Html(super::html::queue_page(
                 // ヘッダーの描画にだけ必要。ポーリングされる JSON 側では引かない
                 viewer(&app, player_id).await,
                 &status,
-                preview_down_range.unwrap_or(DEFAULT_DOWN_RANGE),
                 Utc::now(),
             )),
         )
@@ -355,7 +335,7 @@ async fn join_queue(
     };
 
     // 検証は DB を触る前に済ませる（純粋関数）
-    let validated = match validate_request(request.down_range, &request.roles) {
+    let validated = match validate_request(&request.roles) {
         Ok(validated) => validated,
         Err(error) => return invalid_request(&error),
     };
@@ -396,7 +376,7 @@ async fn join_queue(
         }
     }
 
-    match status(&app, player_id, None).await {
+    match status(&app, player_id).await {
         Some(status) => (StatusCode::OK, Json(status)).into_response(),
         None => internal_error(),
     }
@@ -432,26 +412,18 @@ fn player(session: Option<CurrentSession>) -> Option<PlayerId> {
 
 /// 状態を組み立てる。
 /// 失敗の詳細はログにだけ残し、呼び出し側は 500 を返す。
-async fn status(
-    app: &QueueState,
-    player_id: PlayerId,
-    preview_down_range: Option<i32>,
-) -> Option<StatusView> {
+async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
     let entry = app
         .queue
         .find(player_id)
         .await
         .inspect_err(|error| error!(%error, "could not read the queue entry"))
         .ok()?;
+    // 範囲は固定なので、キューに入る前でも人数が決まる（旧仕様の「プレビュー」は不要）
     let in_range = if entry.is_some() {
         app.queue.in_range_count(player_id).await
-    } else if let Some(down_range) = preview_down_range {
-        app.queue
-            .preview_in_range_count(player_id, down_range)
-            .await
-            .map(Some)
     } else {
-        Ok(None)
+        app.queue.preview_in_range_count(player_id).await.map(Some)
     }
     .inspect_err(|error| error!(%error, "could not count the players in range"))
     .ok()?;
@@ -523,7 +495,6 @@ fn bad_request(code: &'static str, message: &str) -> Response {
 /// 検証エラー。**送られてきた設定値は返してよい**（本人が送った値で、秘密ではない）。
 fn invalid_request(error: &QueueRequestError) -> Response {
     let code = match error {
-        QueueRequestError::DownRangeOutOfBounds(_) => "down_range_out_of_bounds",
         QueueRequestError::NoRoles => "no_roles",
         QueueRequestError::TooManyRoles(_) => "too_many_roles",
         QueueRequestError::DuplicateRole(_) => "duplicate_role",

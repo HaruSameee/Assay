@@ -6,7 +6,7 @@ use crate::lifecycle::Timestamp;
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
 
-use super::model::{DEFAULT_DOWN_RANGE, MAX_DOWN_RANGE, MIN_DOWN_RANGE, UP_RANGE};
+use super::model::UP_RANGE;
 use super::routes::{EntryView, RegistrationBlockView, StatusView};
 
 const QUEUE_STYLES: &str = r#"
@@ -15,8 +15,6 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 legend { padding: 0; font-weight: 700; }
 .role-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .role-grid .field { min-width: 0; margin-bottom: 18px; }
-.range-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; }
-.range-value { min-width: 5.5rem; color: var(--text); font-size: 1.15rem; font-weight: 750; text-align: right; }
 .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin: 28px 0; background: var(--border); border: 1px solid var(--border); }
 .metric { min-width: 0; padding: 18px; background: var(--surface); }
 .metric-label { display: block; margin-bottom: 3px; color: var(--muted); font-size: 0.82rem; }
@@ -43,12 +41,9 @@ legend { padding: 0; font-weight: 700; }
 .poll-status { min-height: 1.5em; margin-top: 14px; color: var(--danger); font-size: 0.875rem; }
 .button-danger { border-color: #7e3d43; background: transparent; color: var(--danger); }
 .button-danger:hover { border-color: var(--danger); background: var(--danger-bg); }
-input[type="range"] { min-height: 40px; padding: 0; accent-color: var(--accent); }
 @media (max-width: 600px) {
   .role-grid { grid-template-columns: 1fr; gap: 0; }
   .metrics { grid-template-columns: 1fr; }
-  .range-row { grid-template-columns: 1fr; gap: 4px; }
-  .range-value { text-align: left; }
 }
 "#;
 
@@ -67,12 +62,7 @@ const ROLE_OPTIONS: [(&str, &str); 5] = [
     ("bot_tank", "タンク"),
 ];
 
-pub(super) fn queue_page(
-    viewer: Viewer,
-    status: &StatusView,
-    preview_down_range: i32,
-    now: Timestamp,
-) -> String {
+pub(super) fn queue_page(viewer: Viewer, status: &StatusView, now: Timestamp) -> String {
     if status.eligibility.registration.is_some()
         || status.eligibility.active_formation.is_some()
         || !status.eligibility.pending_reports.is_empty()
@@ -81,7 +71,7 @@ pub(super) fn queue_page(
     } else if let Some(entry) = &status.entry {
         queued_page(viewer, status, entry, now)
     } else {
-        unqueued_page(viewer, status, preview_down_range)
+        unqueued_page(viewer, status)
     }
 }
 
@@ -100,7 +90,7 @@ fn role_options(selected: Option<&str>) -> String {
     output
 }
 
-fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String {
+fn unqueued_page(viewer: Viewer, status: &StatusView) -> String {
     let in_range = status.in_range.unwrap_or(0);
     let first = role_options(None);
     let second = role_options(None);
@@ -109,7 +99,7 @@ fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String
         "<section id=\"queue-app\" data-view=\"unqueued\" aria-labelledby=\"queue-title\">\n\
          <div class=\"form-header\">\n<p class=\"eyebrow\">Match queue</p>\n\
          <h1 id=\"queue-title\">キューに参加</h1>\n\
-         <p class=\"lead\">希望ロールと、受け入れる下方向のレート範囲を選びます。</p>\n</div>\n\
+         <p class=\"lead\">希望ロールを選びます。</p>\n</div>\n\
          {removal}\
          <form id=\"queue-form\" class=\"queue-form\" novalidate>\n\
          <fieldset class=\"field\"><legend>ロール希望</legend>\n\
@@ -119,20 +109,13 @@ fn unqueued_page(viewer: Viewer, status: &StatusView, down_range: i32) -> String
          <div class=\"field\"><label for=\"role-2\">第2希望</label>\n<select id=\"role-2\">{second}</select></div>\n\
          <div class=\"field\"><label for=\"role-3\">第3希望</label>\n<select id=\"role-3\" disabled>{third}</select></div>\n\
          </div>\n</fieldset>\n\
-         <div class=\"field\">\n<label for=\"down-range\">下方向のレート範囲</label>\n\
-         <div class=\"range-row\"><input id=\"down-range\" type=\"range\" min=\"{min}\" max=\"{max}\" value=\"{down_range}\">\n\
-         <output id=\"down-range-value\" class=\"range-value\" for=\"down-range\">-{down_range}</output></div>\n\
-         <p class=\"field-help\">上方向は +{up} 固定で、変更できません。下方向のみ -{min} から -{max} の範囲で調整できます（既定は -{default}）。\
-         上方向が +{up} で頭を押さえているため、-{up} より広げても組める相手は増えません。</p>\n</div>\n\
-         <div class=\"notice\" aria-live=\"polite\"><p>現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p></div>\n\
+         <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上下 ±{range} 固定です。\
+         現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p></div>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button type=\"submit\">キューに入る</button></div>\n\
          </form>\n<p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
-        min = MIN_DOWN_RANGE,
-        up = UP_RANGE,
-        default = DEFAULT_DOWN_RANGE,
-        max = MAX_DOWN_RANGE,
+        range = UP_RANGE,
         removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
     );
@@ -186,14 +169,13 @@ fn queued_page(viewer: Viewer, status: &StatusView, entry: &EntryView, now: Time
          <div class=\"metric\"><span class=\"metric-label\">範囲内でキュー中</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
          <dl class=\"details\"><div><dt>ロール希望</dt><dd><ol class=\"role-preferences\">{roles}</ol></dd></div>\n\
-         <div><dt>レート範囲</dt><dd>上方向 +{up_range} / 下方向 -{down_range}</dd></div></dl></section>\n\
+         <div><dt>レート範囲</dt><dd>上下 ±{up_range}（固定）</dd></div></dl></section>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button id=\"leave-queue\" class=\"button-danger\" type=\"button\">キューを離脱</button></div>\n\
          <p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
         enqueued = escape(&entry.enqueued_at),
         up_range = entry.up_range,
-        down_range = entry.down_range,
         script = QUEUED_SCRIPT,
     );
     page_with_styles(viewer, "キュー参加中", &body, QUEUE_STYLES)
@@ -316,13 +298,10 @@ fn format_wait(now: Timestamp, enqueued_at: &str) -> String {
 const UNQUEUED_SCRIPT: &str = r#"
 (() => {
   const form = document.getElementById('queue-form');
-  const range = document.getElementById('down-range');
-  const rangeValue = document.getElementById('down-range-value');
   const inRange = document.getElementById('in-range');
   const pollStatus = document.getElementById('poll-status');
   const errorBox = document.getElementById('queue-error');
   const roles = [1, 2, 3].map((n) => document.getElementById(`role-${n}`));
-  let previewTimer;
 
   const blocked = (state) => state.eligibility.registration !== null ||
     state.eligibility.active_formation !== null || state.eligibility.pending_reports.length > 0;
@@ -344,9 +323,7 @@ const UNQUEUED_SCRIPT: &str = r#"
   const preview = async () => {
     if (document.hidden) return;
     try {
-      const response = await fetch(`/queue?down_range=${encodeURIComponent(range.value)}`, {
-        headers: { Accept: 'application/json' }
-      });
+      const response = await fetch('/queue', { headers: { Accept: 'application/json' } });
       if (!response.ok) throw new Error('preview failed');
       const state = await response.json();
       if (blocked(state) || state.queued) return window.location.reload();
@@ -356,11 +333,6 @@ const UNQUEUED_SCRIPT: &str = r#"
       pollStatus.textContent = '人数を更新できませんでした。次の更新を待っています。';
     }
   };
-  range.addEventListener('input', () => {
-    rangeValue.textContent = `-${range.value}`;
-    clearTimeout(previewTimer);
-    previewTimer = setTimeout(preview, 250);
-  });
   for (const select of roles) select.addEventListener('change', () => refreshRoles(select));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -373,7 +345,7 @@ const UNQUEUED_SCRIPT: &str = r#"
       const response = await fetch('/queue', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ down_range: Number(range.value), roles: preferences })
+        body: JSON.stringify({ roles: preferences })
       });
       const result = await response.json();
       if (response.status === 403) return window.location.reload();
@@ -495,15 +467,15 @@ mod tests {
 
     #[test]
     fn the_unqueued_page_has_all_roles_range_and_resilient_polling() {
-        let rendered = queue_page(Viewer::MEMBER, &status(), 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now());
         for (role, label) in ROLE_OPTIONS {
             assert!(rendered.contains(&format!("value=\"{role}\"")));
             assert!(rendered.contains(label));
         }
-        assert!(rendered.contains("min=\"30\" max=\"100\""));
-        assert!(rendered.contains("value=\"95\""), "既定は -95");
-        assert!(rendered.contains("-95 より広げても組める相手は増えません"));
-        assert!(rendered.contains("上方向は +95 固定"));
+        // 調整UIは無い。範囲は固定であることだけを書く
+        assert!(!rendered.contains("type=\"range\""), "スライダーを出さない");
+        assert!(!rendered.contains("down-range"), "{rendered}");
+        assert!(rendered.contains("マッチング範囲は上下 ±50 固定です"));
         assert!(rendered.contains("現在この範囲内でキュー中"));
         assert!(rendered.contains("document.hidden"));
         assert!(rendered.contains("setInterval(preview, 10000)"));
@@ -518,8 +490,8 @@ mod tests {
             player_id: Uuid::from_u128(2),
             enqueued_at: "2026-09-12T12:00:00+00:00".into(),
             updated_at: "2026-09-12T12:00:00+00:00".into(),
-            down_range: 150,
-            up_range: 95,
+            down_range: 50,
+            up_range: 50,
             roles: vec![RolePreference {
                 role: "jungle".into(),
                 priority: 1,
@@ -528,12 +500,11 @@ mod tests {
         let rendered = queue_page(
             Viewer::MEMBER,
             &queued,
-            95,
             Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap(),
         );
         assert!(rendered.contains("02:03"));
         assert!(rendered.contains("第1希望: 中央"));
-        assert!(rendered.contains("上方向 +95 / 下方向 -150"));
+        assert!(rendered.contains("上下 ±50（固定）"));
         assert!(rendered.contains("キューを離脱"));
         assert!(rendered.contains("setInterval(poll, 10000)"));
     }
@@ -556,7 +527,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(Viewer::MEMBER, &blocked, 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &blocked, Utc::now());
         for gate in ["registration", "active_formation", "pending_reports"] {
             assert!(rendered.contains(&format!("data-gate=\"{gate}\"")));
         }
@@ -576,7 +547,7 @@ mod tests {
             channel_name: "vc3-red".into(),
             channel_id: "123".into(),
         });
-        let rendered = queue_page(Viewer::MEMBER, &matched, 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &matched, Utc::now());
         assert!(rendered.contains("class=\"matched\""), "{rendered}");
         // ゲートの側は一切変えていない
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -591,7 +562,7 @@ mod tests {
         // 成立していないブロックは従来どおり
         let mut plain = status();
         plain.eligibility.pending_reports = vec![Uuid::from_u128(9)];
-        let rendered = queue_page(Viewer::MEMBER, &plain, 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &plain, Utc::now());
         assert!(!rendered.contains("class=\"matched\""));
         assert!(rendered.contains("現在止まっている条件"));
         assert!(rendered.contains("data-view=\"blocked\""));
@@ -609,8 +580,8 @@ mod tests {
             player_id: Uuid::from_u128(2),
             enqueued_at: "2026-09-12T12:00:00+00:00".into(),
             updated_at: "2026-09-12T12:00:00+00:00".into(),
-            down_range: 95,
-            up_range: 95,
+            down_range: 50,
+            up_range: 50,
             roles: ROLE_OPTIONS
                 .iter()
                 .enumerate()
@@ -620,8 +591,8 @@ mod tests {
                 })
                 .collect(),
         });
-        let selecting = queue_page(Viewer::MEMBER, &status(), 95, Utc::now());
-        let selected = queue_page(Viewer::MEMBER, &queued, 95, Utc::now());
+        let selecting = queue_page(Viewer::MEMBER, &status(), Utc::now());
+        let selected = queue_page(Viewer::MEMBER, &queued, Utc::now());
         for (role, label) in ROLE_OPTIONS {
             // 選ぶ側は日本語のラベル。識別子は value 属性の中だけ
             assert!(
@@ -670,7 +641,7 @@ mod tests {
 
     #[test]
     fn mobile_layout_is_explicit() {
-        let rendered = queue_page(Viewer::MEMBER, &status(), 95, Utc::now());
+        let rendered = queue_page(Viewer::MEMBER, &status(), Utc::now());
         assert!(rendered.contains("@media (max-width: 600px)"));
         assert!(rendered.contains(".role-grid { grid-template-columns: 1fr"));
     }
@@ -689,8 +660,8 @@ mod tests {
             player_id: Uuid::from_u128(2),
             enqueued_at: "2026-09-12T12:00:00+00:00".into(),
             updated_at: "2026-09-12T12:00:00+00:00".into(),
-            down_range: 95,
-            up_range: 95,
+            down_range: 50,
+            up_range: 50,
             roles: vec![RolePreference {
                 role: "jungle".into(),
                 priority: 1,
@@ -707,16 +678,16 @@ mod tests {
              <button type=\"submit\">ログアウト</button></form>\n\
              </nav>\n</header>\n";
         for rendered in [
-            queue_page(Viewer::MEMBER, &status(), 95, now),
-            queue_page(Viewer::MEMBER, &queued, 95, now),
-            queue_page(Viewer::MEMBER, &blocked, 95, now),
+            queue_page(Viewer::MEMBER, &status(), now),
+            queue_page(Viewer::MEMBER, &queued, now),
+            queue_page(Viewer::MEMBER, &blocked, now),
         ] {
             assert!(rendered.contains(expected), "{rendered}");
             // 非管理者にパネルの存在を知らせない
             assert!(!rendered.contains("href=\"/admin\""), "{rendered}");
         }
         // 管理者にはヘッダーにだけ管理リンクが増える
-        let admin = queue_page(Viewer::ADMIN, &status(), 95, now);
+        let admin = queue_page(Viewer::ADMIN, &status(), now);
         assert!(admin.contains("<a href=\"/admin\">管理</a>"), "{admin}");
     }
 
@@ -729,7 +700,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
 
         println!("========== 1. 未投入 (data-view=unqueued) ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &status(), 150, now));
+        println!("{}", queue_page(Viewer::MEMBER, &status(), now));
 
         let mut queued = status();
         queued.queued = true;
@@ -738,8 +709,8 @@ mod tests {
             player_id: Uuid::from_u128(2),
             enqueued_at: "2026-09-12T12:00:00+00:00".into(),
             updated_at: "2026-09-12T12:00:00+00:00".into(),
-            down_range: 150,
-            up_range: 95,
+            down_range: 50,
+            up_range: 50,
             roles: vec![
                 RolePreference {
                     role: "jungle".into(),
@@ -752,7 +723,7 @@ mod tests {
             ],
         });
         println!("========== 2. キュー中 (data-view=queued) ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &queued, 95, now));
+        println!("{}", queue_page(Viewer::MEMBER, &queued, now));
 
         let mut matched = status();
         matched.eligibility.active_formation = Some(Uuid::from_u128(8));
@@ -763,7 +734,7 @@ mod tests {
             channel_id: "123".into(),
         });
         println!("========== 3. マッチ成立 ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &matched, 95, now));
+        println!("{}", queue_page(Viewer::MEMBER, &matched, now));
 
         let mut blocked = status();
         blocked.eligibility = EligibilityView {
@@ -776,6 +747,6 @@ mod tests {
             pending_reports: vec![Uuid::from_u128(9)],
         };
         println!("========== 4. ゲートで停止 ==========");
-        println!("{}", queue_page(Viewer::MEMBER, &blocked, 95, now));
+        println!("{}", queue_page(Viewer::MEMBER, &blocked, now));
     }
 }

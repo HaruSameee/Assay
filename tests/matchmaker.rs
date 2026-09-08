@@ -110,6 +110,11 @@ async fn seed_players(db: &AppDb, count: u128) {
 
 /// 表示スケールのレートを `rating_adjustments` への追記で作る。
 async fn adjust_rating(db: &AppDb, who: PlayerId, delta_mu: f64) {
+    adjust_rating_with_key(db, who, delta_mu, "seed").await;
+}
+
+/// 同じプレイヤーに 2 回以上追記する用（冪等キーは追記ごとに変える）。
+async fn adjust_rating_with_key(db: &AppDb, who: PlayerId, delta_mu: f64, key: &str) {
     sqlx::query(
         "insert into rating_adjustments \
          (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
@@ -117,7 +122,7 @@ async fn adjust_rating(db: &AppDb, who: PlayerId, delta_mu: f64) {
     )
     .bind(who.0)
     .bind(delta_mu)
-    .bind(format!("seed-{}", who.0))
+    .bind(format!("{key}-{}", who.0))
     .execute(&db.pool)
     .await
     .expect("append a rating adjustment");
@@ -131,7 +136,6 @@ async fn enqueue_full_rosters(db: &AppDb, count: u128, enqueued_at: Timestamp) {
             .enqueue(
                 player(n),
                 &QueueRequest {
-                    down_range: 95,
                     roles: vec![RolePreference {
                         role: role.to_owned(),
                         priority: 1,
@@ -375,7 +379,6 @@ async fn summary_uses_the_persisted_queue_and_last_fifteen_minutes(owner: PgPool
             .enqueue(
                 player(number),
                 &QueueRequest {
-                    down_range: 95,
                     roles: vec![RolePreference {
                         role: role.to_owned(),
                         priority: 1,
@@ -419,7 +422,6 @@ async fn summary_includes_operational_state_and_recent_outcomes(owner: PgPool) {
             .enqueue(
                 player(number),
                 &QueueRequest {
-                    down_range: 95,
                     roles: vec![RolePreference {
                         role: role.to_owned(),
                         priority: 1,
@@ -663,7 +665,6 @@ async fn flex_compensation_is_derived_from_the_last_formation(owner: PgPool) {
             .enqueue(
                 player(n),
                 &QueueRequest {
-                    down_range: 95,
                     roles: roles
                         .iter()
                         .enumerate()
@@ -705,11 +706,15 @@ async fn flex_compensation_is_derived_from_the_last_formation(owner: PgPool) {
 // レート範囲（07 §3-1）を DB 経由で
 // ----------------------------------------------------------------------
 
-/// レートは `rating_adjustments` から導出される。差 100 のプールは混ざらない。
+/// **1600 と 1500 は同じ formation に入らない。**seed の差 100 が窓 50 を超えるため。
+///
+/// レートは `rating_adjustments` から導出される（現在値のテーブルは無い）ので、
+/// ここは「調整ログ → 導出 → 選択 → 凍結値」の経路をまとめて通す。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn the_two_starting_pools_do_not_mix_through_the_database(owner: PgPool) {
+async fn the_two_starting_pools_never_share_a_formation(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 10).await;
+    // 1〜5 が 1600、6〜10 が 1500
     for n in 1..=5u128 {
         adjust_rating(&db, player(n), 100.0).await;
     }
@@ -718,16 +723,36 @@ async fn the_two_starting_pools_do_not_mix_through_the_database(owner: PgPool) {
     let outcome = db.matchmaker(2).run_once(at(600)).await.unwrap();
     assert!(
         outcome.created.is_empty(),
-        "1500 and 1600 are 100 apart: {outcome:?}"
+        "1500 と 1600 は差 100 で窓 50 の外: {outcome:?}"
     );
-    assert_eq!(count(&db, "queue_entries").await, 10);
+    assert_eq!(count(&db, "queue_entries").await, 10, "全員キューに残る");
+    assert_eq!(count(&db, "formation_players").await, 0);
 
-    // 1 勝ぶん（+11）で 1511 になれば 1600 と組める
+    // 1 勝ぶん（+7）では届かない。1507 と 1600 は差 93
     for n in 6..=10u128 {
-        adjust_rating(&db, player(n), 11.0).await;
+        adjust_rating_with_key(&db, player(n), 7.0, "one-win").await;
     }
     let outcome = db.matchmaker(2).run_once(at(600)).await.unwrap();
-    assert_eq!(outcome.created.len(), 1, "1511 and 1600 are 89 apart");
+    assert!(
+        outcome.created.is_empty(),
+        "1507 と 1600 は差 93 でまだ組めない: {outcome:?}"
+    );
+
+    // 合計 +50 で 1550。1600 との差はちょうど 50 なので**組める**（境界は含む）
+    for n in 6..=10u128 {
+        adjust_rating_with_key(&db, player(n), 43.0, "up-to-1550").await;
+    }
+    let outcome = db.matchmaker(2).run_once(at(600)).await.unwrap();
+    assert_eq!(outcome.created.len(), 1, "1550 と 1600 は差ちょうど 50");
     assert_eq!(count(&db, "queue_entries").await, 0);
+
+    // 凍結値でも幅 50 に収まっている
+    let span: f64 = sqlx::query_scalar(
+        "select (max(mu_at_match) - min(mu_at_match)) * 60.0 from formation_players",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!((span - 50.0).abs() < 1e-9, "span = {span}");
     db.done().await;
 }

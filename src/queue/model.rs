@@ -1,13 +1,12 @@
 //! キューの型と、投入リクエストの検証（純粋関数）。
 //!
-//! マッチング範囲の値は 07-マッチング仕様 §3 に従う。**上方向は +95 固定**で
-//! ユーザーが変更できないため、定数として持ち DB の列にはしない。下方向だけを
-//! [`QueueEntry::down_range`] に持ち、DB 側でも CHECK で 30〜100 を強制する。
+//! マッチング範囲の値は 07-マッチング仕様 §3 に従う。**上下とも 50 固定**で、
+//! ユーザーは調整できない。したがって定数として持ち、判定に使う値は DB の列から読まない。
 //!
-//! **−96〜−100 は決して binding にならない。**両立条件（07 §3-1）は
-//! `max − min ≤ 95` かつ 各人 `rating_i − min ≤ d_i` で、前者が上方向の 95 で頭を
-//! 押さえているため、`d_i` を 95 より広くしても候補は増えない。上方向を可変にする改修が
-//! 入るまでの暫定状態であり、**「−100 にしても人数が増えない」はバグではない**。
+//! **群の幅がちょうど 50 になる。**両立条件（07 §3-1）は `max − min ≤ 50` かつ
+//! 各人 `rating_i − min ≤ d_i` で、`d_i` も 50 なので前者と一致する。seed の差 100 と
+//! 組み合わせると、1600 群と 1500 群は初期状態で**分離する**（差 100 > 50）。
+//! 境界の差ちょうど 50 は**組める側**（比較は両端とも `<=`）。
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -18,27 +17,26 @@ use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 ///
 /// 高レート側が低レートだけを狙う設定を防ぐため、狭められない。列にしないのは、
 /// 保存すると「保存値と定数のどちらが正か」が後から分からなくなるため。
-pub const UP_RANGE: i32 = 95;
-/// 下方向の最小値。ここまで本人が**狭められる**。
-pub const MIN_DOWN_RANGE: i32 = 30;
-/// 下方向の最大値。ここまで本人が**広げられる**（[`UP_RANGE`] を超える分は効かない）。
-pub const MAX_DOWN_RANGE: i32 = 100;
-/// 下方向のデフォルト。**最小値ではない**（狭くも広くもできる範囲の中の初期位置）。
-pub const DEFAULT_DOWN_RANGE: i32 = 95;
+pub const UP_RANGE: i32 = 50;
+/// 下方向のマッチング範囲。**固定**。上方向と同じ幅で、ユーザーは変更できない。
+///
+/// `queue_entries.down_range` の列は残してあるが、新しい行には必ずこの値を書く。
+/// 判定はこの定数を通した値（[`clamp_down_range`]）だけを使う。
+pub const DOWN_RANGE: i32 = 50;
 /// 希望ロールの最大数（07 §4-5）。
 pub const MAX_ROLE_PREFERENCES: usize = 3;
 
-/// 保存済みの下方向範囲を、現在の範囲に丸める。**読み出し側で必ず通すこと。**
+/// 保存済みの下方向範囲を、現在の設定に丸める。**読み出し側で必ず通すこと。**
 ///
-/// 旧範囲（95〜200）で入った行が `queue_entries` に残りうる。既存行を一括 UPDATE すると、
-/// 本人が設定した覚えのない値に書き換わるうえ、追記でない書き込みが増える。DB の CHECK も
-/// `not valid` で足してあるので、**古い行は古い値のまま残る**のが正しい状態。
+/// 旧仕様（95〜200、のちに 30〜100）で入った行が `queue_entries` に残りうる。既存行を
+/// 一括 UPDATE すると、本人が設定した覚えのない値に書き換わるうえ、追記でない書き込みが
+/// 増える。DB の CHECK も `not valid` で足してあるので、**古い行は古い値のまま残る**のが
+/// 正しい状態で、丸めるのは読み出し側の責任。
 ///
-/// 下限側は丸めない。旧範囲の最小が 95 で新範囲の最小 30 より広いので、`< 30` の行は
-/// 構造的に存在しない。それでも将来の範囲変更で下側がずれたときに黙って壊れないよう、
-/// [`i32::clamp`] で両側とも締めておく。
+/// いまは上下 50 固定なので、下限と上限が同じ値になる。範囲がまた可変になったときに
+/// ここだけ直せば済むよう、[`i32::clamp`] の形は保つ。
 pub fn clamp_down_range(stored: i32) -> i32 {
-    stored.clamp(MIN_DOWN_RANGE, MAX_DOWN_RANGE)
+    stored.clamp(DOWN_RANGE, DOWN_RANGE)
 }
 
 /// `queue_entries.id`。
@@ -78,10 +76,11 @@ pub struct QueueEntry {
 }
 
 /// 検証済みの投入リクエスト。DB へ渡せるのはこの型だけ。
+///
+/// **マッチング範囲は持たない。**上下とも 50 固定で、ユーザーが送る値は無い
+/// （[`UP_RANGE`] / [`DOWN_RANGE`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueRequest {
-    /// 下方向のマッチング範囲。30〜100。
-    pub down_range: i32,
     /// 希望ロール。`priority` の昇順で 1..=n が詰まっている。
     pub roles: Vec<RolePreference>,
 }
@@ -130,9 +129,6 @@ pub struct StaffRemoval {
 /// （秘密ではなく、本人が送った設定なので）。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QueueRequestError {
-    /// 下方向の範囲が 30〜100 の外。**サーバ側で拒否する**（画面の入力だけに頼らない）。
-    #[error("down_range must be between {MIN_DOWN_RANGE} and {MAX_DOWN_RANGE}, got {0}")]
-    DownRangeOutOfBounds(i32),
     /// 希望ロールが 0 個。
     #[error("at least one role preference is required")]
     NoRoles,
@@ -158,11 +154,7 @@ pub enum QueueRequestError {
 ///
 /// 優先度は 1..=n が欠番なく詰まっていることを要求する。「第2希望だけ」のような
 /// 入力は UI の不具合であり、黙って通すとマッチメイカの費用計算が意味を失う。
-pub fn validate_request(
-    down_range: i32,
-    roles: &[RolePreference],
-) -> Result<QueueRequest, QueueRequestError> {
-    validate_down_range(down_range)?;
+pub fn validate_request(roles: &[RolePreference]) -> Result<QueueRequest, QueueRequestError> {
     if roles.is_empty() {
         return Err(QueueRequestError::NoRoles);
     }
@@ -190,7 +182,6 @@ pub fn validate_request(
     }
 
     Ok(QueueRequest {
-        down_range,
         roles: sorted
             .into_iter()
             .map(|preference| RolePreference {
@@ -199,15 +190,6 @@ pub fn validate_request(
             })
             .collect(),
     })
-}
-
-/// プレビューと投入で共通の下方向範囲検証。
-pub fn validate_down_range(down_range: i32) -> Result<(), QueueRequestError> {
-    if (MIN_DOWN_RANGE..=MAX_DOWN_RANGE).contains(&down_range) {
-        Ok(())
-    } else {
-        Err(QueueRequestError::DownRangeOutOfBounds(down_range))
-    }
 }
 
 #[cfg(test)]
@@ -221,68 +203,39 @@ mod tests {
         }
     }
 
+    /// マッチング範囲は上下とも 50 固定。**ユーザーが送る値は無い。**
     #[test]
-    fn the_down_range_is_bounded_by_the_matching_spec() {
-        assert_eq!((MIN_DOWN_RANGE, MAX_DOWN_RANGE), (30, 100), "07 §3");
-        assert!(validate_request(MIN_DOWN_RANGE, &[wish("jungle", 1)]).is_ok());
-        assert!(validate_request(MAX_DOWN_RANGE, &[wish("jungle", 1)]).is_ok());
-        assert_eq!(
-            validate_request(MIN_DOWN_RANGE - 1, &[wish("jungle", 1)]),
-            Err(QueueRequestError::DownRangeOutOfBounds(29))
-        );
-        assert_eq!(
-            validate_request(MAX_DOWN_RANGE + 1, &[wish("jungle", 1)]),
-            Err(QueueRequestError::DownRangeOutOfBounds(101))
-        );
-        // 旧範囲の上限は受け付けない（サーバ側で拒否する）
-        assert_eq!(
-            validate_request(200, &[wish("jungle", 1)]),
-            Err(QueueRequestError::DownRangeOutOfBounds(200))
-        );
+    fn the_range_is_fixed_at_fifty_in_both_directions() {
+        assert_eq!((UP_RANGE, DOWN_RANGE), (50, 50), "07 §3");
+        // 投入リクエストに範囲が無いこと（型がそれを保証する）
+        let request = validate_request(&[wish("jungle", 1)]).expect("valid");
+        assert_eq!(request.roles.len(), 1);
     }
 
+    /// 旧仕様（95〜200 / 30〜100）で入った行は一括 UPDATE せず、読み出し時に丸める。
     #[test]
-    fn the_default_sits_inside_the_range_and_is_not_the_minimum() {
-        assert_eq!(DEFAULT_DOWN_RANGE, 95);
-        assert!(validate_down_range(DEFAULT_DOWN_RANGE).is_ok());
-        // 既定から**狭める余地も広げる余地も**あること（旧仕様は既定＝最小だった）
-        assert!(validate_down_range(DEFAULT_DOWN_RANGE - 1).is_ok());
-        assert!(validate_down_range(DEFAULT_DOWN_RANGE + 1).is_ok());
-    }
-
-    /// 旧範囲（95〜200）で入った行は一括 UPDATE せず、読み出し時に丸める。
-    #[test]
-    fn stored_values_from_the_old_range_are_clamped_on_read() {
-        assert_eq!(clamp_down_range(200), MAX_DOWN_RANGE);
-        assert_eq!(clamp_down_range(101), MAX_DOWN_RANGE);
-        // 範囲内の値は触らない
-        for stored in [MIN_DOWN_RANGE, 50, DEFAULT_DOWN_RANGE, MAX_DOWN_RANGE] {
-            assert_eq!(clamp_down_range(stored), stored, "{stored}");
+    fn stored_values_from_the_old_ranges_are_clamped_on_read() {
+        for stored in [200, 101, 100, 95, 30, 0, -1] {
+            assert_eq!(clamp_down_range(stored), DOWN_RANGE, "{stored}");
         }
-        // 下側も締める（いまは構造的に発生しないが、範囲変更で黙って壊れないように）
-        assert_eq!(clamp_down_range(0), MIN_DOWN_RANGE);
+        assert_eq!(clamp_down_range(DOWN_RANGE), DOWN_RANGE);
     }
 
     #[test]
     fn role_preferences_are_capped_at_three_and_ordered_by_priority() {
-        let request = validate_request(
-            95,
-            &[wish("bot_tank", 3), wish("jungle", 1), wish("top_carry", 2)],
-        )
-        .unwrap();
+        let request =
+            validate_request(&[wish("bot_tank", 3), wish("jungle", 1), wish("top_carry", 2)])
+                .unwrap();
         let order: Vec<&str> = request.roles.iter().map(|r| r.role.as_str()).collect();
         assert_eq!(order, ["jungle", "top_carry", "bot_tank"]);
 
         assert_eq!(
-            validate_request(95, &[]),
+            validate_request(&[]),
             Err(QueueRequestError::NoRoles),
             "queueing with no role is not a queue entry"
         );
         assert_eq!(
-            validate_request(
-                95,
-                &[wish("a", 1), wish("b", 2), wish("c", 3), wish("d", 4),],
-            ),
+            validate_request(&[wish("a", 1), wish("b", 2), wish("c", 3), wish("d", 4),],),
             Err(QueueRequestError::TooManyRoles(4))
         );
     }
@@ -290,22 +243,22 @@ mod tests {
     #[test]
     fn priorities_must_be_one_through_n_without_gaps_or_duplicates() {
         assert_eq!(
-            validate_request(95, &[wish("jungle", 2)]),
+            validate_request(&[wish("jungle", 2)]),
             Err(QueueRequestError::MalformedPriorities(1)),
             "a lone second choice is a UI bug"
         );
         assert_eq!(
-            validate_request(95, &[wish("jungle", 1), wish("bot_tank", 3)]),
+            validate_request(&[wish("jungle", 1), wish("bot_tank", 3)]),
             Err(QueueRequestError::MalformedPriorities(2)),
             "gaps are rejected"
         );
         assert_eq!(
-            validate_request(95, &[wish("jungle", 1), wish("bot_tank", 1)]),
+            validate_request(&[wish("jungle", 1), wish("bot_tank", 1)]),
             Err(QueueRequestError::MalformedPriorities(2)),
             "duplicate priorities are rejected"
         );
         assert_eq!(
-            validate_request(95, &[wish("jungle", 0)]),
+            validate_request(&[wish("jungle", 0)]),
             Err(QueueRequestError::MalformedPriorities(1))
         );
     }
@@ -313,12 +266,12 @@ mod tests {
     #[test]
     fn the_same_role_cannot_be_wished_for_twice() {
         assert_eq!(
-            validate_request(95, &[wish("jungle", 1), wish(" jungle ", 2)]),
+            validate_request(&[wish("jungle", 1), wish(" jungle ", 2)]),
             Err(QueueRequestError::DuplicateRole("jungle".into())),
             "trimmed identifiers still collide"
         );
         assert_eq!(
-            validate_request(95, &[wish("   ", 1)]),
+            validate_request(&[wish("   ", 1)]),
             Err(QueueRequestError::EmptyRole)
         );
     }

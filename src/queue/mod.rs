@@ -21,10 +21,9 @@ pub mod routes;
 
 pub use flex::{RoleAssignment, flex_compensation_owed, latest_assignment};
 pub use model::{
-    DEFAULT_DOWN_RANGE, MAX_DOWN_RANGE, MAX_ROLE_PREFERENCES, MIN_DOWN_RANGE, QueueEntry,
-    QueueEntryId, QueueRequest, QueueRequestError, REMOVAL_NOTICE_WINDOW_HOURS, RolePreference,
-    StaffRemoval, UP_RANGE, VoiceDestination, clamp_down_range, validate_down_range,
-    validate_request,
+    DOWN_RANGE, MAX_ROLE_PREFERENCES, QueueEntry, QueueEntryId, QueueRequest, QueueRequestError,
+    REMOVAL_NOTICE_WINDOW_HOURS, RolePreference, StaffRemoval, UP_RANGE, VoiceDestination,
+    clamp_down_range, validate_request,
 };
 pub use range::{QueuedPlayer, accepts, count_in_range, mutually_in_range};
 pub use repository::{QueueError, QueueRepository};

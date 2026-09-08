@@ -23,13 +23,9 @@ use unite_matchsystem::matchmaker::{
 };
 use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
 use unite_matchsystem::queue::{
-    DEFAULT_DOWN_RANGE, MAX_DOWN_RANGE, MIN_DOWN_RANGE, QueueRepository, QueueState, UP_RANGE,
-    router as queue_router,
+    DOWN_RANGE, QueueRepository, QueueState, UP_RANGE, router as queue_router,
 };
-use unite_matchsystem::rating::{
-    BASE_DELTA, RATING_GAP_THRESHOLD, RATING_PARAMS_VERSION, RatingAdjustmentRepository,
-    UPSET_ADJUSTMENT,
-};
+use unite_matchsystem::rating::{BASE_DELTA, RATING_PARAMS_VERSION, RatingAdjustmentRepository};
 use unite_matchsystem::registration::{
     AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
     router as registration_router, site_base_url,
@@ -86,12 +82,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!(
         rating_params_version = RATING_PARAMS_VERSION,
         base_delta = BASE_DELTA,
-        upset_adjustment = UPSET_ADJUSTMENT,
-        rating_gap_threshold = RATING_GAP_THRESHOLD,
         matchmaking_params_version = MATCHMAKING_PARAMS_VERSION,
-        down_range_min = MIN_DOWN_RANGE,
-        down_range_max = MAX_DOWN_RANGE,
-        down_range_default = DEFAULT_DOWN_RANGE,
+        down_range = DOWN_RANGE,
         up_range = UP_RANGE,
         "rating and matchmaking params loaded"
     );

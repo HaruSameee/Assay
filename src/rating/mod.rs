@@ -41,10 +41,11 @@ pub const DEFAULT_DISPLAY_SIGMA: f64 = 500.0;
 
 /// 固定増減方式のパラメータ版数。**下の値を変えたら必ず上げること。**
 ///
-/// | 版 | `BASE_DELTA` | `UPSET_ADJUSTMENT` | `RATING_GAP_THRESHOLD` |
-/// |---|---|---|---|
-/// | 1 | 11 | 1 | 50 |
-/// | 2 | 7 | 1 | 50 |
+/// | 版 | 基本 | 格上・格下の補正 |
+/// |---|---|---|
+/// | 1 | 11 | ±1（しきい値 50） |
+/// | 2 | 7 | ±1（しきい値 50） |
+/// | 3 | 7 | **なし（フラット）** |
 ///
 /// **`formations` には凍結しない。**レーティングは導出値で、`recompute` が唯一の計算経路
 /// （00 §3-2 / §3-3）。params を変えれば過去の全試合が**新しい params で引き直される**のが
@@ -54,25 +55,14 @@ pub const DEFAULT_DISPLAY_SIGMA: f64 = 500.0;
 ///
 /// マッチメイキング側の版数は別物（[`crate::matchmaker::MATCHMAKING_PARAMS_VERSION`]。
 /// あちらは選択の費用と範囲の版で、`formations` に凍結する）。
-pub const RATING_PARAMS_VERSION: i32 = 2;
+pub const RATING_PARAMS_VERSION: i32 = 3;
 
-/// 基本の増減幅（表示スケール）。
+/// 増減幅（表示スケール）。**勝ち +7 / 負け −7 のフラット。**
+///
+/// v3 で格上・格下の補正を削除したので、しきい値も補正幅も、境界比較のための
+/// イプシロンも要らなくなった（`RATING_GAP_THRESHOLD` / `UPSET_ADJUSTMENT` /
+/// `GAP_EPSILON` は削除済み）。相手チーム平均との差は**増減に影響しない**。
 pub const BASE_DELTA: f64 = 7.0;
-/// 「相手との差」がこれ以上なら ±1 する（表示スケール）。
-pub const RATING_GAP_THRESHOLD: f64 = 50.0;
-/// 格上・格下のときの補正幅。
-pub const UPSET_ADJUSTMENT: f64 = 1.0;
-
-/// しきい値の比較に許す誤差（表示スケール）。
-///
-/// 凍結値は内部スケール（`mu = 表示値 / 60`）で保存されるので、表示スケールへ戻すと
-/// `1550 / 60 * 60 = 1549.9999999999998` のような値になる。素朴に `>= 50.0` で比較すると、
-/// **仕様が「50 以上」と書いている境界ちょうどが 50 未満に落ちる。**
-/// SQL 側のビューにも同じ幅が入っている（`tests/rating.rs` が両者の一致を検査する）。
-///
-/// 表示スケールで 1e-9 は、レートの最小単位（1）から 9 桁離れており、境界以外の判定を
-/// 変えることはない。
-pub const GAP_EPSILON: f64 = 1e-9;
 
 /// 確定した 1 試合の、そのプレイヤーから見た結果。
 ///
@@ -88,32 +78,22 @@ pub enum MatchResult {
     Drawn,
 }
 
-/// 07 §2-2 の増減式。表示スケールの差分を返す。
+/// 07 §2-2 の増減式（params v3）。表示スケールの差分を返す。
 ///
 /// | 条件 | 勝ち | 負け |
 /// |---|---|---|
-/// | 差が 50 未満 | +7 | −7 |
-/// | 格上（相手平均が 50 以上高い） | +8 | −6 |
-/// | 格下（相手平均が 50 以上低い） | +6 | −8 |
+/// | **相手チーム平均との差に関わらず** | +7 | −7 |
 ///
-/// `own` と `opponent_mean` はどちらも**その試合の開始時点の凍結値**
-/// （`formation_players.mu_at_match`）を表示スケールに直したもの。**現在レートを使わない。**
-/// これがインクリメンタル更新を不要にしている。
+/// v3 で格上・格下の分岐を削除した。**引数の `own` / `opponent_mean` は増減を変えない。**
+/// 残してあるのは、試合ごとの入力（[`PlayedMatch`]）が凍結値だけから作られていることを
+/// 型で示し続けるためと、07 §7 の比較で μ+σ 方式へ同じログを流すときに同じ形の入力が
+/// 要るため。**現在レートは使わない**（これがインクリメンタル更新を不要にしている）。
 ///
-/// 「相手との差」は個々の相手ではなく**相手チーム 5 人の平均**との差（07 §2-2）。
-/// ロールによる調整はしない。
-pub fn match_delta(own: f64, opponent_mean: f64, result: MatchResult) -> f64 {
-    let gap = opponent_mean - own;
-    // 境界ちょうど（差 50）は「50 以上」に入る。凍結値の往復で生じる誤差を [`GAP_EPSILON`] で吸収する
-    let stronger = gap >= RATING_GAP_THRESHOLD - GAP_EPSILON;
-    let weaker = gap <= -RATING_GAP_THRESHOLD + GAP_EPSILON;
+/// 分岐が無いので、境界（差ちょうど 50）の比較演算子も浮動小数点の誤差も関係しない。
+pub fn match_delta(_own: f64, _opponent_mean: f64, result: MatchResult) -> f64 {
     match result {
         MatchResult::Drawn => 0.0,
-        MatchResult::Won if stronger => BASE_DELTA + UPSET_ADJUSTMENT,
-        MatchResult::Won if weaker => BASE_DELTA - UPSET_ADJUSTMENT,
         MatchResult::Won => BASE_DELTA,
-        MatchResult::Lost if stronger => -(BASE_DELTA - UPSET_ADJUSTMENT),
-        MatchResult::Lost if weaker => -(BASE_DELTA + UPSET_ADJUSTMENT),
         MatchResult::Lost => -BASE_DELTA,
     }
 }
@@ -322,35 +302,35 @@ mod tests {
         }
     }
 
-    /// 格上（相手平均が 50 以上高い）: 勝ち +8 / 負け −6。
+    /// **格上でも増減は変わらない。**v3 で分岐を削除したことをここが守る。
     #[test]
-    fn beating_a_stronger_opponent_pays_more_and_losing_costs_less() {
-        for gap in [50.0, 51.0, 300.0] {
+    fn beating_a_stronger_opponent_pays_exactly_the_same() {
+        for gap in [50.0, 51.0, 300.0, 1000.0] {
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
-                8.0,
+                7.0,
                 "gap {gap}"
             );
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
-                -6.0,
+                -7.0,
                 "gap {gap}"
             );
         }
     }
 
-    /// 格下（相手平均が 50 以上低い）: 勝ち +6 / 負け −8。
+    /// **格下でも増減は変わらない。**
     #[test]
-    fn beating_a_weaker_opponent_pays_less_and_losing_costs_more() {
-        for gap in [-50.0, -51.0, -300.0] {
+    fn beating_a_weaker_opponent_pays_exactly_the_same() {
+        for gap in [-50.0, -51.0, -300.0, -1000.0] {
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
-                6.0,
+                7.0,
                 "gap {gap}"
             );
             assert_eq!(
                 match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
-                -8.0,
+                -7.0,
                 "gap {gap}"
             );
         }
@@ -366,30 +346,46 @@ mod tests {
 
     /// ちょうど 50 は「50 以上」に入る（境界）。
     #[test]
-    fn the_threshold_is_inclusive() {
-        assert_eq!(match_delta(1500.0, 1550.0, MatchResult::Won), 8.0);
-        assert_eq!(match_delta(1500.0, 1450.0, MatchResult::Won), 6.0);
-        // 直前の値は基本値のまま
-        assert_eq!(match_delta(1500.0, 1549.9, MatchResult::Won), 7.0);
-        assert_eq!(match_delta(1500.0, 1450.1, MatchResult::Won), 7.0);
+    fn there_is_no_threshold_left_to_be_inclusive_about() {
+        // かつて境界だった 50 の周辺でも、値は一切変わらない
+        for opponent_mean in [1449.9, 1450.0, 1450.1, 1549.9, 1550.0, 1550.1] {
+            assert_eq!(
+                match_delta(1500.0, opponent_mean, MatchResult::Won),
+                BASE_DELTA,
+                "{opponent_mean}"
+            );
+            assert_eq!(
+                match_delta(1500.0, opponent_mean, MatchResult::Lost),
+                -BASE_DELTA,
+                "{opponent_mean}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
     // 畳み込み
     // ------------------------------------------------------------------
 
-    /// 1 勝した 1500 は 1507 になる（v2。07 §3-2 のプール融合の前提）。
+    /// 1 勝した 1500 は 1507 になる。**範囲 50 では 1600 群にまだ届かない。**
     ///
-    /// 増減を 11 から 7 に下げても、**1 勝でプールが融合する**という 07 §3-2 の筋は保つ。
-    /// ただし余裕は 6（1600 − 1511 = 89）から 2（1600 − 1507 = 93）に縮む。
+    /// 範囲を 95 から 50 に絞ったので、07 §3-2 の「1 勝でプールが融合する」は成立しなくなった。
+    /// 1600 と両立するには 1550 以上、つまり**8 勝**が要る。seed の差 100 で 2 群を分離する、
+    /// という今回の狙いどおりの帰結であり、意図した挙動。
     #[test]
-    fn one_win_takes_a_fresh_player_into_the_upper_pool() {
+    fn one_win_is_not_enough_to_reach_the_upper_pool() {
         let initial = initial_rating([]);
         assert_eq!(initial.mu * DISPLAY_SCALE, 1500.0);
         let rating = display_rating(initial, &[played(1500.0, 1500.0, MatchResult::Won)]);
         assert_eq!(rating, 1507.0);
-        // 1600 との差は 93 で、上方向の固定幅 95 の内側に入る
-        assert!(1600.0 - rating <= 95.0);
+        assert!(1600.0 - rating > 50.0, "1 勝では 1600 と両立しない");
+
+        // 8 勝（+56）で 1556。1600 との差 44 が範囲 50 の内側に入る
+        let eight_wins: Vec<PlayedMatch> = (0..8)
+            .map(|_| played(1500.0, 1500.0, MatchResult::Won))
+            .collect();
+        let climbed = display_rating(initial_rating([]), &eight_wins);
+        assert_eq!(climbed, 1556.0);
+        assert!(1600.0 - climbed <= 50.0);
     }
 
     /// 総和なので、畳む順序は結果を変えない。同じログからは必ず同じ値。
@@ -406,7 +402,7 @@ mod tests {
         reversed.reverse();
         let backward = display_rating(initial_rating([]), &reversed);
         assert_eq!(forward, backward);
-        // +8, -8, 0, +7
+        // +7, -7, 0, +7
         assert_eq!(forward, 1500.0 + 7.0);
     }
 

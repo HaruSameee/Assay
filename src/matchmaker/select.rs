@@ -6,17 +6,17 @@
 //! **総当たりを書かない。**キュー 40 人から 10 人を選ぶ組み合わせは 8×10⁸ 通りあり、
 //! 成立しない。07 §4-3 の方針どおり、
 //!
-//! 1. レート降順にソートし、**幅 95 のスライディングウィンドウ**を取る
+//! 1. レート降順にソートし、**幅 50 のスライディングウィンドウ**を取る
 //! 2. ウィンドウ内から、各人の下方向設定を満たさない者を除く
 //! 3. ロール枠への割り当てを**最小費用流**で解く（[`super::flow`]）
 //! 4. 最大流が 10 に達すれば成立。達しなければ次のウィンドウへ
 //!
 //! で解く。ウィンドウは**その最小レートを基準**に取る。07 §3-1 の 2 条件は
 //!
-//! - `max(rating) − min(rating) ≤ 95`
+//! - `max(rating) − min(rating) ≤ 50`
 //! - すべての i で `rating_i − min(rating) ≤ d_i`
 //!
-//! なので、「最小レート `m` を基準に `m ≤ rating ≤ m + 95` かつ `rating − m ≤ d`」を満たす
+//! なので、「最小レート `m` を基準に `m ≤ rating ≤ m + 50` かつ `rating − m ≤ d`」を満たす
 //! 集合を作れば、**その部分集合はどれも 2 条件を満たす**（実際の最小レートは `m` 以上なので、
 //! 差はここで測った値より小さくなる）。基準を全候補について走らせるので、成立しうる組を
 //! 取りこぼさない。
@@ -58,10 +58,11 @@ pub const ROLES: [&str; 5] = [
 /// |---|---|---|
 /// | 1 | 95〜200（既定 95） | +95 固定 |
 /// | 2 | 30〜100（既定 95） | +95 固定 |
+/// | 3 | **50 固定** | **+50 固定** |
 ///
 /// レーティングの版数は別物（[`crate::rating::RATING_PARAMS_VERSION`]。あちらは導出値の
 /// パラメータなので凍結しない）。
-pub const MATCHMAKING_PARAMS_VERSION: i32 = 2;
+pub const MATCHMAKING_PARAMS_VERSION: i32 = 3;
 
 /// 予測勝率の凍結値。
 ///
@@ -109,7 +110,7 @@ pub struct Candidate {
     pub rating: f64,
     /// 表示スケールの σ。formation に凍結する。
     pub sigma: f64,
-    /// 本人が設定した下方向の幅（95〜200）。
+    /// 下方向の幅。いまは 50 固定（`clamp_down_range` を通した値が入る）。
     pub down_range: i32,
     /// キューに入った時刻。待ち時間の算出に使う。
     pub enqueued_at: Timestamp,
@@ -180,7 +181,7 @@ impl ProposedMatch {
         ratings.iter().sum::<f64>() / ratings.len() as f64
     }
 
-    /// 最高レートと最低レートの差。07 §3-1 の条件 1 は 95 以下。
+    /// 最高レートと最低レートの差。07 §3-1 の条件 1 は 50 以下（境界を含む）。
     pub fn rating_span(&self) -> f64 {
         let ratings: Vec<f64> = self.players.iter().map(|player| player.rating).collect();
         let max = ratings.iter().copied().fold(f64::MIN, f64::max);
@@ -223,7 +224,12 @@ pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedM
     matches
 }
 
-/// 幅 95 のウィンドウを上から順に試して、最初に成立した 1 組を返す。
+/// 幅 50 のウィンドウを上から順に試して、最初に成立した 1 組を返す。
+///
+/// **比較は両端を含む（`<=`）。**差ちょうど 50 は同じウィンドウに入る。
+///
+/// `anchor` は 0（最高レート）から順に下りるので、上のウィンドウで組めなかった候補は
+/// **同じ呼び出しの中で下のウィンドウでも評価される**（飛ばさない）。
 fn find_one(pool: &[&Candidate], now: Timestamp) -> Option<(Vec<usize>, ProposedMatch)> {
     let span = f64::from(UP_RANGE);
     for anchor in 0..pool.len() {
@@ -415,7 +421,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::queue::model::MAX_DOWN_RANGE;
+    use crate::queue::model::DOWN_RANGE;
 
     /// 基準時刻。すべての待ち時間はここからの逆算。
     fn now() -> Timestamp {
@@ -449,7 +455,7 @@ mod tests {
                 who(
                     first_id + index as u128,
                     rating,
-                    95,
+                    DOWN_RANGE,
                     600,
                     &[ROLES[index % ROLES.len()]],
                 )
@@ -557,7 +563,7 @@ mod tests {
     fn the_least_patient_eleventh_player_is_left_out() {
         let mut roster = full_roster(1, 1500.0);
         // jungle 希望で 10 秒しか待っていない 11 人目。既存の jungle 2 人は 600 秒待っている
-        roster.push(who(11, 1500.0, 95, 10, &["jungle"]));
+        roster.push(who(11, 1500.0, DOWN_RANGE, 10, &["jungle"]));
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         assert_well_formed(&matches[0]);
@@ -573,8 +579,8 @@ mod tests {
     fn a_long_waiting_newcomer_displaces_a_fresh_player() {
         let mut roster = full_roster(1, 1500.0);
         // full_roster は index % 5 でロールを配るので、3 番は jungle
-        roster[2] = who(3, 1500.0, 95, 5, &["jungle"]);
-        roster.push(who(11, 1500.0, 95, 3600, &["jungle"]));
+        roster[2] = who(3, 1500.0, DOWN_RANGE, 5, &["jungle"]);
+        roster.push(who(11, 1500.0, DOWN_RANGE, 3600, &["jungle"]));
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         let chosen = ids(&matches[0]);
@@ -586,53 +592,47 @@ mod tests {
     // レート範囲（07 §3-1）
     // ------------------------------------------------------------------
 
-    /// レート差 96 の 2 人は同じ組に入らない。95 なら入る。
+    /// **境界の実測（1-2）。**差ちょうど 50 は同じ組に入る。51 は入らない。
+    ///
+    /// ウィンドウの条件は `above <= span`（`find_one`）なので、**両端を含む**。
     #[test]
-    fn ninety_six_apart_never_share_a_match_but_ninety_five_does() {
+    fn exactly_fifty_apart_share_a_match_but_fifty_one_does_not() {
         let build = |high: f64| {
             let mut roster: Vec<Candidate> = full_roster(1, 1500.0);
             for (index, candidate) in roster.iter_mut().enumerate() {
                 if index % 2 == 0 {
                     candidate.rating = high;
                 }
-                candidate.down_range = MAX_DOWN_RANGE;
             }
             roster
         };
         assert!(
-            select_matches(&build(1596.0), now()).is_empty(),
-            "96 apart cannot be bridged even with the widest downward range"
+            select_matches(&build(1551.0), now()).is_empty(),
+            "51 apart is outside the fixed 50 window"
         );
-        let matches = select_matches(&build(1595.0), now());
-        assert_eq!(matches.len(), 1, "95 apart is inside the fixed +95 window");
-        assert_eq!(matches[0].rating_span(), 95.0);
+        let matches = select_matches(&build(1550.0), now());
+        assert_eq!(matches.len(), 1, "50 apart is inside the window (<=)");
+        assert_eq!(matches[0].rating_span(), 50.0);
     }
 
-    /// 下方向を広げていない人が、自分より 96 下の人と組まされない。
-    ///
-    /// 下方向の最小値 95 は上方向の固定幅と同じなので、条件 1（`max − min ≤ 95`）を満たす
-    /// 組では条件 2 も必ず満たされる。ここで効いているのは条件 1 の側だが、設定を広げていない
-    /// 人が 96 下と組まされないという結論は同じである。
+    /// 51 下の人とは組まされない。範囲は全員同じなので、条件 1 と条件 2 が一致する。
     #[test]
-    fn a_player_who_did_not_widen_is_never_matched_ninety_six_below() {
-        let mut roster = full_roster(1, 1504.0);
-        for candidate in roster.iter_mut() {
-            candidate.down_range = MAX_DOWN_RANGE;
-        }
-        // 1 番だけ 96 上で、下方向は既定（95）のまま
-        roster[0] = who(1, 1600.0, 95, 600, &[ROLES[0]]);
+    fn a_player_is_never_matched_fifty_one_below() {
+        let mut roster = full_roster(1, 1549.0);
+        // 1 番だけ 51 上
+        roster[0] = who(1, 1600.0, DOWN_RANGE, 600, &[ROLES[0]]);
         assert!(select_matches(&roster, now()).is_empty());
 
-        // 95 下なら組める
+        // 50 下なら組める
         for candidate in roster.iter_mut().skip(1) {
-            candidate.rating = 1505.0;
+            candidate.rating = 1550.0;
         }
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].rating_span(), 95.0);
+        assert_eq!(matches[0].rating_span(), 50.0);
     }
 
-    /// 初日の 1500 プールと 1600 プールは混ざらない（差 100 > 95）。
+    /// **seed の差 100 で 1500 群と 1600 群が分離する。**今回の変更の狙い。
     #[test]
     fn the_fifteen_hundred_and_sixteen_hundred_pools_do_not_mix() {
         let mut roster = full_roster(1, 1500.0);
@@ -642,17 +642,27 @@ mod tests {
         assert!(select_matches(&roster, now()).is_empty());
     }
 
-    /// 1 勝して 1511 になれば 1600 と混ざる（差 89 ≤ 95）。07 §3-2。
+    /// 中間の 1550 は、1500 群とも 1600 群とも組める（どちらも差ちょうど 50）。
     #[test]
-    fn eleven_points_of_progress_bridge_the_two_pools() {
-        let mut roster = full_roster(1, 1511.0);
-        for candidate in roster.iter_mut().take(5) {
+    fn fifteen_fifty_bridges_both_pools_at_exactly_the_boundary() {
+        // 1550 と 1600 の混成
+        let mut upper = full_roster(1, 1550.0);
+        for candidate in upper.iter_mut().take(5) {
             candidate.rating = 1600.0;
         }
-        let matches = select_matches(&roster, now());
-        assert_eq!(matches.len(), 1, "1511 and 1600 are 89 apart");
+        let matches = select_matches(&upper, now());
+        assert_eq!(matches.len(), 1, "1550 と 1600 は差ちょうど 50");
         assert_well_formed(&matches[0]);
-        assert_eq!(matches[0].rating_span(), 89.0);
+        assert_eq!(matches[0].rating_span(), 50.0);
+
+        // 1550 と 1500 の混成
+        let mut lower = full_roster(1, 1550.0);
+        for candidate in lower.iter_mut().take(5) {
+            candidate.rating = 1500.0;
+        }
+        let matches = select_matches(&lower, now());
+        assert_eq!(matches.len(), 1, "1550 と 1500 も差ちょうど 50");
+        assert_eq!(matches[0].rating_span(), 50.0);
     }
 
     // ------------------------------------------------------------------
@@ -664,14 +674,14 @@ mod tests {
     fn a_lopsided_role_distribution_produces_nothing() {
         // 全員 jungle だけ。jungle は 2 枠しかない
         let all_jungle: Vec<Candidate> = (1..=12)
-            .map(|n| who(n, 1500.0, 95, 600, &["jungle"]))
+            .map(|n| who(n, 1500.0, DOWN_RANGE, 600, &["jungle"]))
             .collect();
         assert!(select_matches(&all_jungle, now()).is_empty());
 
         // 1 ロールだけ供給が消えても成立しない
         let mut roster = full_roster(1, 1500.0);
-        roster[4] = who(5, 1500.0, 95, 600, &["jungle"]);
-        roster[9] = who(10, 1500.0, 95, 600, &["jungle"]);
+        roster[4] = who(5, 1500.0, DOWN_RANGE, 600, &["jungle"]);
+        roster[9] = who(10, 1500.0, DOWN_RANGE, 600, &["jungle"]);
         assert!(select_matches(&roster, now()).is_empty());
     }
 
@@ -679,7 +689,7 @@ mod tests {
     #[test]
     fn a_second_choice_fills_the_gap_and_is_recorded_as_flexed() {
         let mut roster = full_roster(1, 1500.0);
-        roster[9] = who(10, 1500.0, 95, 600, &["jungle", "bot_tank"]);
+        roster[9] = who(10, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]);
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         assert_well_formed(&matches[0]);
@@ -697,16 +707,16 @@ mod tests {
     fn a_flex_compensated_player_wins_the_contested_first_choice() {
         let contested = |flex_target: u128| -> Vec<Candidate> {
             let mut roster = vec![
-                who(1, 1500.0, 95, 600, &["jungle", "bot_tank"]),
-                who(2, 1500.0, 95, 600, &["jungle", "bot_tank"]),
-                who(3, 1500.0, 95, 600, &["jungle", "bot_tank"]),
-                who(4, 1500.0, 95, 600, &["bot_tank"]),
-                who(5, 1500.0, 95, 600, &["top_carry"]),
-                who(6, 1500.0, 95, 600, &["top_carry"]),
-                who(7, 1500.0, 95, 600, &["top_support"]),
-                who(8, 1500.0, 95, 600, &["top_support"]),
-                who(9, 1500.0, 95, 600, &["bot_carry"]),
-                who(10, 1500.0, 95, 600, &["bot_carry"]),
+                who(1, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]),
+                who(2, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]),
+                who(3, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]),
+                who(4, 1500.0, DOWN_RANGE, 600, &["bot_tank"]),
+                who(5, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
+                who(6, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
+                who(7, 1500.0, DOWN_RANGE, 600, &["top_support"]),
+                who(8, 1500.0, DOWN_RANGE, 600, &["top_support"]),
+                who(9, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
+                who(10, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
             ];
             for candidate in roster.iter_mut() {
                 candidate.flex_compensation = candidate.player_id.0 == Uuid::from_u128(flex_target);
@@ -740,16 +750,16 @@ mod tests {
     #[test]
     fn flex_compensation_never_blocks_a_match() {
         let mut roster = vec![
-            who(1, 1500.0, 95, 600, &["jungle"]),
-            who(2, 1500.0, 95, 600, &["jungle"]),
-            who(3, 1500.0, 95, 600, &["top_carry", "bot_tank"]),
-            who(4, 1500.0, 95, 600, &["bot_tank"]),
-            who(5, 1500.0, 95, 600, &["top_carry"]),
-            who(6, 1500.0, 95, 600, &["top_carry"]),
-            who(7, 1500.0, 95, 600, &["top_support"]),
-            who(8, 1500.0, 95, 600, &["top_support"]),
-            who(9, 1500.0, 95, 600, &["bot_carry"]),
-            who(10, 1500.0, 95, 600, &["bot_carry"]),
+            who(1, 1500.0, DOWN_RANGE, 600, &["jungle"]),
+            who(2, 1500.0, DOWN_RANGE, 600, &["jungle"]),
+            who(3, 1500.0, DOWN_RANGE, 600, &["top_carry", "bot_tank"]),
+            who(4, 1500.0, DOWN_RANGE, 600, &["bot_tank"]),
+            who(5, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
+            who(6, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
+            who(7, 1500.0, DOWN_RANGE, 600, &["top_support"]),
+            who(8, 1500.0, DOWN_RANGE, 600, &["top_support"]),
+            who(9, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
+            who(10, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
         ];
         // 3 番は補償対象だが、第 1 希望の top_carry は 5・6 番で埋まっている
         roster[2].flex_compensation = true;
@@ -796,16 +806,16 @@ mod tests {
     #[test]
     fn teams_are_split_to_minimise_the_average_rating_gap() {
         let roster = vec![
-            who(1, 1500.0, 95, 600, &["top_carry"]),
-            who(2, 1540.0, 95, 600, &["top_carry"]),
-            who(3, 1540.0, 95, 600, &["top_support"]),
-            who(4, 1500.0, 95, 600, &["top_support"]),
-            who(5, 1500.0, 95, 600, &["jungle"]),
-            who(6, 1540.0, 95, 600, &["jungle"]),
-            who(7, 1540.0, 95, 600, &["bot_carry"]),
-            who(8, 1500.0, 95, 600, &["bot_carry"]),
-            who(9, 1520.0, 95, 600, &["bot_tank"]),
-            who(10, 1520.0, 95, 600, &["bot_tank"]),
+            who(1, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
+            who(2, 1540.0, DOWN_RANGE, 600, &["top_carry"]),
+            who(3, 1540.0, DOWN_RANGE, 600, &["top_support"]),
+            who(4, 1500.0, DOWN_RANGE, 600, &["top_support"]),
+            who(5, 1500.0, DOWN_RANGE, 600, &["jungle"]),
+            who(6, 1540.0, DOWN_RANGE, 600, &["jungle"]),
+            who(7, 1540.0, DOWN_RANGE, 600, &["bot_carry"]),
+            who(8, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
+            who(9, 1520.0, DOWN_RANGE, 600, &["bot_tank"]),
+            who(10, 1520.0, DOWN_RANGE, 600, &["bot_tank"]),
         ];
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
@@ -843,12 +853,87 @@ mod tests {
 
     #[test]
     fn an_unbalanceable_roster_still_produces_the_smallest_gap() {
-        // 1 人だけ 60 高い。どう割っても差は出るが、最小のものを選ぶ
+        // 1 人だけ 50 高い（範囲の上限ちょうど）。どう割っても差は出るが、最小のものを選ぶ
         let mut roster = full_roster(1, 1500.0);
-        roster[0].rating = 1560.0;
+        roster[0].rating = 1550.0;
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         let gap = (matches[0].team_average(Team::Red) - matches[0].team_average(Team::Blue)).abs();
-        assert!((gap - 12.0).abs() < 1e-9, "gap = {gap}");
+        assert!((gap - 10.0).abs() < 1e-9, "gap = {gap}");
+    }
+
+    /// **1-4 の実測。**上のウィンドウで組めなかった中間層が、同じ周期で下のウィンドウでも
+    /// 候補として評価されること。
+    ///
+    /// 再現手順どおり 1600×6 / 1550×6 / 1500×10 を並べ、上層（1600+1550=12人）は
+    /// ロール構成が埋まらないようにする。`find_one` は anchor を高い方から下ろすので、
+    /// 1550 を基準にしたウィンドウが失敗しても、次の 1500 基準のウィンドウで
+    /// 1550 が再び候補に入る。**スキップされない。**
+    #[test]
+    fn the_middle_layer_is_still_a_candidate_in_the_lower_window() {
+        let mut pool: Vec<Candidate> = Vec::new();
+        // 1600 が 6 人。全員 jungle しか希望しない（jungle は 2 枠）
+        for n in 1..=6u128 {
+            pool.push(who(n, 1600.0, DOWN_RANGE, 600, &["jungle"]));
+        }
+        // 1550 が 6 人。全員 bot_tank だけ
+        for n in 7..=12u128 {
+            pool.push(who(n, 1550.0, DOWN_RANGE, 600, &["bot_tank"]));
+        }
+        // 1500 が 10 人。bot_tank だけ供給が無い（top_carry が 4 人）
+        let lower_roles = [
+            "top_carry",
+            "top_carry",
+            "top_carry",
+            "top_carry",
+            "top_support",
+            "top_support",
+            "jungle",
+            "jungle",
+            "bot_carry",
+            "bot_carry",
+        ];
+        for (index, role) in lower_roles.iter().enumerate() {
+            pool.push(who(13 + index as u128, 1500.0, DOWN_RANGE, 600, &[role]));
+        }
+
+        let matches = select_matches(&pool, now());
+        assert_eq!(matches.len(), 1, "1550 + 1500 で 1 組成立する");
+        let proposal = &matches[0];
+        assert_well_formed(proposal);
+
+        // 幅は 50（1500〜1550）。1600 は 1 人も入らない
+        assert_eq!(proposal.rating_span(), 50.0);
+        let ratings: Vec<f64> = proposal
+            .players
+            .iter()
+            .map(|player| player.rating)
+            .collect();
+        assert_eq!(
+            ratings.iter().filter(|rating| **rating == 1600.0).count(),
+            0,
+            "1600 は窓の外"
+        );
+        assert_eq!(
+            ratings.iter().filter(|rating| **rating == 1550.0).count(),
+            2,
+            "bot_tank の 2 枠を中間層が埋める"
+        );
+        assert_eq!(
+            ratings.iter().filter(|rating| **rating == 1500.0).count(),
+            8
+        );
+
+        // 上のウィンドウ（1550 基準の 12 人）は実際に埋まらないことも確かめる
+        let upper: Vec<Candidate> = pool
+            .iter()
+            .filter(|candidate| candidate.rating >= 1550.0)
+            .cloned()
+            .collect();
+        assert_eq!(upper.len(), 12);
+        assert!(
+            select_matches(&upper, now()).is_empty(),
+            "上層だけではロール構成が埋まらない"
+        );
     }
 }

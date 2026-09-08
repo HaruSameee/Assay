@@ -240,8 +240,11 @@ async fn unconfirmed_matches_stay_out_of_the_status_page(owner: PgPool) {
     finish(&db, 2, K::Confirmed, "red").await;
     let page = body_text(browser.get("/status").await).await;
     assert_eq!(history_rows(&page), 1, "{page}");
-    assert!(page.contains(">+8<"), "格上（1600）に勝って +8: {page}");
-    assert!(page.contains("1508"), "{page}");
+    assert!(
+        page.contains(">+7<"),
+        "v3 は分岐が無いので格上でも +7: {page}"
+    );
+    assert!(page.contains("1507"), "{page}");
 
     db.done().await;
 }
