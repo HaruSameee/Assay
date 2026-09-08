@@ -3,10 +3,10 @@
 //! **すべて通知であり、操作は無い。**ボタンもモーダルも作らない（Discord に
 //! インタラクションを残さない）。行き先としてマッチ画面の URL を添える。
 //!
-//! 出してよいのは、割り当て表・集合場所（VC）・部屋設定・ルーム ID・ホスト打診・解散の通知だけ。
+//! 出してよいのは、集合場所（VC）・ルーム ID・ホスト打診・解散の通知だけ。
 //! 勝敗に関する語は一切出さない（`tests` で検査する）。
 //!
-//! **相手チームの構成は載せない。**割り当て表と招集はチームごとに分けて投稿する。
+//! **参加者の構成は載せない。**名前もロールも VC には出さない（割り当てはマッチ画面）。
 //! サイト側だけ隠しても、VC の投稿に相手のロールが載っていれば意味が無い。
 //!
 //! VC は使い回すので、1 本のチャットに何試合分ものメッセージが溜まる（消さない）。
@@ -74,53 +74,24 @@ fn mention(user: UserId) -> String {
     format!("<@{user}>")
 }
 
-/// 割り当て表 + 集合場所 + 部屋設定のチェックリスト（マップを先頭に差し込む）。
+/// 集合の案内。**参加者名もロールも部屋設定も載せない。**
 ///
-/// **そのVCのチームの構成だけを載せる。**red の VC には red だけ、blue の VC には blue だけ。
-/// 両チーム分を1つのメッセージにして両方へ投げると、サイト側で相手のロールを隠しても
-/// 意味が無くなる（部屋に入るまでの数分で相手の構成に合わせた準備ができてしまう）。
-/// 相手が誰かは招集チャンネルで分かる。隠しているのは**相手のロールだけ**。
-pub fn assignment(
-    heading: &str,
-    roster: &[RosterEntry],
-    vc: &VcPair,
-    team: Team,
-    room_map: &str,
-    checklist: &[String],
-) -> OutgoingMessage {
-    let mut content = String::from(heading);
-    content.push_str("## 割り当て表\n");
-    content.push_str(&format!(
-        "{} **{}** — {}\n",
-        team_emoji(team),
-        team,
-        vc_line(vc, team)
-    ));
-    let mut members: Vec<&RosterEntry> = roster.iter().filter(|entry| entry.team == team).collect();
-    members.sort_by(|a, b| {
-        a.role_sort_order
-            .cmp(&b.role_sort_order)
-            .then_with(|| a.player_id.cmp(&b.player_id))
-    });
-    for entry in members {
-        let name = entry
-            .trainer_name
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or("（名前未登録）");
-        content.push_str(&format!(
-            "- {} — {}\n",
-            plain_discord_text(name),
-            entry.role_display_name
-        ));
-    }
-    content.push_str("\n## 部屋設定\n");
-    content.push_str(&format!("- [ ] マップ: {room_map}\n"));
-    for item in checklist {
-        content.push_str(&format!("- [ ] {item}\n"));
-    }
+/// 以前はここに割り当て表（名前 — ロール）と部屋設定のチェックリストを出していた。
+/// チームごとに本文を分けてはいたが、**その分離は VC テキストチャットの閲覧権限が
+/// 手で絞られていることに依存する**。bot は権限を触らない設計（04）なので、権限が
+/// 開いていれば相手の VC を開くだけで構成が読める。分離が効いているかどうかを
+/// コード側から保証できない以上、VC には最初から載せない。
+///
+/// 割り当てと部屋設定は**マッチ画面**にある（相手のロールは型に存在しないので出ない）。
+/// VC に残すのは「どこへ集合するか」と、ホストによるルーム ID の開示だけ。
+pub fn assignment(heading: &str, vc: &VcPair, team: Team, match_url: &str) -> OutgoingMessage {
     OutgoingMessage {
-        content,
+        content: format!(
+            "{heading}## 集合\n{emoji} **{team}** — {line}してください。\n\
+             割り当てと部屋設定はマッチ画面にあります: {match_url}\n",
+            emoji = team_emoji(team),
+            line = vc_line(vc, team),
+        ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
     }
@@ -352,7 +323,7 @@ pub fn summon(roster: &[RosterEntry], vc: &VcPair, team: Team, match_url: &str) 
         content: format!(
             "{mentions} → <#{channel}>\n\
              マッチが成立しました。**操作はすべてマッチ画面から**行います: {match_url}\n\
-             割り当てとルーム設定は各VCのテキストチャットにもあります",
+             割り当てと部屋設定もマッチ画面にあります",
             channel = vc.channel(team).get(),
         ),
         buttons: Vec::new(),
@@ -638,14 +609,7 @@ mod tests {
             host_accepted(&heading, host, url),
         ];
         for team in Team::ALL {
-            messages.push(assignment(
-                &heading,
-                &roster(),
-                &vc(),
-                team,
-                "kyogre",
-                &checklist,
-            ));
+            messages.push(assignment(&heading, &vc(), team, SITE));
             messages.push(code_reveal(&heading, host, "1234", &vc(), team));
         }
         messages.extend(
@@ -695,88 +659,57 @@ mod tests {
         }
     }
 
-    /// **そのVCのチームの構成だけ。**相手のロールは載せない。
+    /// **VC の投稿に参加者名もロールも載せない。**
+    ///
+    /// チームごとに本文を分ける方式は、VC テキストチャットの閲覧権限が手で絞られて
+    /// いることに依存していた。bot は権限を触らない（04）ので、そこが開いていれば
+    /// 相手の VC を開くだけで構成が読める。コード側で保証できないものは載せない。
     #[test]
-    fn the_assignment_table_only_lists_its_own_team() {
-        let red = assignment(
-            &head(),
-            &roster(),
-            &vc(),
-            Team::Red,
-            "kyogre",
-            &["設定 A".to_owned()],
-        );
-        assert!(red.mention_users.is_empty());
-        assert!(!red.content.contains("<@"), "{}", red.content);
+    fn the_voice_chat_post_carries_no_names_or_roles() {
+        for team in Team::ALL {
+            let message = assignment(&head(), &vc(), team, SITE);
+            assert!(message.mention_users.is_empty());
+            assert!(!message.content.contains("<@"), "{}", message.content);
+            // 参加者名が 1 つも出ない
+            for n in 1..=10 {
+                assert!(
+                    !message.content.contains(&format!("トレーナー{n}")),
+                    "{}",
+                    message.content
+                );
+            }
+            // ロールの表示名も出ない
+            for n in 0..5 {
+                assert!(
+                    !message.content.contains(&format!("ロール{n}")),
+                    "{}",
+                    message.content
+                );
+            }
+            // 部屋設定のチェックリストも出さない（マッチ画面にある）
+            assert!(!message.content.contains("- [ ]"), "{}", message.content);
+            assert!(
+                !message.content.contains("割り当て表"),
+                "{}",
+                message.content
+            );
+            // 出すのは集合先と、マッチ画面への導線だけ
+            assert!(message.content.contains(&vc().channel_name(team)));
+            assert!(message.content.contains(SITE), "{}", message.content);
+        }
+    }
+
+    /// 片方の VC の投稿に相手チームの行き先が混ざらないこと。
+    #[test]
+    fn the_voice_chat_post_only_names_its_own_channel() {
+        let red = assignment(&head(), &vc(), Team::Red, SITE);
+        let blue = assignment(&head(), &vc(), Team::Blue, SITE);
         assert!(red.content.contains("**red**"));
         assert!(!red.content.contains("**blue**"), "{}", red.content);
         assert!(red.content.contains("vc3-red"));
         assert!(!red.content.contains("vc3-blue"), "{}", red.content);
-        // red の5人だけが並ぶ。「トレーナー1」は「トレーナー10」の部分文字列なので、
-        // 行そのもの（`- 名前 — ロール`）で照合する
-        let listed = |content: &str, n: u32| {
-            content
-                .lines()
-                .any(|line| line.starts_with(&format!("- トレーナー{n} — ")))
-        };
-        for n in 1..=5 {
-            assert!(listed(&red.content, n), "{}", red.content);
-        }
-        for n in 6..=10 {
-            assert!(
-                !listed(&red.content, n),
-                "blue の {n} が red の表に載っている: {}",
-                red.content
-            );
-        }
-        let map = red.content.find("- [ ] マップ: kyogre").unwrap();
-        let item = red.content.find("- [ ] 設定 A").unwrap();
-        assert!(map < item, "the map comes first");
-        // チーム内はロールの表示順（ロール0 が先頭）
-        let first = red.content.find("トレーナー5").unwrap();
-        let second = red.content.find("トレーナー1").unwrap();
-        assert!(first < second);
-
-        // blue 側も同じく、自分のチームだけ
-        let blue = assignment(&head(), &roster(), &vc(), Team::Blue, "kyogre", &[]);
-        assert!(blue.content.contains("**blue**"));
-        assert!(!blue.content.contains("**red**"), "{}", blue.content);
-        for n in 1..=5 {
-            assert!(
-                !listed(&blue.content, n),
-                "red の {n} が blue の表に載っている: {}",
-                blue.content
-            );
-        }
-    }
-
-    /// **red の VC への投稿に blue のロール割り当てが含まれないこと。**
-    ///
-    /// ロール名の文字列自体は両チームで共通なので、「誰がどのロールか」の行で検査する。
-    #[test]
-    fn the_opposing_roles_never_reach_a_voice_chat() {
-        let red = assignment(&head(), &roster(), &vc(), Team::Red, "kyogre", &[]);
-        let blue = assignment(&head(), &roster(), &vc(), Team::Blue, "kyogre", &[]);
-        // roster() は player_id ごとに `ロール<n % 5>` という表示名を持たせてある
-        let pair_line = |n: u32| format!("- トレーナー{n} — ロール{}", n % 5);
-        for n in 6..=10 {
-            assert!(!red.content.contains(&pair_line(n)), "{}", red.content);
-        }
-        for n in 1..=5 {
-            assert!(!blue.content.contains(&pair_line(n)), "{}", blue.content);
-            // 自分の側には出る
-            assert!(red.content.contains(&pair_line(n)), "{}", red.content);
-        }
-    }
-
-    #[test]
-    fn assignment_neutralizes_mention_syntax_in_trainer_names() {
-        let mut roster = roster();
-        roster[0].trainer_name = Some("<@123>\n@everyone".into());
-        let message = assignment(&head(), &roster, &vc(), roster[0].team, "kyogre", &[]);
-        assert!(!message.content.contains("<@"), "{}", message.content);
-        assert!(message.content.contains("＜@123＞ @everyone"));
-        assert!(message.mention_users.is_empty());
+        assert!(blue.content.contains("vc3-blue"));
+        assert!(!blue.content.contains("vc3-red"), "{}", blue.content);
     }
 
     /// **チームごとに別のメッセージ。**片方の投稿に相手チームが混ざらないこと。
@@ -789,7 +722,7 @@ mod tests {
             format!(
                 "<@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
                  マッチが成立しました。**操作はすべてマッチ画面から**行います: {SITE}\n\
-                 割り当てとルーム設定は各VCのテキストチャットにもあります"
+                 割り当てと部屋設定もマッチ画面にあります"
             )
         );
         // 相手チームのメンションも、相手の行き先 VC も入らない
@@ -1016,15 +949,7 @@ mod tests {
         };
         println!(
             "========== 割り当て表（red） ==========\n{}",
-            assignment(
-                &head(),
-                &roster(),
-                &vc(),
-                Team::Red,
-                "kyogre",
-                &["設定 A".into()]
-            )
-            .content
+            assignment(&head(), &vc(), Team::Red, SITE).content
         );
         println!(
             "========== 招集通知（red） ==========\n{}",
@@ -1071,15 +996,9 @@ mod tests {
             host_announcement(formation(), UserId::new(1006), 2, 3, SITE).content
         );
         println!("\n========== red の VC: 割り当て表 ==========");
-        println!(
-            "{}",
-            assignment(&head(), &roster(), &vc(), Team::Red, "kyogre", &checklist).content
-        );
+        println!("{}", assignment(&head(), &vc(), Team::Red, SITE).content);
         println!("\n========== blue の VC: 割り当て表 ==========");
-        println!(
-            "{}",
-            assignment(&head(), &roster(), &vc(), Team::Blue, "kyogre", &checklist).content
-        );
+        println!("{}", assignment(&head(), &vc(), Team::Blue, SITE).content);
         println!("\n========== ホスト候補の VC: 打診 ==========");
         println!("{}", host_prompt(&head(), host, 1, 3, SITE).content);
         println!("\n========== ホスト候補の VC: 承諾後 ==========");

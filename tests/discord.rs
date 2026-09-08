@@ -523,7 +523,7 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         announcement.content
     );
 
-    // 2. 割り当て表: **そのVCのチームだけ**。red の投稿に blue の割り当てが載らない
+    // 2. 集合の案内: **名前もロールも部屋設定も載せない**。行き先とマッチ画面だけ
     let assignment_red = fake.message(vc.red, red_assignment);
     let assignment_blue = fake.message(vc.blue, blue_assignment);
     assert_ne!(
@@ -546,8 +546,20 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         "{}",
         assignment_red.content
     );
-    assert!(assignment_red.content.contains("- [ ] マップ: kyogre"));
-    assert!(assignment_red.content.contains("- [ ] 設定 A"));
+    // 部屋設定のチェックリストは VC に出さない（マッチ画面にある）
+    assert!(
+        !assignment_red.content.contains("- [ ]"),
+        "{}",
+        assignment_red.content
+    );
+    // 参加者名も VC に出さない
+    for n in 1..=10u128 {
+        assert!(
+            !assignment_red.content.contains(&format!("trainer-{n}")),
+            "{}",
+            assignment_red.content
+        );
+    }
     assert!(assignment_red.buttons.is_empty());
     assert!(assignment_blue.content.contains("**blue**"));
     assert!(
@@ -1675,6 +1687,76 @@ async fn internal_formations_endpoint_requires_the_token_and_starts_a_formation(
         }
         assert!(Instant::now() < deadline, "start_formation did not run");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    db.done().await;
+}
+
+/// **招集チャンネルは1本。**チームごとに分かれているのは*メッセージ*だけ。
+///
+/// 「割り当て表を招集チャンネルへ移す」案の前提を実測する。分かれているのが
+/// チャンネルではなくメッセージである以上、そこへ名前とロールの一覧を出すと
+/// **公開チャンネルに両チームの構成が並ぶ**ことになる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_summon_channel_is_one_channel_with_two_messages(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let (vc, _, _) = started(&db, &adapter, 1).await;
+
+    let summon_channel = config().summon_channel_id;
+    let summons = fake.sends_in(summon_channel);
+    // red と blue の成立通知 2 通 + ホスト決定の通知 1 通。**すべて同じ 1 本の
+    // チャンネル**に入る（分かれているのはメッセージだけ）
+    assert_eq!(summons.len(), 3, "成立2通 + ホスト決定1通");
+    assert_ne!(summon_channel, vc.red);
+    assert_ne!(summon_channel, vc.blue);
+    println!(
+        "招集チャンネル: {summon_channel}（1本） / 投稿数: {}",
+        summons.len()
+    );
+
+    // その2通に、ロールも部屋設定も入っていない（00 §3-5）
+    for id in &summons {
+        let message = fake.message(summon_channel, *id);
+        assert!(!message.content.contains("- [ ]"), "{}", message.content);
+        // 名前とロールの一覧が公開チャンネルに出ていないこと
+        for n in 1..=10u128 {
+            assert!(
+                !message.content.contains(&format!("trainer-{n}")),
+                "{}",
+                message.content
+            );
+        }
+        println!("招集の本文: {}", message.content.replace('\n', " / "));
+    }
+    db.done().await;
+}
+
+/// **VC のテキストチャットに残るものを全部並べる。**相手に見せたくないものが
+/// 混ざっていないかを、実際の投稿から確認する。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+#[ignore = "レビュー用の出力。--ignored で明示的に走らせる"]
+async fn dump_everything_left_in_a_voice_chat(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let fake = Arc::new(FakeGateway::default());
+    let adapter = adapter(&db, fake.clone(), 1);
+    let (vc, _, _) = started(&db, &adapter, 1).await;
+    accept_host(&db, &adapter, 1, 1).await;
+    post_room_code(&db, &adapter, 1, 1, "12345678").await;
+
+    for (label, channel) in [("red", vc.red), ("blue", vc.blue)] {
+        println!("\n===== vc1-{label} に残る投稿 =====");
+        for id in fake.sends_in(channel) {
+            let message = fake.message(channel, id);
+            println!("---- 通知が飛ぶ相手: {:?}", message.mention_users);
+            println!("{}", message.content);
+        }
     }
     db.done().await;
 }
