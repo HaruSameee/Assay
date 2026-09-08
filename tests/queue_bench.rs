@@ -236,7 +236,10 @@ async fn queue_status_under_thirty_requests_per_second(owner: PgPool) {
     let failed = failures.load(Ordering::Relaxed);
     println!("--------------------------------------------------");
     println!("GET /queue: {players}人がキュー中 / {rps} req/s / {seconds}秒");
-    println!("送信: {total} 件 / 成功: {} 件 / 失敗: {failed} 件", sorted.len());
+    println!(
+        "送信: {total} 件 / 成功: {} 件 / 失敗: {failed} 件",
+        sorted.len()
+    );
     println!("実測の所要時間: {:.1} 秒", wall.as_secs_f64());
     println!("p50: {:.2} ms", percentile(&sorted, 0.50));
     println!("p95: {:.2} ms", percentile(&sorted, 0.95));
