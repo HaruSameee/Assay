@@ -56,7 +56,9 @@ impl CurrentBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockSearchResult {
     pub player_id: Uuid,
-    pub display_name: String,
+    /// Discord の表示名。スナップショットがまだ無い相手では `None`。
+    pub display_name: Option<String>,
+    /// サイト上のトレーナー名。**利用者が打つのはこちら。**
     pub trainer_name: Option<String>,
 }
 

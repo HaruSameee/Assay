@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select target.id as player_id, target.trainer_name, snapshot.display_name as \"display_name?\" from players target left join lateral ( select s.display_name from player_discord_snapshots s where s.player_id = target.id order by s.id desc limit 1 ) snapshot on true where target.id <> $1 and ( position(lower($2) in lower(coalesce(snapshot.display_name, ''))) > 0 or position(lower($2) in lower(coalesce(target.trainer_name, ''))) > 0 or target.discord_user_id::text = $2 ) order by target.trainer_name nulls last, snapshot.display_name nulls last, target.id limit 20",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_discord_snapshots",
+            "name": "display_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "d11530ce81f8b6d36186e744891f5eb370e8fb8b720dcd313a1bf4dde3e93530"
+}

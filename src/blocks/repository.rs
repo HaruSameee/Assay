@@ -55,6 +55,18 @@ impl BlockRepository {
             .collect())
     }
 
+    /// ブロック相手を探す。**トレーナー名・Discord 表示名・Discord ユーザー ID の 3 つで引く。**
+    ///
+    /// 表示名だけで引いていた頃は、ほとんどの検索が空振りしていた。画面に出ているのは
+    /// トレーナー名で、利用者はそれを打つが、スナップショットに入っているのは Discord の
+    /// 表示名であり、本番では 53 人中 44 人で両者が食い違っていた。
+    ///
+    /// **`players` を主にして、スナップショットは左外部結合で足す。**スナップショットが
+    /// 無い人（バックフィルで取れなかった人・入った直後の人）も、トレーナー名と ID では
+    /// 見つかる必要がある。
+    ///
+    /// ユーザー ID は**完全一致**にする。部分一致にすると、桁の一部がたまたま合った
+    /// 無関係な人が出てきて、誤ブロックの元になる（解除は 5 日間できない）。
     pub async fn search_display_names(
         &self,
         player_id: PlayerId,
@@ -65,16 +77,21 @@ impl BlockRepository {
             return Ok(Vec::new());
         }
         let rows = sqlx::query!(
-            "select snapshot.player_id, snapshot.display_name, target.trainer_name \
-             from ( \
-                 select distinct on (player_id) player_id, display_name \
-                 from player_discord_snapshots \
-                 order by player_id, id desc \
-             ) snapshot \
-             join players target on target.id = snapshot.player_id \
-             where snapshot.player_id <> $1 \
-               and position(lower($2) in lower(snapshot.display_name)) > 0 \
-             order by snapshot.display_name, snapshot.player_id \
+            "select target.id as player_id, target.trainer_name, \
+                    snapshot.display_name as \"display_name?\" \
+             from players target \
+             left join lateral ( \
+                 select s.display_name from player_discord_snapshots s \
+                 where s.player_id = target.id \
+                 order by s.id desc limit 1 \
+             ) snapshot on true \
+             where target.id <> $1 \
+               and ( \
+                   position(lower($2) in lower(coalesce(snapshot.display_name, ''))) > 0 \
+                   or position(lower($2) in lower(coalesce(target.trainer_name, ''))) > 0 \
+                   or target.discord_user_id::text = $2 \
+               ) \
+             order by target.trainer_name nulls last, snapshot.display_name nulls last, target.id \
              limit 20",
             player_id.0,
             query,
