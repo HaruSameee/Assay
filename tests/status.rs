@@ -368,9 +368,11 @@ async fn the_status_page_carries_the_shared_header(owner: PgPool) {
     db.done().await;
 }
 
-/// 管理者リストに載っているセッションには、戦績画面のヘッダーにも管理の導線が出る。
+/// 管理者リストに載っているセッションでも、戦績画面に管理の導線は出ない。
+///
+/// リンクの有無がそのまま「この人は管理者か」の判別材料になるため、誰にも出さない。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn an_admin_sees_the_panel_link_on_the_status_page(owner: PgPool) {
+async fn an_admin_sees_no_panel_link_on_the_status_page(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 1).await;
     let oauth = Arc::new(FakeOAuth::new("1001"));
@@ -387,6 +389,7 @@ async fn an_admin_sees_the_panel_link_on_the_status_page(owner: PgPool) {
     let mut browser = Browser::new(app);
     sign_in(&mut browser, &db.registration, "1001").await;
     let page = body_text(browser.get("/status").await).await;
-    assert!(page.contains("<a href=\"/admin\">管理</a>"), "{page}");
+    assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
+    assert!(!page.contains("href=\"/admin\""), "{page}");
     db.done().await;
 }

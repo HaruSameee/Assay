@@ -807,9 +807,11 @@ mod tests {
             // 非管理者にパネルの存在を知らせない
             assert!(!rendered.contains("href=\"/admin\""), "{rendered}");
         }
-        // 管理者にはヘッダーにだけ管理リンクが増える
+        // **管理者でもヘッダーは同じ。**リンクの有無で管理者かどうかが判別できてしまう
         let admin = queue_page(Viewer::ADMIN, &status(), now, None, &[]);
-        assert!(admin.contains("<a href=\"/admin\">管理</a>"), "{admin}");
+        assert!(admin.contains(expected), "{admin}");
+        assert!(!admin.contains("href=\"/admin\""), "{admin}");
+        assert!(!admin.contains("管理"), "{admin}");
     }
 
     /// レビュー用に各画面の HTML を丸ごと出す。スクリーンショットが撮れないため。

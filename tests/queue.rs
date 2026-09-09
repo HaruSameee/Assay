@@ -1159,13 +1159,24 @@ async fn the_queue_page_carries_the_shared_header(owner: PgPool) {
     let (_, page) = get_queue_html(&others, me, "/queue").await;
     assert!(!page.contains("href=\"/admin\""), "{page}");
 
-    // 本人が管理者: ヘッダーにだけ 1 リンク増える
+    // **本人が管理者でもヘッダーは変わらない。**
+    // リンクの有無がそのまま「この人は管理者か」の判別材料になる
     let mine = router(
         QueueState::new(config(), db.registration.clone(), db.queue.clone())
             .with_admins(parse_admin_ids(Some(&discord_user_id)).unwrap()),
     );
-    let (_, page) = get_queue_html(&mine, me, "/queue").await;
-    assert!(page.contains("<a href=\"/admin\">管理</a>"), "{page}");
+    let (_, as_admin) = get_queue_html(&mine, me, "/queue").await;
+    assert!(!as_admin.contains("href=\"/admin\""), "{as_admin}");
+    let header_of = |body: &str| {
+        let start = body.find("<header").expect("a header");
+        let end = body.find("</header>").expect("a header end") + "</header>".len();
+        body[start..end].to_owned()
+    };
+    assert_eq!(
+        header_of(&as_admin),
+        header_of(&page),
+        "管理者と一般参加者でヘッダーが違う"
+    );
 
     // 未ログインの 401 画面には導線を出さない
     let response = send(
