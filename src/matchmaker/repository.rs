@@ -612,8 +612,37 @@ fn pick_vc(
         .cloned()
 }
 
+/// red / blue のラベルを入れ替えるか。**`formation_id` だけから決める。**
+///
+/// 探索側（[`crate::matchmaker::select`]）は、対称な分け方を 1 回だけ数えるために
+/// 「`assignment[0]` を必ず red に置く」という最適化を持っている。その `assignment[0]` は
+/// レート降順に並べたプールの先頭、つまり**その試合の最高レートの人**である。
+/// 結果として、探索の出力をそのまま使うと高レート側が常に red になる。
+///
+/// **探索は変えない。**出てきた分け方に対して、ここでラベルだけを入れ替える。
+/// 誰と誰が同じ側かは 1 ミリも動かないので、「チーム平均レートの差が最小」という
+/// 仕様も、凍結値（`mu_at_match` / `sigma_at_match`）もレート導出も影響を受けない。
+///
+/// 乱数やコイントスは使わない。同じ `formation_id` からは常に同じ結果が出る必要がある
+/// ——ログを畳み直したときに再現しないと、記録と画面が食い違う。
+pub fn teams_are_swapped(formation_id: FormationId) -> bool {
+    // 16 バイトを XOR で畳んで最下位ビットを見る。特定のバイトだけを見ると、
+    // ID の採番方式が変わったとき（v4 以外）に偏りが出る
+    formation_id
+        .0
+        .as_bytes()
+        .iter()
+        .fold(0u8, |folded, byte| folded ^ byte)
+        & 1
+        == 1
+}
+
 /// 成立した組を永続化の形に変換する。表示スケールから内部スケールへ変換する唯一の場所。
+///
+/// **red / blue のラベルはここで決まる。**探索の出力は「最高レートの人が red」に
+/// 固定されているので、`formation_id` から導いた向きで入れ替える。
 fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -> NewFormation {
+    let swapped = teams_are_swapped(id);
     NewFormation {
         id,
         created_at: now,
@@ -624,7 +653,11 @@ fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -
             .iter()
             .map(|player| NewFormationPlayer {
                 player_id: player.player_id,
-                team: player.team,
+                team: if swapped {
+                    player.team.flipped()
+                } else {
+                    player.team
+                },
                 role: player.role.clone(),
                 role_was_flexed: player.role_was_flexed,
                 // 凍結値は内部スケール（rating::DISPLAY_SCALE で割る）
@@ -755,4 +788,167 @@ async fn load_active_ally_blocks(
             .insert(PlayerId(row.blocked_player_id));
     }
     Ok(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeDelta, TimeZone, Utc};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::matchmaker::select::{Candidate, MATCH_SIZE, ROLES, RoleWish, select_matches};
+    use crate::queue::model::DOWN_RANGE;
+
+    fn now() -> Timestamp {
+        Utc.with_ymd_and_hms(2026, 9, 12, 21, 30, 0).unwrap()
+    }
+
+    /// 決定的な擬似乱数（splitmix64）。テストを安定させたまま、
+    /// 連番ではない現実的な UUID を作るために使う。
+    fn mix(mut seed: u64) -> u64 {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// 試行番号から formation_id を作る。連番 UUID では偏りの検証にならない。
+    fn formation_id(trial: u64) -> FormationId {
+        let high = mix(trial * 2);
+        let low = mix(trial * 2 + 1);
+        FormationId(Uuid::from_u128(u128::from(high) << 64 | u128::from(low)))
+    }
+
+    /// ロールがちょうど 2 人ずつ、レートがばらけた 10 人。
+    fn roster(trial: u64) -> Vec<Candidate> {
+        (0..MATCH_SIZE)
+            .map(|index| {
+                let offset = ((index * 7 + trial as usize * 3) % 10) as f64 * 5.0;
+                Candidate {
+                    player_id: PlayerId(Uuid::from_u128(
+                        u128::from(trial) * 100 + index as u128 + 1,
+                    )),
+                    rating: 1500.0 + offset,
+                    sigma: 500.0,
+                    down_range: DOWN_RANGE,
+                    enqueued_at: now() - TimeDelta::seconds(600),
+                    roles: vec![RoleWish {
+                        role: ROLES[index % ROLES.len()].to_owned(),
+                        priority: 1,
+                    }],
+                    flex_compensation: false,
+                }
+            })
+            .collect()
+    }
+
+    /// **同じ formation_id からは常に同じ向きが出る。**
+    #[test]
+    fn the_side_is_derived_from_the_formation_id_alone() {
+        for trial in 0..50 {
+            let id = formation_id(trial);
+            let first = teams_are_swapped(id);
+            for _ in 0..5 {
+                assert_eq!(teams_are_swapped(id), first, "{id} で結果が揺れている");
+            }
+        }
+        // 既知の値で固定する（採番方式を変えても気づけるように）
+        assert!(!teams_are_swapped(FormationId(Uuid::from_u128(0))));
+        assert!(teams_are_swapped(FormationId(Uuid::from_u128(1))));
+    }
+
+    /// **入れ替えても、誰と誰が同じ側かは変わらない。**
+    ///
+    /// チーム分割そのもの（＝仕様「チーム平均レートの差が最小」）と凍結値に
+    /// 影響しないことを、同じ提案を 2 通りのラベルで永続化して確かめる。
+    #[test]
+    fn swapping_the_labels_keeps_the_split_and_the_frozen_values() {
+        let proposal = select_matches(&roster(0), now()).remove(0);
+
+        // 入れ替えが起きる ID と起きない ID を 1 つずつ選ぶ
+        let plain = (0..200)
+            .map(formation_id)
+            .find(|id| !teams_are_swapped(*id))
+            .expect("入れ替えない ID");
+        let swapped = (0..200)
+            .map(formation_id)
+            .find(|id| teams_are_swapped(*id))
+            .expect("入れ替える ID");
+
+        let a = to_new_formation(plain, now(), &proposal);
+        let b = to_new_formation(swapped, now(), &proposal);
+
+        // 凍結値は 1 ミリも動かない
+        for (left, right) in a.players.iter().zip(&b.players) {
+            assert_eq!(left.player_id, right.player_id);
+            assert_eq!(left.role, right.role);
+            assert_eq!(left.mu_at_match, right.mu_at_match);
+            assert_eq!(left.sigma_at_match, right.sigma_at_match);
+            assert_eq!(left.team, right.team.flipped(), "ラベルが反転していない");
+        }
+
+        // 「同じ側にいる集合」も変わらない（ラベルが入れ替わるだけ）
+        let side = |formation: &NewFormation, team: Team| {
+            let mut ids: Vec<Uuid> = formation
+                .players
+                .iter()
+                .filter(|player| player.team == team)
+                .map(|player| player.player_id.0)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(side(&a, Team::Red), side(&b, Team::Blue));
+        assert_eq!(side(&a, Team::Blue), side(&b, Team::Red));
+    }
+
+    /// **実測: 20 組で、高レート側が red になる回数。**
+    ///
+    /// 修正前は探索の最適化がそのまま出ていて 20/20 だった。
+    #[test]
+    fn the_higher_rated_side_is_red_about_half_the_time() {
+        let mut red_is_higher = 0usize;
+        let mut lines = Vec::new();
+
+        for trial in 0..20u64 {
+            let proposal = select_matches(&roster(trial), now()).remove(0);
+            let id = formation_id(trial);
+            let formation = to_new_formation(id, now(), &proposal);
+
+            let mean = |team: Team| {
+                let picked: Vec<f64> = formation
+                    .players
+                    .iter()
+                    .filter(|player| player.team == team)
+                    .map(|player| player.mu_at_match)
+                    .collect();
+                picked.iter().sum::<f64>() / picked.len() as f64
+            };
+            let red = mean(Team::Red);
+            let blue = mean(Team::Blue);
+            if red > blue {
+                red_is_higher += 1;
+            }
+            lines.push(format!(
+                "trial {trial:>2}: 高い側 = {:<4} / 入れ替え = {}",
+                if red > blue { "red" } else { "blue" },
+                if teams_are_swapped(id) {
+                    "した"
+                } else {
+                    "しない"
+                },
+            ));
+        }
+
+        for line in &lines {
+            println!("{line}");
+        }
+        println!("---");
+        println!("高レート側が red になった回数: {red_is_higher} / 20");
+        assert!(
+            (6..=14).contains(&red_is_higher),
+            "偏っている: {red_is_higher} / 20"
+        );
+    }
 }
