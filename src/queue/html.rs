@@ -768,10 +768,10 @@ mod tests {
 
     /// キュー画面も共通ヘッダーをそのまま出す（自前の `<header>` を持たない）。
     ///
-    /// 3 つの表示（未投入・キュー中・ブロック / 成立）すべてで同じもの。
-    /// 登録画面側の `every_screen_renders_the_same_header` と対になる検査。
+    /// 一般参加者の 3 つの表示（未投入・キュー中・ブロック / 成立）では同じもの。
+    /// 管理者には管理パネルへの導線だけを追加する。
     #[test]
-    fn every_queue_view_renders_the_shared_header() {
+    fn every_queue_view_renders_the_header_for_its_viewer() {
         let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap();
         let mut queued = status();
         queued.queued = true;
@@ -805,13 +805,20 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "{rendered}");
             // 非管理者にパネルの存在を知らせない
-            assert!(!rendered.contains("href=\"/admin\""), "{rendered}");
+            assert!(!rendered.contains("admin"), "{rendered}");
         }
-        // **管理者でもヘッダーは同じ。**リンクの有無で管理者かどうかが判別できてしまう
+        // 管理者にはサーバーが管理パネルへの導線を含むヘッダーを送る。
         let admin = queue_page(Viewer::ADMIN, &status(), now, None, &[]);
-        assert!(admin.contains(expected), "{admin}");
-        assert!(!admin.contains("href=\"/admin\""), "{admin}");
-        assert!(!admin.contains("管理"), "{admin}");
+        let admin_expected = "<header class=\"site-header\">\n\
+             <a class=\"brand\" href=\"/queue\">Assay</a>\n\
+             <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
+             <a href=\"/status\">戦績</a>\n\
+             <a href=\"/profile\">プロフィール</a>\n\
+             <a href=\"/admin\">管理</a>\n\
+             <form method=\"post\" action=\"/auth/logout\">\
+             <button type=\"submit\">ログアウト</button></form>\n\
+             </nav>\n</header>\n";
+        assert!(admin.contains(admin_expected), "{admin}");
     }
 
     /// レビュー用に各画面の HTML を丸ごと出す。スクリーンショットが撮れないため。
