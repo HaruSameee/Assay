@@ -1373,3 +1373,76 @@ async fn both_teams_carry_an_icon_and_a_name(owner: PgPool) {
 
     db.done().await;
 }
+
+/// **同レートの並びが安定していること。**
+///
+/// 開幕直後は 1500 と 1600 の 2 値しかないので、相手チームのほぼ全員が同レートになる。
+/// 10 秒ポーリングのたびに並びが変わると読みづらいので、同率は `player_id` で決める。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn equal_ratings_keep_a_stable_order(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+    // blue（相手）の 5 人を全員同じレートにする（開幕直後の 1500 揃いと同じ形）
+    for n in 6..=10u128 {
+        snapshot(&db, player(n), &format!("相手{n}"), Some("abc123")).await;
+    }
+
+    let (_, first) = get_json(&app, 1, player(1)).await;
+    let order: Vec<String> = first["opponents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["player_id"].as_str().unwrap().to_owned())
+        .collect();
+    let ratings: Vec<f64> = first["opponents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["rating"].as_f64().unwrap())
+        .collect();
+    assert!(
+        ratings.windows(2).all(|pair| pair[0] == pair[1]),
+        "全員同レートの前提が崩れている: {ratings:?}"
+    );
+    println!("全員同レート（{}）のときの送信順:", ratings[0]);
+    for id in &order {
+        println!("  {id}");
+    }
+
+    // **10 回取り直しても同じ順**（ポーリングのたびに揺れない）
+    for attempt in 1..=10 {
+        let (_, again) = get_json(&app, 1, player(1)).await;
+        let repeated: Vec<String> = again["opponents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["player_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(repeated, order, "{attempt} 回目で並びが変わった");
+    }
+    // player_id の昇順（同率のタイブレーク）
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted, "同率のタイブレークが player_id 順でない");
+    println!("10 回取り直しても同じ順（player_id 昇順）");
+
+    // 自チームは**ロール順のまま**（レート順にしない）
+    let roles: Vec<&str> = first["teammates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["上キャリー", "サポート", "中央", "下キャリー", "タンク"],
+        "自チームがロール順でない"
+    );
+    println!("自チームの並び: {roles:?}（ロール順のまま）");
+
+    db.done().await;
+}
