@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use unite_matchsystem::blocks::{BLOCK_COOLDOWN_DAYS, BlockRepository, UserBlockError};
 use unite_matchsystem::lifecycle::PlayerId;
+use unite_matchsystem::profiles::ProfileRepository;
 use uuid::Uuid;
 
 const APP_ROLE: &str = "assay_app";
@@ -219,4 +220,108 @@ async fn an_admin_override_requires_a_uuid_target_in_its_payload(owner: PgPool) 
         Some("23514")
     );
     app.close().await;
+}
+
+/// **ブロック検索は 3 つの入口で引ける。**トレーナー名・Discord 表示名・ユーザー ID。
+///
+/// 表示名だけで引いていた頃は、本番の 53 人中 44 人で display_name と trainer_name が
+/// 食い違っており、画面に出ているトレーナー名を打っても 0 件だった。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_search_finds_people_by_trainer_name_display_name_and_user_id(owner: PgPool) {
+    let app = app_pool(&owner).await;
+    let blocks = BlockRepository::new(app.clone());
+    let profiles = ProfileRepository::new(app.clone());
+
+    // player 2: トレーナー名と Discord 表示名が食い違う（本番で 8 割がこの形）
+    set_trainer_name(&app, player(2), "ハチワ冷笑").await;
+    profiles
+        .record_appearance(player(2), "ばちお", None, at(0))
+        .await
+        .unwrap();
+    // player 3: スナップショットがまだ無い（バックフィルで取れなかった人）
+    set_trainer_name(&app, player(3), "地下貯蔵庫").await;
+    // player 4: 表示名だけある（トレーナー名は未設定）
+    profiles
+        .record_appearance(player(4), "L0tus__", None, at(0))
+        .await
+        .unwrap();
+
+    let ids = |found: &[unite_matchsystem::blocks::BlockSearchResult]| {
+        found.iter().map(|row| row.player_id).collect::<Vec<_>>()
+    };
+
+    // 1. **トレーナー名で引ける。**以前はここが 0 件だった
+    let found = blocks
+        .search_display_names(player(1), "ハチワ")
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec![player(2).0], "トレーナー名で引けない");
+    assert_eq!(found[0].trainer_name.as_deref(), Some("ハチワ冷笑"));
+    assert_eq!(found[0].display_name.as_deref(), Some("ばちお"));
+    println!(
+        "トレーナー名「ハチワ」→ {:?} / {:?}",
+        found[0].trainer_name, found[0].display_name
+    );
+
+    // 2. **Discord 表示名でも引ける**（従来どおり）
+    let found = blocks
+        .search_display_names(player(1), "ばちお")
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec![player(2).0], "表示名で引けない");
+
+    // 3. **Discord ユーザー ID で引ける。**reference の player 2 は 1002
+    let found = blocks
+        .search_display_names(player(1), "1002")
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec![player(2).0], "ユーザー ID で引けない");
+    println!("ユーザーID「1002」→ {:?}", found[0].trainer_name);
+
+    // 部分一致では引かない。桁の一部が合った無関係な人を出さない（誤ブロックは 5 日間解けない）
+    let found = blocks.search_display_names(player(1), "100").await.unwrap();
+    assert!(ids(&found).is_empty(), "ID の部分一致で出ている: {found:?}");
+
+    // 4. **スナップショットが無い人も、トレーナー名で見つかる**
+    let found = blocks
+        .search_display_names(player(1), "地下")
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&found),
+        vec![player(3).0],
+        "スナップショット無しが出ない"
+    );
+    assert_eq!(found[0].display_name, None, "表示名は未取得のまま返す");
+
+    // 5. トレーナー名が未設定でも、表示名で見つかる
+    let found = blocks
+        .search_display_names(player(1), "L0tus")
+        .await
+        .unwrap();
+    assert_eq!(ids(&found), vec![player(4).0]);
+    assert_eq!(found[0].trainer_name, None);
+
+    // 自分自身は出ない
+    set_trainer_name(&app, player(1), "じぶん").await;
+    let found = blocks
+        .search_display_names(player(1), "じぶん")
+        .await
+        .unwrap();
+    assert!(ids(&found).is_empty(), "自分が候補に出ている");
+
+    app.close().await;
+}
+
+/// テスト用にトレーナー名を入れる（`players` は可変の参照データ）。
+async fn set_trainer_name(pool: &PgPool, who: PlayerId, name: &str) {
+    sqlx::query("update players set trainer_name = $2, registered_at = now() where id = $1")
+        .bind(who.0)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("set the trainer name");
 }

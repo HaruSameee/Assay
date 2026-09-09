@@ -167,14 +167,14 @@ pub fn edit_page(page: EditPage<'_>) -> String {
         let rows = current_blocks
             .iter()
             .map(|block| {
-                let name = block
-                    .display_name
-                    .as_deref()
-                    .or(block.trainer_name.as_deref())
-                    .unwrap_or("表示名を取得できませんでした");
+                // 検索結果と同じ並べ方にする。片方だけ Discord 表示名で出すと、
+                // 同じ相手が 2 つの一覧で別人に見える
+                let name = block.trainer_name.as_deref().unwrap_or("（未設定）");
+                let discord = block.display_name.as_deref().unwrap_or("（未取得）");
                 let available = display_time(block.cooldown_ends_at());
                 format!(
                     "<li><div class=\"block-person\"><strong>{name}</strong>\
+                     <div class=\"block-meta\">Discord表示名: {discord}</div>\
                      <div class=\"block-meta\">解除可能: {available}</div></div>\
                      <form method=\"post\" action=\"/profile/blocks\">\
                      <input type=\"hidden\" name=\"action\" value=\"unblock\">\
@@ -183,6 +183,7 @@ pub fn edit_page(page: EditPage<'_>) -> String {
                      <button class=\"button-secondary\" type=\"submit\"{disabled}>解除</button>\
                      </form></li>",
                     name = escape(name),
+                    discord = escape(discord),
                     available = escape(&available),
                     target = escape(&block.blocked_player_id.to_string()),
                     form_key = block_form_key,
@@ -199,22 +200,27 @@ pub fn edit_page(page: EditPage<'_>) -> String {
     let search_results = if block_query.trim().is_empty() {
         String::new()
     } else if search_results.is_empty() {
-        "<p class=\"field-help\">一致するDiscord表示名は見つかりませんでした。</p>".to_owned()
+        "<p class=\"field-help\">一致する相手は見つかりませんでした。\
+         トレーナー名・Discord表示名・DiscordユーザーIDのいずれかで探せます\
+         （ユーザーIDは全桁を入れてください）。</p>"
+            .to_owned()
     } else {
+        // **トレーナー名と Discord 表示名を必ず両方出す。**同名や紛らわしい相手を
+        // 取り違えると、5 日間は解除できない
         let rows = search_results
             .iter()
             .map(|result| {
                 format!(
-                    "<li><div class=\"block-person\"><strong>{display_name}</strong>\
-                     <div class=\"block-meta\">トレーナー名: {trainer_name}</div></div>\
+                    "<li><div class=\"block-person\"><strong>{trainer_name}</strong>\
+                     <div class=\"block-meta\">Discord表示名: {display_name}</div></div>\
                      <form method=\"post\" action=\"/profile/blocks\">\
                      <input type=\"hidden\" name=\"action\" value=\"block\">\
                      <input type=\"hidden\" name=\"target\" value=\"{target}\">\
                      <input type=\"hidden\" name=\"key\" value=\"block:{form_key}:{target}\">\
                      <button class=\"button-secondary\" type=\"submit\">ブロック</button>\
                      </form></li>",
-                    display_name = escape(&result.display_name),
-                    trainer_name = escape(result.trainer_name.as_deref().unwrap_or("未設定")),
+                    trainer_name = escape(result.trainer_name.as_deref().unwrap_or("（未設定）")),
+                    display_name = escape(result.display_name.as_deref().unwrap_or("（未取得）")),
                     target = escape(&result.player_id.to_string()),
                     form_key = block_form_key,
                 )
@@ -251,8 +257,9 @@ pub fn edit_page(page: EditPage<'_>) -> String {
          <p class=\"field-help\">指定したプレイヤーと味方チームにならないようにします。相手チームには影響せず、相手に通知されません。</p>\
          {current_blocks}\
          <form method=\"get\" action=\"/profile\">\
-         <div class=\"field\"><label for=\"block_query\">Discord表示名で追加</label>\
-         <p class=\"field-help\">表示名の一部を入力して選択します。プレイヤーIDを入力する必要はありません。</p>\
+         <div class=\"field\"><label for=\"block_query\">相手を探して追加</label>\
+         <p class=\"field-help\">トレーナー名かDiscord表示名の一部、またはDiscordユーザーIDで探せます。\
+         同名の相手を取り違えないよう、結果には両方の名前が出ます。</p>\
          <input id=\"block_query\" name=\"block_query\" type=\"search\" value=\"{block_query}\" autocomplete=\"off\"></div>\
          <div class=\"actions\"><button class=\"button-secondary\" type=\"submit\">検索</button></div>\
          </form>\
@@ -367,11 +374,19 @@ mod tests {
             trainer_name: Some("trainer".to_owned()),
             blocked_at: chrono::Utc::now(),
         }];
-        let search = [BlockSearchResult {
-            player_id: uuid::Uuid::from_u128(43),
-            display_name: "Another Global Name".to_owned(),
-            trainer_name: Some("other-trainer".to_owned()),
-        }];
+        let search = [
+            BlockSearchResult {
+                player_id: uuid::Uuid::from_u128(43),
+                display_name: Some("Another Global Name".to_owned()),
+                trainer_name: Some("other-trainer".to_owned()),
+            },
+            // スナップショットがまだ無い相手。トレーナー名だけで出す
+            BlockSearchResult {
+                player_id: uuid::Uuid::from_u128(44),
+                display_name: None,
+                trainer_name: Some("no-snapshot".to_owned()),
+            },
+        ];
         let own = OwnProfile::default();
         let edit = edit_page(EditPage {
             viewer: Viewer::MEMBER,
@@ -387,6 +402,18 @@ mod tests {
         assert!(edit.contains("action=\"/profile/blocks\""), "{edit}");
         assert!(edit.contains("Global Name"), "{edit}");
         assert!(edit.contains(&target.to_string()), "{edit}");
+        // **検索結果には両方の名前が出る。**取り違えると 5 日間解除できない
+        assert!(
+            edit.contains("other-trainer"),
+            "トレーナー名が出ていない: {edit}"
+        );
+        assert!(
+            edit.contains("Discord表示名: Another Global Name"),
+            "Discord 表示名が出ていない: {edit}"
+        );
+        // スナップショットが無い相手も出る（表示名は「未取得」と分かる形で）
+        assert!(edit.contains("no-snapshot"), "{edit}");
+        assert!(edit.contains("Discord表示名: （未取得）"), "{edit}");
 
         let public = public_page(Viewer::ANONYMOUS, &profile());
         assert!(!public.contains("/profile/blocks"), "{public}");
