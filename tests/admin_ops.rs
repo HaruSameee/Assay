@@ -29,6 +29,7 @@ use tower::ServiceExt;
 use unite_matchsystem::admin::{
     AdminRepository, AdminState, DEFAULT_BLOCK_ALLOWANCE, parse_admin_ids, router as admin_router,
 };
+use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::lifecycle::{PlayerId, Timestamp};
 use unite_matchsystem::matchmaker::{
     Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
@@ -100,6 +101,7 @@ struct AppDb {
     registration: RegistrationRepository,
     formations: FormationRepository,
     admin: AdminRepository,
+    blocks: BlockRepository,
 }
 
 impl AppDb {
@@ -118,6 +120,7 @@ impl AppDb {
             registration: RegistrationRepository::new(pool.clone()),
             formations: FormationRepository::new(pool.clone()),
             admin: AdminRepository::new(pool.clone()),
+            blocks: BlockRepository::new(pool.clone()),
             pool,
         }
     }
@@ -135,6 +138,7 @@ impl AppDb {
             config(),
             ids,
             self.admin.clone(),
+            self.blocks.clone(),
         )))
     }
 
@@ -691,9 +695,9 @@ async fn removing_a_player_does_not_disturb_their_running_match(owner: PgPool) {
 // C. ブロック枠
 // ----------------------------------------------------------------------
 
-/// 既定は 2 枠。変更は追記として記録され、誰がいつ変えたかが残る。
+/// 既定は 1 枠。変更は追記として記録され、誰がいつ変えたかが残る。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn the_block_allowance_defaults_to_two_and_records_the_change(owner: PgPool) {
+async fn the_block_allowance_defaults_to_one_and_records_the_change(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_cast(&db, 2).await;
     let app = db.router();
@@ -705,7 +709,7 @@ async fn the_block_allowance_defaults_to_two_and_records_the_change(owner: PgPoo
     let path = format!("/admin/player?player={}", player(2).0);
     let (status, page) = get_html(&app, player(ADMIN), &path).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("<dt>ブロック枠</dt><dd>2 枠</dd>"), "{page}");
+    assert!(page.contains("<dt>ブロック枠</dt><dd>1 枠</dd>"), "{page}");
 
     let key = form_key(&page, "/admin/blocks");
     let (status, page) = post_form(
@@ -730,6 +734,64 @@ async fn the_block_allowance_defaults_to_two_and_records_the_change(owner: PgPoo
     assert_eq!(actions[0].target_player_id, Some(player(2).0));
     assert_eq!(actions[0].allowance, Some(4));
     assert_eq!(actions[0].reason.as_deref(), Some("大会前の調整"));
+    db.done().await;
+}
+
+/// 誤ブロックは 5 日間残るため、管理者は画面からだけ即時解除できる。
+/// 解除そのものと管理操作は、ともに追記行として残る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn an_admin_can_override_an_active_block_and_the_action_is_recorded(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 2).await;
+    db.blocks
+        .block(player(2), player(3), "player-block", at(0))
+        .await
+        .unwrap();
+    let app = db.router();
+    let path = format!("/admin/player?player={}", player(2).0);
+    let (status, page) = get_html(&app, player(ADMIN), &path).await;
+    assert_eq!(status, StatusCode::OK);
+    let key = form_key(&page, "/admin/blocks/override");
+
+    let (status, page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/blocks/override",
+        &format!(
+            "player={}&target={}&key={key}&reason=mistake",
+            player(2).0,
+            player(3).0,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("ブロックを管理解除しました"), "{page}");
+    assert!(db.blocks.current_for(player(2)).await.unwrap().is_empty());
+
+    let events: Vec<String> =
+        sqlx::query_scalar("select kind from player_blocks where player_id = $1 order by id")
+            .bind(player(2).0)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(events, ["blocked", "unblocked"]);
+    let actions = db.admin.recent_actions(10).await.unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].raw_kind, "block_override_removed");
+    assert_eq!(actions[0].target_player_id, Some(player(2).0));
+
+    let (status, _) = post_form(
+        &app,
+        player(2),
+        "/admin/blocks/override",
+        &format!(
+            "player={}&target={}&key=non-admin-override&reason=mistake",
+            player(2).0,
+            player(3).0,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     db.done().await;
 }
 

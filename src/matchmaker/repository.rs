@@ -35,7 +35,7 @@ use crate::rating::{DEFAULT_DISPLAY_MU, DEFAULT_DISPLAY_SIGMA, DISPLAY_SCALE};
 
 use super::select::{
     Candidate, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch, RoleWish,
-    select_matches,
+    select_matches_with_ally_blocks,
 };
 
 /// 1 回の実行の結果。
@@ -274,6 +274,7 @@ impl MatchmakerRepository {
         crate::persistence::repository::lock_vc_pool(&mut tx).await?;
 
         let candidates = load_candidates(&mut tx).await?;
+        let ally_blocks = load_active_ally_blocks(&mut tx, &candidates).await?;
         let mut outcome = RunOutcome {
             candidates: candidates.len(),
             unmatched: candidates.len(),
@@ -299,7 +300,7 @@ impl MatchmakerRepository {
             return Ok(outcome);
         }
 
-        let proposals = select_matches(&candidates, now);
+        let proposals = select_matches_with_ally_blocks(&candidates, &ally_blocks, now);
         if proposals.is_empty() {
             tx.commit().await?;
             return Ok(outcome);
@@ -719,4 +720,39 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
             }
         })
         .collect())
+}
+
+async fn load_active_ally_blocks(
+    conn: &mut PgConnection,
+    candidates: &[Candidate],
+) -> Result<super::select::AllyBlocks, RepositoryError> {
+    let player_ids: Vec<uuid::Uuid> = candidates
+        .iter()
+        .map(|candidate| candidate.player_id.0)
+        .collect();
+    if player_ids.is_empty() {
+        return Ok(super::select::AllyBlocks::new());
+    }
+    let rows = sqlx::query!(
+        "select latest.player_id, latest.blocked_player_id \
+         from ( \
+             select distinct on (player_id, blocked_player_id) \
+                    player_id, blocked_player_id, kind \
+             from player_blocks \
+             where player_id = any($1) \
+             order by player_id, blocked_player_id, id desc \
+         ) latest \
+         where latest.kind = 'blocked'",
+        &player_ids,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut blocks = super::select::AllyBlocks::new();
+    for row in rows {
+        blocks
+            .entry(PlayerId(row.player_id))
+            .or_default()
+            .insert(PlayerId(row.blocked_player_id));
+    }
+    Ok(blocks)
 }

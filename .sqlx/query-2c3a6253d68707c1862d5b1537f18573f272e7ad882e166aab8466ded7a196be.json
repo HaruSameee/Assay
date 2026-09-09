@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select latest.player_id, latest.created_at as \"blocked_at!\", snapshot.display_name as \"display_name?\", source.trainer_name from ( select distinct on (player_id) player_id, kind, created_at from player_blocks where blocked_player_id = $1 order by player_id, id desc ) latest join players source on source.id = latest.player_id left join lateral ( select display_name from player_discord_snapshots where player_id = latest.player_id order by id desc limit 1 ) snapshot on true where latest.kind = 'blocked' order by latest.created_at desc, latest.player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "player_blocks",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "blocked_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "player_blocks",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_discord_snapshots",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "2c3a6253d68707c1862d5b1537f18573f272e7ad882e166aab8466ded7a196be"
+}

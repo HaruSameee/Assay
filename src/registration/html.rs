@@ -844,6 +844,7 @@ mod tests {
             query: "",
             players: &[],
             recent: &[],
+            received_blocks: &[],
             notice: None,
         });
         assert_eq!(
@@ -923,6 +924,7 @@ mod tests {
                 query: "",
                 players: &[],
                 recent: &[],
+                received_blocks: &[],
                 notice: None,
             })
         );

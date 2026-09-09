@@ -9,17 +9,19 @@
 //! - **公開ビューは [`PublicProfile`] しか返さない。**非公開の担当ロールは型に入らない
 //! - URL に `discord_user_id` を出さない（`players.id` の UUID を使う）
 
-use axum::extract::{FromRef, Path, State};
+use axum::extract::{FromRef, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use chrono::Utc;
+use serde::Deserialize;
 use tracing::error;
 use uuid::Uuid;
 
 use crate::admin::AdminIds;
+use crate::blocks::{BlockRepository, UserBlockError};
 use crate::lifecycle::PlayerId;
 use crate::registration::html::error_page;
 use crate::registration::{Audience, AuthConfig, CurrentSession, RegistrationRepository, Viewer};
@@ -32,6 +34,7 @@ use super::repository::ProfileRepository;
 pub struct ProfileState {
     pub config: AuthConfig,
     pub profiles: ProfileRepository,
+    pub blocks: BlockRepository,
     /// 共通ヘッダーの導線判定に使う。
     pub registration: RegistrationRepository,
     key: Key,
@@ -44,12 +47,14 @@ impl ProfileState {
         config: AuthConfig,
         profiles: ProfileRepository,
         registration: RegistrationRepository,
+        blocks: BlockRepository,
     ) -> Self {
         let key = config.cookie_key();
         Self {
             config,
             profiles,
             registration,
+            blocks,
             key,
             audience: Audience::default(),
         }
@@ -85,6 +90,7 @@ pub fn router(state: ProfileState) -> Router {
     Router::new()
         .route("/players/{player_id}", get(show_public))
         .route("/profile", get(show_edit).post(save))
+        .route("/profile/blocks", axum::routing::post(change_block))
         .with_state(state)
 }
 
@@ -143,11 +149,29 @@ async fn show_public(
 }
 
 /// 自分の編集画面。
-async fn show_edit(State(app): State<ProfileState>, session: Option<CurrentSession>) -> Response {
+#[derive(Debug, Default, Deserialize)]
+struct EditQuery {
+    #[serde(default)]
+    block_query: String,
+}
+
+async fn show_edit(
+    State(app): State<ProfileState>,
+    session: Option<CurrentSession>,
+    Query(query): Query<EditQuery>,
+) -> Response {
     let Some(CurrentSession(current)) = session else {
         return session_expired();
     };
-    render_edit(&app, session.as_ref(), current.player_id, None, false).await
+    render_edit(
+        &app,
+        session.as_ref(),
+        current.player_id,
+        None,
+        false,
+        &query.block_query,
+    )
+    .await
 }
 
 /// 編集画面を描く（保存後の再描画にも使う）。
@@ -157,6 +181,7 @@ async fn render_edit(
     player_id: PlayerId,
     error: Option<&str>,
     saved: bool,
+    block_query: &str,
 ) -> Response {
     let own = match app.profiles.own(player_id).await {
         Ok(own) => own,
@@ -172,6 +197,24 @@ async fn render_edit(
             return internal_error(true);
         }
     };
+    let current_blocks = match app.blocks.current_for(player_id).await {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            error!(%error, "could not read current blocks");
+            return internal_error(true);
+        }
+    };
+    let search_results = match app
+        .blocks
+        .search_display_names(player_id, block_query)
+        .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            error!(%error, "could not search block targets");
+            return internal_error(true);
+        }
+    };
     let viewer = viewer(app, session).await;
     let status = if error.is_some() {
         StatusCode::BAD_REQUEST
@@ -180,14 +223,17 @@ async fn render_edit(
     };
     (
         status,
-        Html(super::html::edit_page(
+        Html(super::html::edit_page(super::html::EditPage {
             viewer,
-            player_id.0,
-            &own,
-            &known_roles,
+            player_id: player_id.0,
+            own: &own,
+            known_roles: &known_roles,
+            current_blocks: &current_blocks,
+            block_query,
+            search_results: &search_results,
             error,
             saved,
-        )),
+        })),
     )
         .into_response()
 }
@@ -251,6 +297,28 @@ struct EditForm {
     main_roles_public: bool,
 }
 
+#[derive(Debug, Default)]
+struct BlockForm {
+    action: String,
+    target: String,
+    key: String,
+}
+
+impl BlockForm {
+    fn from_body(body: &str) -> Self {
+        let mut form = Self::default();
+        for (name, value) in parse_form(body) {
+            match name.as_str() {
+                "action" => form.action = value,
+                "target" => form.target = value,
+                "key" => form.key = value,
+                _ => {}
+            }
+        }
+        form
+    }
+}
+
 impl EditForm {
     fn from_body(body: &str) -> Self {
         let mut form = Self::default();
@@ -301,6 +369,7 @@ async fn save(
                 current.player_id,
                 Some(&message),
                 false,
+                "",
             )
             .await;
         }
@@ -313,7 +382,107 @@ async fn save(
         error!(%error, "could not save the profile");
         return internal_error(true);
     }
-    render_edit(&app, session.as_ref(), current.player_id, None, true).await
+    render_edit(&app, session.as_ref(), current.player_id, None, true, "").await
+}
+
+async fn change_block(
+    State(app): State<ProfileState>,
+    session: Option<CurrentSession>,
+    body: String,
+) -> Response {
+    let Some(CurrentSession(current)) = session else {
+        return session_expired();
+    };
+    let form = BlockForm::from_body(&body);
+    let Ok(target) = Uuid::parse_str(form.target.trim()) else {
+        return render_edit(
+            &app,
+            session.as_ref(),
+            current.player_id,
+            Some("ブロックする相手を選択してください。"),
+            false,
+            "",
+        )
+        .await;
+    };
+    let Some(target) = (match app.profiles.find_player(target).await {
+        Ok(player) => player,
+        Err(error) => {
+            error!(%error, "could not validate a block target");
+            return internal_error(true);
+        }
+    }) else {
+        return render_edit(
+            &app,
+            session.as_ref(),
+            current.player_id,
+            Some("ブロックする相手を選択してください。"),
+            false,
+            "",
+        )
+        .await;
+    };
+    if form.key.trim().is_empty() {
+        return render_edit(
+            &app,
+            session.as_ref(),
+            current.player_id,
+            Some("操作をやり直してください。"),
+            false,
+            "",
+        )
+        .await;
+    }
+    let result = match form.action.as_str() {
+        "block" => {
+            app.blocks
+                .block(current.player_id, target, &form.key, Utc::now())
+                .await
+        }
+        "unblock" => {
+            app.blocks
+                .unblock(current.player_id, target, &form.key, Utc::now())
+                .await
+        }
+        _ => {
+            return render_edit(
+                &app,
+                session.as_ref(),
+                current.player_id,
+                Some("操作をやり直してください。"),
+                false,
+                "",
+            )
+            .await;
+        }
+    };
+    match result {
+        Ok(()) => render_edit(&app, session.as_ref(), current.player_id, None, true, "").await,
+        Err(error) => {
+            render_edit(
+                &app,
+                session.as_ref(),
+                current.player_id,
+                Some(block_error_message(&error)),
+                false,
+                "",
+            )
+            .await
+        }
+    }
+}
+
+fn block_error_message(error: &UserBlockError) -> &'static str {
+    match error {
+        UserBlockError::SelfTarget => "自分自身はブロックできません。",
+        UserBlockError::AlreadyBlocked => "このプレイヤーはすでにブロックしています。",
+        UserBlockError::AllowanceFull { .. } => "ブロック枠が埋まっています。",
+        UserBlockError::NotBlocked => "このプレイヤーは現在ブロックしていません。",
+        UserBlockError::Cooldown { .. } => "このブロックはまだ解除できません。",
+        UserBlockError::Database(_) => {
+            "操作を完了できませんでした。時間をおいて再試行してください。"
+        }
+    }
 }
 
 fn accepts_html(headers: &HeaderMap) -> bool {

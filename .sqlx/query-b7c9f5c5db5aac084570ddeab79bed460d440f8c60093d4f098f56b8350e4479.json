@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*)::bigint as \"count!\" from ( select distinct on (blocked_player_id) kind from player_blocks where player_id = $1 order by blocked_player_id, id desc ) latest where kind = 'blocked'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b7c9f5c5db5aac084570ddeab79bed460d440f8c60093d4f098f56b8350e4479"
+}

@@ -5,6 +5,8 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serenity::http::Http;
+use serenity::model::id::UserId;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -13,6 +15,7 @@ use unite_matchsystem::admin::{
     ADMIN_DISCORD_USER_IDS, AdminRepository, AdminState, admin_ids_from_env, router as admin_router,
 };
 use unite_matchsystem::api::{ApiState, router};
+use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::discord::{
     Adapter, DiscordConfig, Handler, SerenityGateway, build_client, resolve_vc_pool,
 };
@@ -52,6 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     match env::args().nth(1).as_deref() {
         Some("migrate") => return migrate().await,
+        Some("backfill-discord-appearances") => return backfill_discord_appearances().await,
         Some(command) => return Err(format!("unknown command: {command}").into()),
         None => {}
     }
@@ -103,6 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ratings_repo = RatingAdjustmentRepository::new(pool.clone());
     let status_repo = StatusRepository::new(pool.clone());
     let admin_store = AdminRepository::new(pool.clone());
+    let block_repo = BlockRepository::new(pool.clone());
     let match_pool = pool.clone();
     let ranking_pool = pool.clone();
     let matchmaker_repo = MatchmakerRepository::new(pool.clone());
@@ -214,9 +219,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_ranking(ranking_public),
     ))
     .merge(profile_router(
-        ProfileState::new(auth_config.clone(), profile_repo, registration_repo.clone())
-            .with_admins(admin_ids.clone())
-            .with_ranking(ranking_public),
+        ProfileState::new(
+            auth_config.clone(),
+            profile_repo,
+            registration_repo.clone(),
+            block_repo.clone(),
+        )
+        .with_admins(admin_ids.clone())
+        .with_ranking(ranking_public),
     ))
     .merge(ranking_router(
         RankingState::new(
@@ -234,7 +244,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let app = match admin_ids {
         Some(ids) => {
             info!(admins = %ids, "admin routes mounted");
-            app.merge(admin_router(AdminState::new(auth_config, ids, admin_store)))
+            app.merge(admin_router(AdminState::new(
+                auth_config,
+                ids,
+                admin_store,
+                block_repo,
+            )))
         }
         None => {
             warn!(
@@ -350,5 +365,60 @@ async fn migrate() -> Result<(), Box<dyn Error>> {
         .connect(&database_url)
         .await?;
     MIGRATOR.run(&pool).await?;
+    Ok(())
+}
+
+async fn backfill_discord_appearances() -> Result<(), Box<dyn Error>> {
+    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set")?;
+    let discord_config = DiscordConfig::from_env()?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let profiles = ProfileRepository::new(pool.clone());
+    let players = profiles.players_without_appearance().await?;
+    let http = Http::new(&discord_config.token);
+    let mut saved = 0usize;
+    let mut unavailable = 0usize;
+
+    for player in players {
+        let Ok(discord_user_id) = u64::try_from(player.discord_user_id) else {
+            unavailable += 1;
+            continue;
+        };
+        let member = match discord_config
+            .guild_id
+            .member(&http, UserId::new(discord_user_id))
+            .await
+        {
+            Ok(member) => member,
+            Err(_) => {
+                unavailable += 1;
+                continue;
+            }
+        };
+        let Some(display_name) = member
+            .user
+            .global_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            unavailable += 1;
+            continue;
+        };
+        let avatar_hash = member.user.avatar.as_ref().map(ToString::to_string);
+        profiles
+            .record_appearance(
+                player.player_id,
+                display_name,
+                avatar_hash.as_deref(),
+                chrono::Utc::now(),
+            )
+            .await?;
+        saved += 1;
+    }
+    info!(saved, unavailable, "discord appearance backfill completed");
+    pool.close().await;
     Ok(())
 }

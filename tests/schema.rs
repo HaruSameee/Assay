@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use unite_matchsystem::admin::AdminActionKind;
+use unite_matchsystem::blocks::BlockKind;
 use unite_matchsystem::lifecycle::{AbandonReason, FormationEventKind, PlayerId};
 use unite_matchsystem::rating::RatingAdjustmentRepository;
 
@@ -52,6 +53,8 @@ async fn append_only_privileges_and_triggers_are_wired(owner: sqlx::PgPool) {
         "delete from admin_actions",
         "update discord_failures set id = id",
         "delete from discord_failures",
+        "update player_blocks set id = id",
+        "delete from player_blocks",
     ] {
         for (pool, expected) in [(&app, "42501"), (&owner, "0A000")] {
             let error = sqlx::query(sql).execute(pool).await.unwrap_err();
@@ -447,8 +450,14 @@ fn kind_checks_for(table: &str) -> Vec<(PathBuf, Vec<String>)> {
     let marker = format!("table {table}");
     up_migrations()
         .into_iter()
-        .filter(|(_, sql)| sql.contains(&marker))
-        .filter_map(|(path, sql)| kind_check_values(&sql).map(|values| (path, values)))
+        .flat_map(|(path, sql)| {
+            sql.split(';')
+                .filter(|statement| statement.contains(&marker))
+                .filter_map(move |statement| {
+                    kind_check_values(statement).map(|values| (path.clone(), values))
+                })
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -487,6 +496,12 @@ fn admin_action_kind_check_matches_rust_enum() {
         .map(|kind| kind.as_str())
         .collect();
     assert_kind_check_matches("admin_actions", &values, "AdminActionKind::ALL");
+}
+
+#[test]
+fn player_block_kind_check_matches_rust_enum() {
+    let values: Vec<&str> = BlockKind::ALL.iter().map(|kind| kind.as_str()).collect();
+    assert_kind_check_matches("player_blocks", &values, "BlockKind::ALL");
 }
 
 #[test]

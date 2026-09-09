@@ -5,9 +5,11 @@
 
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
+use crate::status::html::display_time;
 
 use super::model::{MAX_BIO_CHARS, PublicProfile};
 use super::repository::OwnProfile;
+use crate::blocks::{BlockSearchResult, CurrentBlock};
 
 const PROFILE_STYLES: &str = r#"
 .profile-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 18px; align-items: center; margin-bottom: 26px; }
@@ -27,11 +29,30 @@ const PROFILE_STYLES: &str = r#"
 .role-choice { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 0; }
 .role-choice label { display: inline-flex; gap: 6px; align-items: center; }
 .char-count { color: var(--muted); font-size: 0.82rem; }
+.block-list, .block-search-results { margin: 0; padding: 0; list-style: none; }
+.block-list li, .block-search-results li { display: flex; flex-wrap: wrap; align-items: center;
+  justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.block-person { min-width: 0; overflow-wrap: anywhere; }
+.block-meta { color: var(--muted); font-size: 0.875rem; }
+.block-list form, .block-search-results form { margin: 0; }
+.block-list button, .block-search-results button { min-height: 38px; padding: 7px 12px; }
 @media (max-width: 600px) {
   .profile-head { grid-template-columns: 1fr; }
   .profile-metrics { grid-template-columns: 1fr; }
 }
 "#;
+
+pub struct EditPage<'a> {
+    pub viewer: Viewer,
+    pub player_id: uuid::Uuid,
+    pub own: &'a OwnProfile,
+    pub known_roles: &'a [String],
+    pub current_blocks: &'a [CurrentBlock],
+    pub block_query: &'a str,
+    pub search_results: &'a [BlockSearchResult],
+    pub error: Option<&'a str>,
+    pub saved: bool,
+}
 
 /// 公開プロフィール。**担当ロールは型に入っているときだけ描かれる。**
 pub fn public_page(viewer: Viewer, profile: &PublicProfile) -> String {
@@ -95,14 +116,18 @@ fn role_label(role: &str) -> &str {
 }
 
 /// 編集画面。**本人にだけ出す。**公開可否のチェックボックスもここにしか無い。
-pub fn edit_page(
-    viewer: Viewer,
-    player_id: uuid::Uuid,
-    own: &OwnProfile,
-    known_roles: &[String],
-    error: Option<&str>,
-    saved: bool,
-) -> String {
+pub fn edit_page(page: EditPage<'_>) -> String {
+    let EditPage {
+        viewer,
+        player_id,
+        own,
+        known_roles,
+        current_blocks,
+        block_query,
+        search_results,
+        error,
+        saved,
+    } = page;
     let notice = if saved {
         "<div class=\"notice\" role=\"status\"><p><strong>保存しました。</strong></p></div>\n"
             .to_owned()
@@ -135,6 +160,68 @@ pub fn edit_page(
     } else {
         ""
     };
+    let block_form_key = uuid::Uuid::new_v4();
+    let current_blocks = if current_blocks.is_empty() {
+        "<p class=\"field-help\">現在ブロックしているプレイヤーはいません。</p>".to_owned()
+    } else {
+        let rows = current_blocks
+            .iter()
+            .map(|block| {
+                let name = block
+                    .display_name
+                    .as_deref()
+                    .or(block.trainer_name.as_deref())
+                    .unwrap_or("表示名を取得できませんでした");
+                let available = display_time(block.cooldown_ends_at());
+                format!(
+                    "<li><div class=\"block-person\"><strong>{name}</strong>\
+                     <div class=\"block-meta\">解除可能: {available}</div></div>\
+                     <form method=\"post\" action=\"/profile/blocks\">\
+                     <input type=\"hidden\" name=\"action\" value=\"unblock\">\
+                     <input type=\"hidden\" name=\"target\" value=\"{target}\">\
+                     <input type=\"hidden\" name=\"key\" value=\"unblock:{form_key}:{target}\">\
+                     <button class=\"button-secondary\" type=\"submit\"{disabled}>解除</button>\
+                     </form></li>",
+                    name = escape(name),
+                    available = escape(&available),
+                    target = escape(&block.blocked_player_id.to_string()),
+                    form_key = block_form_key,
+                    disabled = if block.can_unblock_at(chrono::Utc::now()) {
+                        ""
+                    } else {
+                        " disabled"
+                    },
+                )
+            })
+            .collect::<String>();
+        format!("<ul class=\"block-list\">{rows}</ul>")
+    };
+    let search_results = if block_query.trim().is_empty() {
+        String::new()
+    } else if search_results.is_empty() {
+        "<p class=\"field-help\">一致するDiscord表示名は見つかりませんでした。</p>".to_owned()
+    } else {
+        let rows = search_results
+            .iter()
+            .map(|result| {
+                format!(
+                    "<li><div class=\"block-person\"><strong>{display_name}</strong>\
+                     <div class=\"block-meta\">トレーナー名: {trainer_name}</div></div>\
+                     <form method=\"post\" action=\"/profile/blocks\">\
+                     <input type=\"hidden\" name=\"action\" value=\"block\">\
+                     <input type=\"hidden\" name=\"target\" value=\"{target}\">\
+                     <input type=\"hidden\" name=\"key\" value=\"block:{form_key}:{target}\">\
+                     <button class=\"button-secondary\" type=\"submit\">ブロック</button>\
+                     </form></li>",
+                    display_name = escape(&result.display_name),
+                    trainer_name = escape(result.trainer_name.as_deref().unwrap_or("未設定")),
+                    target = escape(&result.player_id.to_string()),
+                    form_key = block_form_key,
+                )
+            })
+            .collect::<String>();
+        format!("<ul class=\"block-search-results\">{rows}</ul>")
+    };
 
     let body = format!(
         "<section aria-labelledby=\"edit-title\">\n<p class=\"eyebrow\">Profile</p>\n\
@@ -158,10 +245,25 @@ pub fn edit_page(
          </fieldset>\n\
          <div class=\"actions\"><button type=\"submit\">保存する</button>\
          <a class=\"button button-secondary\" href=\"/players/{player_id}\">公開プロフィールを見る</a></div>\n\
-         </form></section>\n",
+         </form>\
+         <section class=\"section\" aria-labelledby=\"blocks-title\">\n\
+         <h2 id=\"blocks-title\">味方ブロック</h2>\
+         <p class=\"field-help\">指定したプレイヤーと味方チームにならないようにします。相手チームには影響せず、相手に通知されません。</p>\
+         {current_blocks}\
+         <form method=\"get\" action=\"/profile\">\
+         <div class=\"field\"><label for=\"block_query\">Discord表示名で追加</label>\
+         <p class=\"field-help\">表示名の一部を入力して選択します。プレイヤーIDを入力する必要はありません。</p>\
+         <input id=\"block_query\" name=\"block_query\" type=\"search\" value=\"{block_query}\" autocomplete=\"off\"></div>\
+         <div class=\"actions\"><button class=\"button-secondary\" type=\"submit\">検索</button></div>\
+         </form>\
+         {search_results}\
+         </section></section>\n",
         max = MAX_BIO_CHARS,
         bio = escape(&own.bio),
         x_id = escape(own.x_id.as_deref().unwrap_or("")),
+        current_blocks = current_blocks,
+        block_query = escape(block_query),
+        search_results = search_results,
     );
     page_with_styles(viewer, "プロフィールの編集", &body, PROFILE_STYLES)
 }
@@ -254,5 +356,40 @@ mod tests {
         );
         assert!(with.contains("https://x.com/someone"), "{with}");
         assert!(with.contains("noopener"), "{with}");
+    }
+
+    #[test]
+    fn block_controls_only_render_on_the_private_edit_page() {
+        let target = uuid::Uuid::from_u128(42);
+        let blocks = [CurrentBlock {
+            blocked_player_id: target,
+            display_name: Some("Global Name".to_owned()),
+            trainer_name: Some("trainer".to_owned()),
+            blocked_at: chrono::Utc::now(),
+        }];
+        let search = [BlockSearchResult {
+            player_id: uuid::Uuid::from_u128(43),
+            display_name: "Another Global Name".to_owned(),
+            trainer_name: Some("other-trainer".to_owned()),
+        }];
+        let own = OwnProfile::default();
+        let edit = edit_page(EditPage {
+            viewer: Viewer::MEMBER,
+            player_id: uuid::Uuid::nil(),
+            own: &own,
+            known_roles: &[],
+            current_blocks: &blocks,
+            block_query: "another",
+            search_results: &search,
+            error: None,
+            saved: false,
+        });
+        assert!(edit.contains("action=\"/profile/blocks\""), "{edit}");
+        assert!(edit.contains("Global Name"), "{edit}");
+        assert!(edit.contains(&target.to_string()), "{edit}");
+
+        let public = public_page(Viewer::ANONYMOUS, &profile());
+        assert!(!public.contains("/profile/blocks"), "{public}");
+        assert!(!public.contains("Global Name"), "{public}");
     }
 }

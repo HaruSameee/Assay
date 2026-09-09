@@ -15,6 +15,7 @@
 use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::lifecycle::{
     AbandonReason, FormationEventKind as K, FormationId, FormationState, PlayerId, Timestamp,
 };
@@ -389,11 +390,19 @@ async fn summary_uses_the_persisted_queue_and_last_fifteen_minutes(owner: PgPool
             .await
             .unwrap();
     }
+    BlockRepository::new(db.pool.clone())
+        .block(player(1), player(11), "block-summary-player", at(550))
+        .await
+        .unwrap();
     let summary = matchmaker.summary(at(600)).await.unwrap();
     assert_eq!(summary.queued, 2);
     assert_eq!(summary.formed_last_15_minutes, 1);
     assert_eq!(summary.median_wait_seconds, Some(180));
-    assert_eq!(summary.longest_wait_seconds, Some(300));
+    assert_eq!(
+        summary.longest_wait_seconds,
+        Some(300),
+        "受信ブロックがある player(11) も queue_entries から集計する"
+    );
     assert_eq!(summary.first_choice_roles.top_carry, 1);
     assert_eq!(summary.first_choice_roles.top_support, 1);
     assert_eq!(summary.vc_in_use, 1);

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into admin_actions (kind, actor_discord_user_id, target_player_id, reason, payload, occurred_at, idempotency_key) values ('block_override_removed', $1, $2, null, $3, $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Jsonb",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e3b0769f1269ca10eed02d3c60ebfd83007e6403e3beca1e5df66296417cc3ea"
+}

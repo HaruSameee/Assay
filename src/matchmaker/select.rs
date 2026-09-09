@@ -24,7 +24,7 @@
 //! チーム分けだけは成立した 10 人に対する総当たり（`C(10,5)/2 = 126` 通り）でよい。
 //! 07 §4-3 のとおり、ここは十分小さい。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::lifecycle::{PlayerId, Timestamp};
 use crate::persistence::Team;
@@ -36,6 +36,38 @@ use super::flow::MinCostFlow;
 pub const MATCH_SIZE: usize = 10;
 /// 1 チームの人数。
 pub const TEAM_SIZE: usize = MATCH_SIZE / 2;
+
+/// Active directed ally blocks. A relation in either direction prevents the
+/// two players from being assigned to the same team.
+pub type AllyBlocks = HashMap<PlayerId, HashSet<PlayerId>>;
+
+/// Observes selection work without changing the matching decisions.
+///
+/// The production observer is a no-op. Benchmarks can opt into detailed
+/// counters and timings without adding clock reads to the production path.
+trait SelectionObserver {
+    fn begin_measurement(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn record_anchor(&mut self) {}
+
+    fn record_window(&mut self, _large_enough: bool, _elapsed: Option<std::time::Duration>) {}
+
+    fn record_role_assignment(&mut self, _success: bool, _elapsed: Option<std::time::Duration>) {}
+
+    fn record_team_mask(&mut self) {}
+
+    fn record_block_check(&mut self, _blocked: bool, _elapsed: Option<std::time::Duration>) {}
+
+    fn record_blocked_team_mask(&mut self) {}
+
+    fn record_team_split(&mut self, _success: bool, _elapsed: Option<std::time::Duration>) {}
+}
+
+struct NoopSelectionObserver;
+
+impl SelectionObserver for NoopSelectionObserver {}
 
 /// ロールの正規値（00 §4 / Phase 1 マイグレーションの `roles`）。
 ///
@@ -199,6 +231,30 @@ impl ProposedMatch {
 /// 成立した 10 人は候補から外して探索を続ける（07 §4-2「1 回の実行で組めるだけ組む」）。
 /// 返る順序は決定的（レート降順・同点は `player_id` 昇順で走査した結果）。
 pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedMatch> {
+    let mut observer = NoopSelectionObserver;
+    select_matches_inner(candidates, &AllyBlocks::new(), now, &mut observer)
+}
+
+/// Select matches with hard ally-only incompatibilities.
+///
+/// Role allocation is deliberately unchanged. If the allocated ten players
+/// have no legal team split, [`find_one`] continues with the next existing
+/// rating-window anchor rather than searching another role assignment.
+pub fn select_matches_with_ally_blocks(
+    candidates: &[Candidate],
+    ally_blocks: &AllyBlocks,
+    now: Timestamp,
+) -> Vec<ProposedMatch> {
+    let mut observer = NoopSelectionObserver;
+    select_matches_inner(candidates, ally_blocks, now, &mut observer)
+}
+
+fn select_matches_inner<O: SelectionObserver>(
+    candidates: &[Candidate],
+    ally_blocks: &AllyBlocks,
+    now: Timestamp,
+    observer: &mut O,
+) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
     // 決定的にするため、レート降順・同点は player_id 昇順で固定する
     pool.sort_by(|a, b| {
@@ -210,7 +266,7 @@ pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedM
 
     let mut matches = Vec::new();
     while pool.len() >= MATCH_SIZE {
-        let Some((taken, proposal)) = find_one(&pool, now) else {
+        let Some((taken, proposal)) = find_one(&pool, ally_blocks, now, observer) else {
             break;
         };
         // 成立した 10 人を候補から外す（添字の大きい方から消す）
@@ -230,24 +286,49 @@ pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedM
 ///
 /// `anchor` は 0（最高レート）から順に下りるので、上のウィンドウで組めなかった候補は
 /// **同じ呼び出しの中で下のウィンドウでも評価される**（飛ばさない）。
-fn find_one(pool: &[&Candidate], now: Timestamp) -> Option<(Vec<usize>, ProposedMatch)> {
+fn find_one<O: SelectionObserver>(
+    pool: &[&Candidate],
+    ally_blocks: &AllyBlocks,
+    now: Timestamp,
+    observer: &mut O,
+) -> Option<(Vec<usize>, ProposedMatch)> {
     let span = f64::from(UP_RANGE);
     for anchor in 0..pool.len() {
+        observer.record_anchor();
         // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
         // ここで 2 条件を満たしていれば部分集合はどれも満たす
         let floor = pool[anchor].rating;
+        let window_started = observer.begin_measurement();
         let window: Vec<usize> = (0..pool.len())
             .filter(|&i| {
                 let above = pool[i].rating - floor;
                 above >= 0.0 && above <= span && above <= f64::from(pool[i].down_range)
             })
             .collect();
+        observer.record_window(
+            window.len() >= MATCH_SIZE,
+            window_started.map(|started| started.elapsed()),
+        );
         if window.len() < MATCH_SIZE {
             continue;
         }
-        if let Some(assignment) = assign_roles(pool, &window, now) {
-            let taken = assignment.iter().map(|slot| slot.pool_index).collect();
-            return Some((taken, split_teams(pool, &assignment, now)));
+        let role_started = observer.begin_measurement();
+        let assignment = assign_roles(pool, &window, now);
+        observer.record_role_assignment(
+            assignment.is_some(),
+            role_started.map(|started| started.elapsed()),
+        );
+        if let Some(assignment) = assignment {
+            let split_started = observer.begin_measurement();
+            let proposal = split_teams(pool, &assignment, ally_blocks, now, observer);
+            observer.record_team_split(
+                proposal.is_some(),
+                split_started.map(|started| started.elapsed()),
+            );
+            if let Some(proposal) = proposal {
+                let taken = assignment.iter().map(|slot| slot.pool_index).collect();
+                return Some((taken, proposal));
+            }
         }
     }
     None
@@ -336,7 +417,13 @@ fn edge_cost(candidate: &Candidate, wish: &RoleWish, wait: i64, longest: i64) ->
 ///
 /// 成立した 10 人に対する総当たり。`C(10,5)/2 = 126` 通りを、先頭のプレイヤーを red に
 /// 固定して数え上げる。各チームに 5 ロールが 1 人ずつ入る分け方だけを残す。
-fn split_teams(pool: &[&Candidate], assignment: &[Slot], now: Timestamp) -> ProposedMatch {
+fn split_teams<O: SelectionObserver>(
+    pool: &[&Candidate],
+    assignment: &[Slot],
+    ally_blocks: &AllyBlocks,
+    now: Timestamp,
+    observer: &mut O,
+) -> Option<ProposedMatch> {
     let ratings: Vec<f64> = assignment
         .iter()
         .map(|slot| pool[slot.pool_index].rating)
@@ -363,13 +450,21 @@ fn split_teams(pool: &[&Candidate], assignment: &[Slot], now: Timestamp) -> Prop
         if red_roles.count_ones() as usize != ROLES.len() {
             continue;
         }
+        observer.record_team_mask();
+        let block_started = observer.begin_measurement();
+        let blocked = has_same_team_block(pool, assignment, mask, ally_blocks);
+        observer.record_block_check(blocked, block_started.map(|started| started.elapsed()));
+        if blocked {
+            observer.record_blocked_team_mask();
+            continue;
+        }
         let difference = ((red_sum - blue_sum) / TEAM_SIZE as f64).abs();
         if best.is_none_or(|(current, _)| difference < current) {
             best = Some((difference, mask));
         }
     }
     // 割り当ては 5 ロール × 各 2 人なので、条件を満たす分け方は必ず存在する
-    let (_, mask) = best.expect("a role-balanced split always exists for two players per role");
+    let (_, mask) = best?;
 
     let mut players: Vec<ProposedPlayer> = assignment
         .iter()
@@ -401,7 +496,33 @@ fn split_teams(pool: &[&Candidate], assignment: &[Slot], now: Timestamp) -> Prop
             ROLES.iter().position(|role| *role == player.role),
         )
     });
-    ProposedMatch { players }
+    Some(ProposedMatch { players })
+}
+
+fn has_same_team_block(
+    pool: &[&Candidate],
+    assignment: &[Slot],
+    mask: u32,
+    ally_blocks: &AllyBlocks,
+) -> bool {
+    for (left_index, left_slot) in assignment.iter().enumerate() {
+        let left_player = pool[left_slot.pool_index].player_id;
+        for (right_index, right_slot) in assignment.iter().enumerate() {
+            let left_is_red = mask & (1 << left_index) != 0;
+            let right_is_red = mask & (1 << right_index) != 0;
+            if left_index == right_index || left_is_red != right_is_red {
+                continue;
+            }
+            let right_player = pool[right_slot.pool_index].player_id;
+            if ally_blocks
+                .get(&left_player)
+                .is_some_and(|blocked| blocked.contains(&right_player))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 割り当て済みのロールごとの人数（テストと不変条件の確認に使う）。
@@ -417,11 +538,70 @@ pub fn role_counts(proposal: &ProposedMatch) -> HashMap<(&str, Team), usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use chrono::{TimeDelta, TimeZone, Utc};
     use uuid::Uuid;
 
     use super::*;
     use crate::queue::model::DOWN_RANGE;
+
+    #[derive(Debug, Default)]
+    struct SelectionDiagnostics {
+        anchors: usize,
+        large_enough_windows: usize,
+        role_allocations: usize,
+        role_allocation_failures: usize,
+        team_splits: usize,
+        failed_team_splits: usize,
+        legal_role_masks: usize,
+        block_checks: usize,
+        block_rejected_masks: usize,
+        window_time: Duration,
+        role_time: Duration,
+        block_check_time: Duration,
+        split_time: Duration,
+    }
+
+    impl SelectionObserver for SelectionDiagnostics {
+        fn begin_measurement(&self) -> Option<Instant> {
+            Some(Instant::now())
+        }
+
+        fn record_anchor(&mut self) {
+            self.anchors += 1;
+        }
+
+        fn record_window(&mut self, large_enough: bool, elapsed: Option<Duration>) {
+            self.large_enough_windows += usize::from(large_enough);
+            self.window_time += elapsed.unwrap_or_default();
+        }
+
+        fn record_role_assignment(&mut self, success: bool, elapsed: Option<Duration>) {
+            self.role_allocations += 1;
+            self.role_allocation_failures += usize::from(!success);
+            self.role_time += elapsed.unwrap_or_default();
+        }
+
+        fn record_team_mask(&mut self) {
+            self.legal_role_masks += 1;
+        }
+
+        fn record_block_check(&mut self, _blocked: bool, elapsed: Option<Duration>) {
+            self.block_checks += 1;
+            self.block_check_time += elapsed.unwrap_or_default();
+        }
+
+        fn record_blocked_team_mask(&mut self) {
+            self.block_rejected_masks += 1;
+        }
+
+        fn record_team_split(&mut self, success: bool, elapsed: Option<Duration>) {
+            self.team_splits += 1;
+            self.failed_team_splits += usize::from(!success);
+            self.split_time += elapsed.unwrap_or_default();
+        }
+    }
 
     /// 基準時刻。すべての待ち時間はここからの逆算。
     fn now() -> Timestamp {
@@ -461,6 +641,15 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn select_with_diagnostics(
+        roster: &[Candidate],
+        blocks: &AllyBlocks,
+    ) -> (Vec<ProposedMatch>, SelectionDiagnostics) {
+        let mut diagnostics = SelectionDiagnostics::default();
+        let matches = select_matches_inner(roster, blocks, now(), &mut diagnostics);
+        (matches, diagnostics)
     }
 
     fn ids(proposal: &ProposedMatch) -> Vec<u128> {
@@ -529,6 +718,190 @@ mod tests {
                 .iter()
                 .all(|player| !player.role_was_flexed)
         );
+    }
+
+    #[test]
+    fn an_ally_block_keeps_the_pair_on_opposing_teams() {
+        let roster = full_roster(1, 1500.0);
+        let mut blocks = AllyBlocks::new();
+        blocks
+            .entry(PlayerId(Uuid::from_u128(1)))
+            .or_default()
+            .insert(PlayerId(Uuid::from_u128(2)));
+
+        let matches = select_matches_with_ally_blocks(&roster, &blocks, now());
+        assert_eq!(matches.len(), 1);
+        let proposal = &matches[0];
+        assert_ne!(
+            role_of(proposal, 1).team,
+            role_of(proposal, 2).team,
+            "an outgoing block only prevents teammates"
+        );
+    }
+
+    #[test]
+    fn a_block_between_same_role_players_does_not_reject_the_formation() {
+        let roster = full_roster(1, 1500.0);
+        let mut blocks = AllyBlocks::new();
+        // Players 1 and 6 have the same fixed role and must already be opponents.
+        blocks
+            .entry(PlayerId(Uuid::from_u128(1)))
+            .or_default()
+            .insert(PlayerId(Uuid::from_u128(6)));
+
+        let matches = select_matches_with_ally_blocks(&roster, &blocks, now());
+        assert_eq!(matches.len(), 1);
+        assert_ne!(role_of(&matches[0], 1).team, role_of(&matches[0], 6).team);
+    }
+
+    #[test]
+    fn a_blocked_candidate_set_falls_through_to_the_next_window() {
+        let mut roster = full_roster(1, 1551.0);
+        roster.extend(full_roster(11, 1500.0));
+        let mut blocks = AllyBlocks::new();
+        let blocked = blocks.entry(PlayerId(Uuid::from_u128(1))).or_default();
+        for player in 2..=10 {
+            blocked.insert(PlayerId(Uuid::from_u128(player)));
+        }
+
+        let matches = select_matches_with_ally_blocks(&roster, &blocks, now());
+        assert_eq!(matches.len(), 1);
+        assert_eq!(ids(&matches[0]), (11..=20).collect::<Vec<u128>>());
+        assert_well_formed(&matches[0]);
+    }
+
+    #[test]
+    fn a_candidate_set_without_a_legal_team_split_is_rejected() {
+        let roster = full_roster(1, 1500.0);
+        let mut blocks = AllyBlocks::new();
+        let blocked = blocks.entry(PlayerId(Uuid::from_u128(1))).or_default();
+        for player in 2..=10 {
+            blocked.insert(PlayerId(Uuid::from_u128(player)));
+        }
+
+        assert!(select_matches_with_ally_blocks(&roster, &blocks, now()).is_empty());
+    }
+
+    #[test]
+    #[ignore = "benchmark; run cargo test --lib ally_block_benchmark -- --ignored --nocapture"]
+    fn ally_block_benchmark_covers_realistic_queue_sizes_and_diagnoses_the_worst_case() {
+        for queued in [30, 50, 100] {
+            let roster = benchmark_roster(queued);
+            let (baseline_formations, baseline_elapsed) =
+                benchmark_case(&roster, &AllyBlocks::new());
+            println!(
+                "ally-block benchmark: queued={queued} condition=none formations={baseline_formations} avg_ms={:.3}",
+                baseline_elapsed.as_secs_f64() * 1000.0,
+            );
+
+            for (label, active_percent, slots_per_active_player) in
+                [("all-1", 100, 1), ("30pct-2", 30, 2)]
+            {
+                let blocks = benchmark_blocks(queued, active_percent, slots_per_active_player);
+                let (formations, elapsed) = benchmark_case(&roster, &blocks);
+                println!(
+                    "ally-block benchmark: queued={queued} condition={label} active_blockers={} slots_per_active_player={slots_per_active_player} formations={formations} avg_ms={:.3}",
+                    queued * active_percent / 100,
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+            }
+        }
+
+        // Keep the original all-player, two-slot case as a worst-case reference.
+        let roster = benchmark_roster(300);
+        let blocks = benchmark_blocks(300, 100, 2);
+        let (baseline_formations, baseline_elapsed) = benchmark_case(&roster, &AllyBlocks::new());
+        let (formations, elapsed) = benchmark_case(&roster, &blocks);
+        let diagnostic_started = Instant::now();
+        let (diagnostic_matches, diagnostics) = select_with_diagnostics(&roster, &blocks);
+        let diagnostic_elapsed = diagnostic_started.elapsed();
+
+        println!(
+            "ally-block benchmark: queued=300 condition=all-2 formations={formations} avg_ms={:.3} baseline_formations={baseline_formations} baseline_avg_ms={:.3}",
+            elapsed.as_secs_f64() * 1000.0,
+            baseline_elapsed.as_secs_f64() * 1000.0,
+        );
+        println!(
+            "ally-block diagnostics: queued=300 condition=all-2 formations={} total_ms={:.3} anchors={} large_windows={} role_allocations={} role_failures={} team_splits={} failed_team_splits={} legal_role_masks={} block_checks={} block_rejected_masks={} window_ms={:.3} role_ms={:.3} block_check_ms={:.3} split_ms={:.3}",
+            diagnostic_matches.len(),
+            diagnostic_elapsed.as_secs_f64() * 1000.0,
+            diagnostics.anchors,
+            diagnostics.large_enough_windows,
+            diagnostics.role_allocations,
+            diagnostics.role_allocation_failures,
+            diagnostics.team_splits,
+            diagnostics.failed_team_splits,
+            diagnostics.legal_role_masks,
+            diagnostics.block_checks,
+            diagnostics.block_rejected_masks,
+            diagnostics.window_time.as_secs_f64() * 1000.0,
+            diagnostics.role_time.as_secs_f64() * 1000.0,
+            diagnostics.block_check_time.as_secs_f64() * 1000.0,
+            diagnostics.split_time.as_secs_f64() * 1000.0,
+        );
+    }
+
+    fn benchmark_roster(queued: usize) -> Vec<Candidate> {
+        (1..=queued as u128)
+            .map(|id| {
+                who(
+                    id,
+                    1500.0,
+                    DOWN_RANGE,
+                    600,
+                    &[ROLES[(id as usize - 1) % ROLES.len()]],
+                )
+            })
+            .collect()
+    }
+
+    fn benchmark_blocks(
+        queued: usize,
+        active_percent: usize,
+        slots_per_active_player: usize,
+    ) -> AllyBlocks {
+        let active_players = queued * active_percent / 100;
+        let mut sources: Vec<u128> = (1..=queued as u128).collect();
+        let mut seed = 0x4d595df4d0f33173_u64;
+        if active_players != queued {
+            for index in (1..sources.len()).rev() {
+                seed = next_benchmark_random(&mut seed);
+                sources.swap(index, (seed as usize) % (index + 1));
+            }
+        }
+
+        let mut blocks = AllyBlocks::new();
+        for source in sources.into_iter().take(active_players) {
+            let blocked = blocks.entry(PlayerId(Uuid::from_u128(source))).or_default();
+            while blocked.len() < slots_per_active_player {
+                seed = next_benchmark_random(&mut seed);
+                let target = 1 + u128::from(seed % queued as u64);
+                if target != source {
+                    blocked.insert(PlayerId(Uuid::from_u128(target)));
+                }
+            }
+        }
+        blocks
+    }
+
+    fn next_benchmark_random(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *seed
+    }
+
+    fn benchmark_case(roster: &[Candidate], blocks: &AllyBlocks) -> (usize, Duration) {
+        const RUNS: u32 = 5;
+        let mut formations = None;
+        let started = Instant::now();
+        for _ in 0..RUNS {
+            let result = select_matches_with_ally_blocks(roster, blocks, now());
+            if let Some(expected) = formations {
+                assert_eq!(result.len(), expected, "benchmark must be deterministic");
+            } else {
+                formations = Some(result.len());
+            }
+        }
+        (formations.unwrap_or_default(), started.elapsed() / RUNS)
     }
 
     #[test]

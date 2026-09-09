@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select (payload ->> 'allowance')::integer as \"allowance!\" from admin_actions where kind = 'block_allowance_set' and target_player_id = $1 order by id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "allowance!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "12dd617b320c683e93537566379a9585f6f891a19ae8e44fc4fe3b6939882f18"
+}

@@ -31,6 +31,12 @@ pub struct OwnProfile {
     pub main_roles_public: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerDiscordIdentity {
+    pub player_id: PlayerId,
+    pub discord_user_id: i64,
+}
+
 impl ProfileRepository {
     /// プールを包む。
     pub fn new(pool: PgPool) -> Self {
@@ -83,6 +89,28 @@ impl ProfileRepository {
             display_name: row.display_name,
             avatar_hash: row.avatar_hash,
         }))
+    }
+
+    /// Existing players without any appearance snapshot. This only identifies
+    /// rows for a one-time fetch; writes still use [`Self::record_appearance`].
+    pub async fn players_without_appearance(
+        &self,
+    ) -> Result<Vec<PlayerDiscordIdentity>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select p.id, p.discord_user_id from players p \
+             where not exists ( \
+                 select 1 from player_discord_snapshots s where s.player_id = p.id \
+             ) order by p.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PlayerDiscordIdentity {
+                player_id: PlayerId(row.id),
+                discord_user_id: row.discord_user_id,
+            })
+            .collect())
     }
 
     /// 編集内容を追記する。**上書きしない。**
