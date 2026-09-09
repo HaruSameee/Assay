@@ -621,27 +621,29 @@ async fn the_admin_panel_is_reachable_but_never_linked(owner: PgPool) {
     assert!(panel.contains("レート調整パネル"), "{panel}");
     assert!(panel.contains("<a href=\"/status\">戦績</a>"), "{panel}");
     assert!(!panel.contains("href=\"/admin\""), "{panel}");
-    let elsewhere = body_text(admin.get("/register").await).await;
-    assert!(!elsewhere.contains("href=\"/admin\""), "{elsewhere}");
-    assert!(!elsewhere.contains("管理"), "{elsewhere}");
-
-    // 一般プレイヤー: 同じ構成。/admin は 404 のまま
-    let mut nope = player_browser(&db, &oauth, ids(), 2).await;
-    let page = body_text(nope.get("/register").await).await;
-    assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
-    assert!(page.contains("action=\"/auth/logout\""), "{page}");
-    assert!(!page.contains("href=\"/admin\""), "{page}");
-    assert!(!page.contains("管理"), "{page}");
-
-    // **管理者と一般参加者のヘッダーが 1 バイトも違わないこと。**
+    // 「管理」の有無はヘッダーだけで見る。本文にはトレーナー名「管理者」が出る
     let header_of = |body: &str| {
         let start = body.find("<header").expect("a header");
         let end = body.find("</header>").expect("a header end") + "</header>".len();
         body[start..end].to_owned()
     };
+    let elsewhere = body_text(admin.get("/register").await).await;
+    let admin_header = header_of(&elsewhere);
+    assert!(!elsewhere.contains("href=\"/admin\""), "{elsewhere}");
+    assert!(!admin_header.contains("管理"), "{admin_header}");
+
+    // 一般プレイヤー: 同じ構成。/admin は 404 のまま
+    let mut nope = player_browser(&db, &oauth, ids(), 2).await;
+    let page = body_text(nope.get("/register").await).await;
+    let player_header = header_of(&page);
+    assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
+    assert!(page.contains("action=\"/auth/logout\""), "{page}");
+    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!player_header.contains("管理"), "{player_header}");
+
+    // **管理者と一般参加者のヘッダーが 1 バイトも違わないこと。**
     assert_eq!(
-        header_of(&elsewhere),
-        header_of(&page),
+        admin_header, player_header,
         "管理者と一般参加者でヘッダーが違う"
     );
 
