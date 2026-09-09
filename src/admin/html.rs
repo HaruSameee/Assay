@@ -12,7 +12,7 @@ use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
-use super::repository::{AdjustmentRow, FoundPlayer, QueuedEntry};
+use super::repository::{AdjustmentRow, AwaitingReports, FoundPlayer, QueuedEntry};
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
 
 /// 検索画面に渡すデータ。
@@ -361,9 +361,10 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/queue", "キューと運用"),
+        link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
     )
 }
@@ -1060,4 +1061,102 @@ mod tests {
             println!("===== {name}\n{html}");
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// 運営による報告の入力
+// ----------------------------------------------------------------------
+
+/// 報告の入力画面（`/admin/reports`）に渡すデータ。
+#[derive(Debug, Clone)]
+pub struct ReportsView<'a> {
+    /// 報告待ちの formation と未報告者。
+    pub awaiting: &'a [AwaitingReports],
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    pub notice: Option<Notice>,
+}
+
+/// 報告の入力画面。**未報告の人だけを並べる。**
+///
+/// 報告済みの人はそもそも一覧に出ない。運営が上書きできる形にしない
+/// （裁定は disputed のフローで行う）。
+pub fn reports_page(view: &ReportsView<'_>) -> String {
+    let body = if view.awaiting.is_empty() {
+        String::from("<p class=\"fine-print\">報告待ちの試合はありません。</p>\n")
+    } else {
+        view.awaiting
+            .iter()
+            .map(|formation| awaiting_block(formation, view.form_key))
+            .collect::<String>()
+    };
+    page(
+        Viewer::ADMIN,
+        "管理 / 報告の入力",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-reports-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-reports-title\">未報告のプレイヤーに報告を入れる</h1>\n\
+             {nav}\
+             <p class=\"lead\">Discord 上で裁定した結果をここから入れます。\
+             <strong>入るのは追記で、プレイヤーの報告は書き換わりません。</strong>\
+             確定の条件も変わりません（全員一致 + 全員報告、または受付時間の経過）。</p>\n\
+             <p class=\"fine-print\">既に報告している人はこの一覧に出ません。\
+             その人の内容を運営が上書きする経路はありません（裁定は係争のフローで行います）。</p>\n\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/reports"),
+            notice = notice_html(view.notice.as_ref()),
+        ),
+    )
+}
+
+/// formation 1 件ぶんの入力欄。
+fn awaiting_block(formation: &AwaitingReports, form_key: &str) -> String {
+    let rows = formation
+        .unreported
+        .iter()
+        .map(|player| {
+            let name = player
+                .trainer_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("（名前未登録）");
+            format!(
+                "<tr><td>{name}</td><td>{team}</td><td>\
+                 <form method=\"post\" action=\"/admin/reports\" class=\"inline-form\">\
+                 <input type=\"hidden\" name=\"formation\" value=\"{formation_id}\">\
+                 <input type=\"hidden\" name=\"player\" value=\"{player_id}\">\
+                 <input type=\"hidden\" name=\"key\" value=\"{key}:{player_id}\">\
+                 <label class=\"sr-only\" for=\"reason-{player_id}\">理由</label>\
+                 <input id=\"reason-{player_id}\" name=\"reason\" type=\"text\" \
+                 placeholder=\"理由（任意）\" maxlength=\"200\">\
+                 <button class=\"button-secondary\" type=\"submit\" name=\"outcome\" value=\"red\">赤の勝ち</button>\
+                 <button class=\"button-secondary\" type=\"submit\" name=\"outcome\" value=\"blue\">青の勝ち</button>\
+                 <button class=\"button-secondary\" type=\"submit\" name=\"outcome\" value=\"nullified\">無効試合</button>\
+                 </form></td></tr>\n",
+                name = escape(name),
+                team = escape(&player.team),
+                formation_id = escape(&formation.formation_id.to_string()),
+                player_id = escape(&player.player_id.to_string()),
+                key = escape(form_key),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"section\"><h2>{label}</h2>\n\
+         <p class=\"fine-print\">状態: {state} / 成立: {at} / 未報告: {count}人</p>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>プレイヤー</th><th>チーム</th><th>入れる結果</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody></table></div></section>\n",
+        label = escape(&format!(
+            "match-{}",
+            &formation.formation_id.simple().to_string()[..8]
+        )),
+        state = escape(&formation.state),
+        at = escape(&display_time(formation.created_at)),
+        count = formation.unreported.len(),
+    )
 }

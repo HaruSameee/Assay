@@ -30,17 +30,20 @@ pub enum AdminActionKind {
     BlockAllowanceSet,
     /// シーズン境界の追記（導出の起点を進めた）。
     SeasonStarted,
+    /// 未報告のプレイヤーに運営が報告を入れた。
+    ReportEntered,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
         Self::BlockAllowanceSet,
         Self::SeasonStarted,
+        Self::ReportEntered,
     ];
 
     /// DB に入る文字列。
@@ -51,6 +54,7 @@ impl AdminActionKind {
             Self::QueueRemoved => "queue_removed",
             Self::BlockAllowanceSet => "block_allowance_set",
             Self::SeasonStarted => "season_started",
+            Self::ReportEntered => "report_entered",
         }
     }
 
@@ -62,6 +66,7 @@ impl AdminActionKind {
             "queue_removed" => Some(Self::QueueRemoved),
             "block_allowance_set" => Some(Self::BlockAllowanceSet),
             "season_started" => Some(Self::SeasonStarted),
+            "report_entered" => Some(Self::ReportEntered),
             _ => None,
         }
     }
@@ -74,6 +79,7 @@ impl AdminActionKind {
             Self::QueueRemoved => "キューから強制離脱",
             Self::BlockAllowanceSet => "ブロック枠の変更",
             Self::SeasonStarted => "シーズン開始（導出の起点を追記）",
+            Self::ReportEntered => "運営による報告の入力",
         }
     }
 }

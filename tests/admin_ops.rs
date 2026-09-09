@@ -29,11 +29,16 @@ use tower::ServiceExt;
 use unite_matchsystem::admin::{
     AdminRepository, AdminState, DEFAULT_BLOCK_ALLOWANCE, parse_admin_ids, router as admin_router,
 };
-use unite_matchsystem::lifecycle::{PlayerId, Timestamp};
+use unite_matchsystem::lifecycle::{
+    FormationEventKind as K, FormationId, FormationState as S, PlayerId, Timestamp,
+};
 use unite_matchsystem::matchmaker::{
     Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
 };
-use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
+use unite_matchsystem::persistence::{
+    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
+    VcAssignment,
+};
 use unite_matchsystem::queue::model::{QueueRequest, RolePreference};
 use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
@@ -915,5 +920,344 @@ async fn dump_the_operational_pages(owner: PgPool) {
     .await;
     let (_, removed) = get_html(&app, player(3), "/queue").await;
     println!("===== /queue（外された本人）\n{removed}");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 運営による報告の入力
+// ----------------------------------------------------------------------
+
+/// 10 人の formation を `in_progress` まで進める（参加者は player(2)..player(11)）。
+async fn playable_formation(db: &AppDb, n: u128) {
+    let fid = FormationId(Uuid::from_u128(0xf00 + n));
+    let players: Vec<NewFormationPlayer> = (0..10u128)
+        .map(|i| NewFormationPlayer {
+            player_id: player(i + 2),
+            team: if i < 5 { Team::Red } else { Team::Blue },
+            role: ROLES[(i % 5) as usize].to_owned(),
+            role_was_flexed: false,
+            mu_at_match: 25.0,
+            sigma_at_match: 8.3333,
+        })
+        .collect();
+    db.formations
+        .create_formation(&NewFormation {
+            id: fid,
+            created_at: at(0),
+            matchmaking_params_version: 3,
+            predicted_win_prob: 0.5,
+            players,
+        })
+        .await
+        .unwrap();
+    let host = player(2);
+    for event in [
+        NewEvent::vc_assigned("1", 101, 102, at(0), format!("vc-{n}")),
+        NewEvent::new(K::HostAssigned, Some(host), at(1), format!("as-{n}")),
+        NewEvent::new(K::HostAccepted, Some(host), at(2), format!("ac-{n}")),
+        NewEvent::code_posted(host, "1234", at(3), format!("code-{n}")),
+    ] {
+        db.formations.append_event(fid, &event).await.unwrap();
+    }
+}
+
+fn fid(n: u128) -> FormationId {
+    FormationId(Uuid::from_u128(0xf00 + n))
+}
+
+/// プレイヤー本人の報告を 1 件入れる。
+async fn player_report(db: &AppDb, n: u128, who: u128, outcome: &str) {
+    let outcome = match outcome {
+        "red" => Outcome::Win(Team::Red),
+        "blue" => Outcome::Win(Team::Blue),
+        _ => Outcome::Nullified,
+    };
+    db.formations
+        .append_latest_report(NewReport {
+            formation_id: fid(n),
+            player_id: player(who),
+            reported_at: at(10),
+            outcome,
+            raw_result: json!({ "source": "web", "choice": outcome.as_str() }),
+            idempotency_key: format!("player-{n}-{who}"),
+            supersedes_id: None,
+        })
+        .await
+        .unwrap();
+}
+
+async fn state_of(db: &AppDb, n: u128) -> S {
+    db.formations
+        .load_events(fid(n))
+        .await
+        .unwrap()
+        .snapshot()
+        .state
+}
+
+/// 画面のその行のフォームから、そのプレイヤーの冪等キーを読む。
+fn report_key(html: &str, player_id: PlayerId) -> String {
+    html.split(&format!("name=\"player\" value=\"{}\"", player_id.0))
+        .nth(1)
+        .expect("the player row is rendered")
+        .split("name=\"key\" value=\"")
+        .nth(1)
+        .expect("the hidden idempotency key")
+        .split('"')
+        .next()
+        .expect("a key value")
+        .to_owned()
+}
+
+/// 運営の報告を送る。
+async fn enter_report(
+    app: &Router,
+    page: &str,
+    n: u128,
+    who: PlayerId,
+    outcome: &str,
+) -> (StatusCode, String) {
+    let key = report_key(page, who);
+    post_form(
+        app,
+        player(ADMIN),
+        "/admin/reports",
+        &format!(
+            "formation={}&player={}&outcome={outcome}&reason=Discordで裁定&key={key}",
+            fid(n).0,
+            who.0,
+        ),
+    )
+    .await
+}
+
+/// 画面にその人の入力欄が出ているか。
+fn listed(page: &str, who: PlayerId) -> bool {
+    page.contains(&format!("name=\"player\" value=\"{}\"", who.0))
+}
+
+/// **運営の報告はプレイヤーの報告と区別でき、確定判定は通常どおり動く。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_staff_report_is_appended_and_settles_the_match(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 10).await;
+    playable_formation(&db, 1).await;
+    let app = db.router();
+
+    // 9 人が red で報告。10 人目（player(11)）だけ未報告
+    for who in 2..=10u128 {
+        player_report(&db, 1, who, "red").await;
+    }
+    assert!(
+        matches!(state_of(&db, 1).await, S::InProgress { .. }),
+        "まだ確定していないこと"
+    );
+
+    // 画面には未報告の 1 人だけが出る
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed(&page, player(11)), "未報告の人が出ていない");
+    for reported in 2..=10u128 {
+        assert!(
+            !listed(&page, player(reported)),
+            "報告済みの player {reported} が一覧に出ている"
+        );
+    }
+    println!("未報告の1人だけが一覧に出る（報告済みの9人は出ない）");
+
+    let (status, after) = enter_report(&app, &page, 1, player(11), "red").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after.contains("結果が確定しました"), "{after}");
+
+    // **確定している。**確定条件は変えていない（全員一致 + 全員報告）
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    // 運営の報告とプレイヤーの報告が区別できる
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "select player_id, outcome, raw_result->>'source' as source \
+         from match_reports order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let staff: Vec<&(Uuid, String, Option<String>)> = rows
+        .iter()
+        .filter(|row| row.2.as_deref() == Some("staff"))
+        .collect();
+    println!("=== match_reports（raw_result->>'source' で区別できる）");
+    println!(
+        "全 {} 件 / うち運営が入れたもの {} 件",
+        rows.len(),
+        staff.len()
+    );
+    for row in &staff {
+        println!("  player={} outcome={} source={:?}", row.0, row.1, row.2);
+    }
+    assert_eq!(rows.len(), 10);
+    assert_eq!(staff.len(), 1);
+    assert_eq!(staff[0].0, player(11).0);
+
+    // 誰が入れたかも残っている
+    let actions: Vec<(String, Option<Uuid>, i64, Value)> = sqlx::query_as(
+        "select kind, target_player_id, actor_discord_user_id, payload \
+         from admin_actions where kind = 'report_entered' order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    println!("=== admin_actions");
+    for action in &actions {
+        println!(
+            "  kind={} target={:?} actor={} payload={}",
+            action.0, action.1, action.2, action.3
+        );
+    }
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].1, Some(player(11).0));
+    assert_eq!(actions[0].2, ADMIN_ID);
+
+    // レートも通常の経路と同じく導出される
+    let deltas: Vec<(Uuid, f64)> = sqlx::query_as(
+        "select player_id, delta from player_match_rating_deltas order by delta desc",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(deltas.len(), 10);
+    assert_eq!(deltas[0].1, 7.0);
+    assert_eq!(deltas[9].1, -7.0);
+    println!(
+        "レートの導出: +7 が {} 人 / -7 が {} 人",
+        deltas.iter().filter(|row| row.1 > 0.0).count(),
+        deltas.iter().filter(|row| row.1 < 0.0).count()
+    );
+
+    db.done().await;
+}
+
+/// **報告済みのプレイヤーは上書きできない。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_reported_player_cannot_be_overwritten_by_staff(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 10).await;
+    playable_formation(&db, 1).await;
+    let app = db.router();
+
+    player_report(&db, 1, 2, "red").await;
+    let before: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    // 画面には出ない
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!listed(&page, player(2)), "報告済みの人が一覧に出ている");
+
+    // 直接 POST しても通らない
+    let (status, after) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports",
+        &format!(
+            "formation={}&player={}&outcome=blue&reason=上書き&key=force-1",
+            fid(1).0,
+            player(2).0,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after.contains("既に報告しています"), "{after}");
+    println!("報告済みの人への上書き: 拒否された");
+
+    // **行は増えていない。**元の報告も書き換わっていない
+    let rows: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, before);
+    let outcome: String =
+        sqlx::query_scalar("select outcome from match_reports where player_id = $1")
+            .bind(player(2).0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "red", "プレイヤーの報告が書き換わっている");
+    println!("player(2) の報告は red のまま / match_reports の行数は {rows}");
+
+    // 操作ログも増えない
+    let actions: i64 =
+        sqlx::query_scalar("select count(*) from admin_actions where kind = 'report_entered'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(actions, 0);
+
+    db.done().await;
+}
+
+/// **係争中（disputed）の試合に運営が入れたときの挙動。**現在の姿を記録する（修正しない）。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 10).await;
+    playable_formation(&db, 1).await;
+    let app = db.router();
+
+    // 8 人が red、1 人が blue。割れたまま disputed にする
+    for who in 2..=9u128 {
+        player_report(&db, 1, who, "red").await;
+    }
+    player_report(&db, 1, 10, "blue").await;
+    db.formations
+        .append_event(
+            fid(1),
+            &NewEvent::new(K::Disputed, None, at(20), "disputed-1")
+                .with_payload(json!({ "outcome": "disputed" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(&db, 1).await, S::Disputed);
+
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    println!(
+        "係争中の試合の未報告者が一覧に出るか: {}",
+        listed(&page, player(11))
+    );
+
+    let (status, after) = enter_report(&app, &page, 1, player(11), "red").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let state = state_of(&db, 1).await;
+    let kinds: Vec<&str> = db
+        .formations
+        .load_events(fid(1))
+        .await
+        .unwrap()
+        .events
+        .iter()
+        .map(|stored| stored.event.kind.as_str())
+        .collect();
+    let staff: i64 = sqlx::query_scalar(
+        "select count(*) from match_reports where raw_result->>'source' = 'staff'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let notice = if after.contains("結果が確定しました") {
+        "確定した"
+    } else if after.contains("まだ確定していません") {
+        "追記されたが未確定"
+    } else if after.contains("受け付けていません") {
+        "受け付けられなかった"
+    } else {
+        "その他"
+    };
+    println!("=== 係争中に運営が報告を入れた結果");
+    println!("画面の通知: {notice}");
+    println!("状態: {state:?}");
+    println!("イベント列: {kinds:?}");
+    println!("運営が入れた報告の行数: {staff}");
+
     db.done().await;
 }
