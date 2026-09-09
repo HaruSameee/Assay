@@ -1908,7 +1908,7 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
     );
     println!("15 分経過で確定: {:?}", confirmed.payload);
 
-    // 割れていれば disputed（多数決にはしない）
+    // **閾値（7人）に届いていれば、割れていても確定する。**
     db.repo.create_formation(&formation(2)).await.unwrap();
     for event in [
         NewEvent::vc_assigned("1", 101, 102, started, "vc2"),
@@ -1924,7 +1924,7 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
                 formation_id: fid(2),
                 player_id: pid(reporter),
                 reported_at: first_report_at,
-                // 8 人が red、1 人が blue。多数決なら red になるが、そうはしない
+                // 8 人が red、1 人が blue。8 >= 7 なので red で確定する
                 outcome: if reporter == 9 {
                     Outcome::Win(Team::Blue)
                 } else {
@@ -1938,9 +1938,54 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
             .unwrap();
     }
     adapter.resume_unfinished().await.unwrap();
-    let (_, state, _) = load(&db, fid(2)).await;
-    assert_eq!(state, S::Disputed, "8 対 1 が多数決で確定している");
-    println!("8 対 1 は多数決にせず disputed のまま");
+    let (log, state, _) = load(&db, fid(2)).await;
+    assert_eq!(state, S::Confirmed, "8 対 1 が確定していない");
+    let confirmed = log
+        .events
+        .iter()
+        .rev()
+        .find(|stored| stored.event.kind == K::Confirmed)
+        .expect("confirmed event");
+    assert_eq!(confirmed.payload["outcome"], "red");
+    assert_eq!(
+        confirmed.payload["decision_basis"], "majority_threshold",
+        "{:?}",
+        confirmed.payload
+    );
+    println!("8 対 1 は閾値に届くので確定: {:?}", confirmed.payload);
+
+    // **閾値に届かなければ、従来どおり disputed。**6 対 4 はどちらも 7 に足りない
+    db.repo.create_formation(&formation(3)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("2", 201, 202, started, "vc3"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), started, "host3"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), started, "accepted3"),
+        NewEvent::code_posted(pid(1), "1234", started, "code3"),
+    ] {
+        db.repo.append_event(fid(3), &event).await.unwrap();
+    }
+    for reporter in 1..=10u128 {
+        db.repo
+            .append_report(&NewReport {
+                formation_id: fid(3),
+                player_id: pid(reporter),
+                reported_at: first_report_at,
+                outcome: if reporter > 6 {
+                    Outcome::Win(Team::Blue)
+                } else {
+                    Outcome::Win(Team::Red)
+                },
+                raw_result: serde_json::json!({ "source": "test" }),
+                supersedes_id: None,
+                idempotency_key: format!("even-{reporter}"),
+            })
+            .await
+            .unwrap();
+    }
+    adapter.resume_unfinished().await.unwrap();
+    let (_, state, _) = load(&db, fid(3)).await;
+    assert_eq!(state, S::Disputed, "6 対 4 が確定している");
+    println!("6 対 4 は閾値に届かないので disputed のまま");
 
     db.done().await;
 }
