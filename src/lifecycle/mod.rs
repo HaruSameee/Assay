@@ -26,9 +26,10 @@ mod ids;
 mod state;
 
 pub use config::{
-    DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS, DEFAULT_HOST_CANDIDATE_LIMIT, Deadline,
-    HOST_ACCEPT_TIMEOUT_SECONDS, HOST_CANDIDATE_LIMIT, HostAction, LifecycleConfig,
-    LifecycleConfigError, next_deadline, next_host_action,
+    DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS, DEFAULT_HOST_CANDIDATE_LIMIT,
+    DEFAULT_REPORT_MAJORITY_THRESHOLD, Deadline, HOST_ACCEPT_TIMEOUT_SECONDS, HOST_CANDIDATE_LIMIT,
+    HostAction, LifecycleConfig, LifecycleConfigError, REPORT_MAJORITY_THRESHOLD, next_deadline,
+    next_host_action,
 };
 pub use error::{TransitionError, UnknownValue};
 pub use host::{

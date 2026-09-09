@@ -14,6 +14,8 @@ pub const HOST_ACCEPT_TIMEOUT_SECONDS: &str = "HOST_ACCEPT_TIMEOUT_SECONDS";
 pub const HOST_CANDIDATE_LIMIT: &str = "HOST_CANDIDATE_LIMIT";
 /// 報告の受付時間（分）の環境変数。**当日の校正対象**（短すぎたらここで戻す）。
 pub const REPORT_WINDOW_MINUTES: &str = "REPORT_WINDOW_MINUTES";
+/// 早期確定に必要な一致人数の環境変数。**当日の校正対象。**
+pub const REPORT_MAJORITY_THRESHOLD: &str = "REPORT_MAJORITY_THRESHOLD";
 
 /// 既定の承諾期限（秒）。
 ///
@@ -28,8 +30,23 @@ pub const DEFAULT_HOST_CANDIDATE_LIMIT: u32 = 3;
 /// 30 分から **15 分**へ縮めてある。長いほど「報告しない1人」に9人が待たされる時間が
 /// 伸びる（レートが動くのは確定してから）。**確定条件そのものは変えていない** —
 /// `unanimous && (all_reported || report_window_elapsed)` のままで、window の長さだけ。
-/// 多数決にはしない（docs/02 で却下済み）。
 pub const DEFAULT_REPORT_WINDOW_MINUTES: u64 = 15;
+
+/// 既定の早期確定の閾値（人）。
+///
+/// 同じ結果に 7 人以上が一致したら、残りを待たずに確定する。**従来の条件は残してある**
+/// ——これは経路の追加であって、全員一致の判定を置き換えるものではない。
+///
+/// 7 にした根拠は本番の実測である。2026-09-09 に係争になった 4 件は
+/// 8対2 / 9対1 / 9対1 / 9対1 で、いずれも 1〜2 人が「無効試合」を選んだために
+/// 全員一致が崩れ、15 分待たされたうえで係争になっていた。7 人ならこの 4 件すべてが
+/// 即確定する。
+pub const DEFAULT_REPORT_MAJORITY_THRESHOLD: usize = 7;
+
+/// 早期確定の閾値の下限。1 人で確定できてしまうと報告の意味が無くなる。
+const MIN_REPORT_MAJORITY_THRESHOLD: usize = 2;
+/// 早期確定の閾値の上限。試合の人数（10 人）を超える閾値は決して満たせない。
+const MAX_REPORT_MAJORITY_THRESHOLD: usize = 10;
 
 /// 設定の読み込みエラー。値そのものは秘密ではないので理由に載せる。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -59,10 +76,12 @@ pub struct LifecycleConfig {
     pub report_window: Duration,
     /// 打診するホスト候補の上限。尽きたら `abandoned`。
     pub max_host_candidates: u32,
+    /// `in_progress`: 早期確定に必要な一致人数。同じ結果がこの人数に達したら即確定する。
+    pub report_majority_threshold: usize,
 }
 
 impl Default for LifecycleConfig {
-    /// 180秒 / 180秒 / 45分 / 15分 / 上位3人。
+    /// 180秒 / 180秒 / 45分 / 15分 / 上位3人 / 一致7人。
     fn default() -> Self {
         Self {
             host_accept_timeout: Duration::from_secs(DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS),
@@ -70,6 +89,7 @@ impl Default for LifecycleConfig {
             no_report_timeout: Duration::from_secs(45 * 60),
             report_window: Duration::from_secs(DEFAULT_REPORT_WINDOW_MINUTES * 60),
             max_host_candidates: DEFAULT_HOST_CANDIDATE_LIMIT,
+            report_majority_threshold: DEFAULT_REPORT_MAJORITY_THRESHOLD,
         }
     }
 }
@@ -81,6 +101,7 @@ impl LifecycleConfig {
             env::var(HOST_ACCEPT_TIMEOUT_SECONDS).ok().as_deref(),
             env::var(HOST_CANDIDATE_LIMIT).ok().as_deref(),
             env::var(REPORT_WINDOW_MINUTES).ok().as_deref(),
+            env::var(REPORT_MAJORITY_THRESHOLD).ok().as_deref(),
         )
     }
 
@@ -93,6 +114,7 @@ impl LifecycleConfig {
         host_accept_timeout_seconds: Option<&str>,
         host_candidate_limit: Option<&str>,
         report_window_minutes: Option<&str>,
+        report_majority_threshold: Option<&str>,
     ) -> Result<Self, LifecycleConfigError> {
         let defaults = Self::default();
         let host_accept_timeout = match trimmed(host_accept_timeout_seconds) {
@@ -115,10 +137,33 @@ impl LifecycleConfig {
             None => defaults.report_window,
             Some(raw) => Duration::from_secs(positive(REPORT_WINDOW_MINUTES, raw, "minutes")? * 60),
         };
+        // 閾値は 2〜10 人。1 人だと最初の報告で確定してしまい、11 人以上は決して満たせない
+        // （どちらも「設定したつもりの挙動」にならないので起動で落とす）
+        let report_majority_threshold = match trimmed(report_majority_threshold) {
+            None => defaults.report_majority_threshold,
+            Some(raw) => {
+                let value = usize::try_from(positive(REPORT_MAJORITY_THRESHOLD, raw, "players")?)
+                    .map_err(|_| LifecycleConfigError::Invalid {
+                    name: REPORT_MAJORITY_THRESHOLD,
+                    reason: format!("{raw:?} is out of range"),
+                })?;
+                if !(MIN_REPORT_MAJORITY_THRESHOLD..=MAX_REPORT_MAJORITY_THRESHOLD).contains(&value)
+                {
+                    return Err(LifecycleConfigError::Invalid {
+                        name: REPORT_MAJORITY_THRESHOLD,
+                        reason: format!(
+                            "must be between {MIN_REPORT_MAJORITY_THRESHOLD} and {MAX_REPORT_MAJORITY_THRESHOLD} players, got {value}"
+                        ),
+                    });
+                }
+                value
+            }
+        };
         Ok(Self {
             host_accept_timeout,
             max_host_candidates,
             report_window,
+            report_majority_threshold,
             ..defaults
         })
     }
@@ -244,19 +289,19 @@ mod tests {
     #[test]
     fn unset_environment_keeps_the_defaults() {
         assert_eq!(
-            LifecycleConfig::parse(None, None, None).unwrap(),
+            LifecycleConfig::parse(None, None, None, None).unwrap(),
             LifecycleConfig::default()
         );
         // 空文字・空白だけも「未設定」と同じ（.env に空行を残しても既定に戻る）
         assert_eq!(
-            LifecycleConfig::parse(Some(""), Some("  "), Some("")).unwrap(),
+            LifecycleConfig::parse(Some(""), Some("  "), Some(""), Some(" ")).unwrap(),
             LifecycleConfig::default()
         );
     }
 
     #[test]
     fn the_host_timeout_and_candidate_limit_come_from_the_environment() {
-        let config = LifecycleConfig::parse(Some("45"), Some("5"), None).unwrap();
+        let config = LifecycleConfig::parse(Some("45"), Some("5"), None, None).unwrap();
         assert_eq!(config.host_accept_timeout, Duration::from_secs(45));
         assert_eq!(config.max_host_candidates, 5);
         // 他の期限は動かない
@@ -266,7 +311,7 @@ mod tests {
         assert_eq!(config.report_window, defaults.report_window);
 
         // 片方だけ設定してもよい
-        let only_limit = LifecycleConfig::parse(None, Some("1"), None).unwrap();
+        let only_limit = LifecycleConfig::parse(None, Some("1"), None, None).unwrap();
         assert_eq!(only_limit.host_accept_timeout, defaults.host_accept_timeout);
         assert_eq!(only_limit.max_host_candidates, 1);
     }
@@ -275,33 +320,59 @@ mod tests {
     fn a_meaningless_setting_fails_at_startup() {
         // 0 秒は「打診した瞬間にタイムアウト」、0 人は「成立した瞬間に解散」、
         // 0 分は「最初の報告と同時に期限切れ」＝ 1 人の報告で確定してしまう。
+        // 閾値 1 人も同じ（最初の報告で確定する）、11 人以上は決して満たせない。
         // どれも黙って動かず起動で落とす
-        for (timeout, limit, window) in [
-            (Some("0"), None, None),
-            (None, Some("0"), None),
-            (None, None, Some("0")),
-            (Some("-1"), None, None),
-            (Some("soon"), None, None),
-            (None, Some("たくさん"), None),
-            (None, Some("4294967296"), None),
-            (None, None, Some("しばらく")),
-            (None, None, Some("-5")),
+        for (timeout, limit, window, threshold) in [
+            (Some("0"), None, None, None),
+            (None, Some("0"), None, None),
+            (None, None, Some("0"), None),
+            (Some("-1"), None, None, None),
+            (Some("soon"), None, None, None),
+            (None, Some("たくさん"), None, None),
+            (None, Some("4294967296"), None, None),
+            (None, None, Some("しばらく"), None),
+            (None, None, Some("-5"), None),
+            (None, None, None, Some("0")),
+            (None, None, None, Some("1")),
+            (None, None, None, Some("11")),
+            (None, None, None, Some("100")),
+            (None, None, None, Some("-3")),
+            (None, None, None, Some("ほとんど")),
         ] {
             assert!(
-                LifecycleConfig::parse(timeout, limit, window).is_err(),
-                "{timeout:?} / {limit:?} / {window:?} must be rejected"
+                LifecycleConfig::parse(timeout, limit, window, threshold).is_err(),
+                "{timeout:?} / {limit:?} / {window:?} / {threshold:?} must be rejected"
             );
         }
-        let error = LifecycleConfig::parse(Some("0"), None, None).unwrap_err();
+        let error = LifecycleConfig::parse(Some("0"), None, None, None).unwrap_err();
         assert!(error.to_string().contains(HOST_ACCEPT_TIMEOUT_SECONDS));
-        let error = LifecycleConfig::parse(None, None, Some("0")).unwrap_err();
+        let error = LifecycleConfig::parse(None, None, Some("0"), None).unwrap_err();
         assert!(error.to_string().contains(REPORT_WINDOW_MINUTES));
+        let error = LifecycleConfig::parse(None, None, None, Some("11")).unwrap_err();
+        assert!(error.to_string().contains(REPORT_MAJORITY_THRESHOLD));
+    }
+
+    /// 早期確定の閾値は環境変数で変えられる。**当日の校正対象。**
+    #[test]
+    fn the_majority_threshold_comes_from_the_environment() {
+        for raw in ["2", "6", "8", "10"] {
+            let config = LifecycleConfig::parse(None, None, None, Some(raw)).unwrap();
+            assert_eq!(
+                config.report_majority_threshold,
+                raw.parse::<usize>().unwrap()
+            );
+            // 他の設定は動かない
+            let defaults = LifecycleConfig::default();
+            assert_eq!(config.report_window, defaults.report_window);
+            assert_eq!(config.host_accept_timeout, defaults.host_accept_timeout);
+            assert_eq!(config.max_host_candidates, defaults.max_host_candidates);
+        }
     }
 
     /// 報告の受付時間は環境変数で変えられる。**当日に戻せること**が目的。
     #[test]
     fn the_report_window_comes_from_the_environment() {
-        let config = LifecycleConfig::parse(None, None, Some("30")).unwrap();
+        let config = LifecycleConfig::parse(None, None, Some("30"), None).unwrap();
         assert_eq!(config.report_window, Duration::from_secs(30 * 60));
         // 他の期限は動かない
         let defaults = LifecycleConfig::default();
@@ -319,6 +390,7 @@ mod tests {
         assert_eq!(config.no_report_timeout, Duration::from_secs(45 * 60));
         assert_eq!(config.report_window, Duration::from_secs(15 * 60));
         assert_eq!(config.max_host_candidates, 3);
+        assert_eq!(config.report_majority_threshold, 7);
     }
 
     #[test]
@@ -330,6 +402,7 @@ mod tests {
             no_report_timeout: Duration::from_secs(30),
             report_window: Duration::from_secs(40),
             max_host_candidates: 3,
+            report_majority_threshold: DEFAULT_REPORT_MAJORITY_THRESHOLD,
         };
         let since = t0();
         let pending = S::AwaitingHost {

@@ -584,4 +584,37 @@ mod tests {
             Some(RegistrationBlock::NotRegistered)
         );
     }
+
+    /// **確定後に未報告のまま残ると、その人のキューは開かない。**
+    ///
+    /// 早期確定（閾値 7 人）を入れると、確定の時点で 3 人が未報告のまま残るのが
+    /// 通常になる。その 3 人の報告を 409 で断ると、ここが恒久的に真のままになり、
+    /// キューへ戻れなくなる（00 §5「報告ゲートの解除条件を『確定』にしない」）。
+    #[test]
+    fn probe_a_confirmed_match_still_gates_an_unreported_player() {
+        for state in [
+            FormationState::Confirmed,
+            FormationState::Nullified,
+            FormationState::Disputed,
+        ] {
+            assert!(
+                formation_blocks_queue(&state, false),
+                "{state:?}: 未報告のまま塞がれない想定ではない"
+            );
+            assert!(
+                !formation_blocks_queue(&state, true),
+                "{state:?}: 報告すれば開く"
+            );
+            println!(
+                "{state:?}: 未報告 -> 塞ぐ={} / 報告済み -> 塞ぐ={}",
+                formation_blocks_queue(&state, false),
+                formation_blocks_queue(&state, true)
+            );
+        }
+        // 不成立・解散は報告義務が無いので塞がない
+        for state in [FormationState::Voided, FormationState::Abandoned] {
+            assert!(!formation_blocks_queue(&state, false), "{state:?}");
+            println!("{state:?}: 未報告でも塞がない");
+        }
+    }
 }

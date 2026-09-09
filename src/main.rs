@@ -85,6 +85,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         host_candidate_limit = lifecycle.max_host_candidates,
         "host prompt settings loaded"
     );
+    // 確定条件は当日に校正しうる。どの値で走っているかを起動ログに残す
+    info!(
+        report_window_minutes = lifecycle.report_window.as_secs() / 60,
+        report_majority_threshold = lifecycle.report_majority_threshold,
+        "report settlement settings loaded"
+    );
     // どの params で走っているかを起動ログに残す。レート側は導出値なので凍結せず、
     // ここに出る版数が「いま全履歴に適用されている式」を指す（00 §3-3）
     info!(
@@ -106,7 +112,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let queue_repo = QueueRepository::new(pool.clone());
     let ratings_repo = RatingAdjustmentRepository::new(pool.clone());
     let status_repo = StatusRepository::new(pool.clone());
-    let admin_store = AdminRepository::new(pool.clone());
+    let admin_store = AdminRepository::new(pool.clone())
+        .with_majority_threshold(lifecycle.report_majority_threshold);
     let block_repo = BlockRepository::new(pool.clone());
     let match_pool = pool.clone();
     let ranking_pool = pool.clone();

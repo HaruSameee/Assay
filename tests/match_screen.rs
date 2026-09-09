@@ -843,7 +843,7 @@ async fn split_reports_do_not_confirm_and_never_show_the_breakdown(owner: PgPool
     for reporter in 6..=10u128 {
         assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
     }
-    // 全員が出していても一致していないので、期限まで待つ。多数決で決めない
+    // 全員が出していても、どちらの結果も早期確定の閾値（7人）に届かないので期限まで待つ
     assert!(
         matches!(state_of(&db, 1).await, S::InProgress { .. }),
         "{:?}",
@@ -954,6 +954,10 @@ async fn a_correction_moves_the_confirmation_but_not_the_agreement_metric(owner:
 ///
 /// 00 §5「報告ゲートの解除条件を『確定』にしない」。ここで入口を閉じると、
 /// 未報告のままキューのゲートが開かなくなる。
+///
+/// **早期確定（閾値 7 人）を入れてから、これは例外ではなく通常になった。**
+/// 7 人で確定した時点で 3 人が未報告のまま残るので、その 3 人の入口を閉じると
+/// 毎試合 3 人がキューへ戻れなくなる。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
@@ -963,23 +967,74 @@ async fn an_unreported_player_can_still_report_after_confirmation(owner: PgPool)
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    for reporter in 1..=9u128 {
+    // 6 人では閾値に届かない
+    for reporter in 1..=6u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
-    // 10 人目が未報告のまま、期限まで待たずには確定しない
     assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
-    assert_eq!(report(&app, 1, 10, "red").await, StatusCode::OK);
+
+    // 7 人目で確定する（残り 3 人を待たない）
+    assert_eq!(report(&app, 1, 7, "red").await, StatusCode::OK);
     assert_eq!(state_of(&db, 1).await, S::Confirmed);
 
-    // 別の formation で「確定後に未報告の人が報告する」経路を見る
-    formation_at(&db, 2, Stage::InProgress).await;
-    for reporter in 1..=10u128 {
-        assert_eq!(report(&app, 2, reporter, "blue").await, StatusCode::OK);
+    // **残り 3 人は確定後も報告できる。**受理はするが確定は動かさない
+    for reporter in 8..=10u128 {
+        assert_eq!(
+            report(&app, 1, reporter, "blue").await,
+            StatusCode::OK,
+            "未報告の {reporter} 人目が報告できない"
+        );
+        assert_eq!(state_of(&db, 1).await, S::Confirmed, "確定が覆っている");
     }
-    assert_eq!(state_of(&db, 2).await, S::Confirmed);
-    let (_, view) = get_json(&app, 2, player(1)).await;
+    let (_, view) = get_json(&app, 1, player(10)).await;
     assert_eq!(view["i_reported"], json!(true));
     assert_eq!(view["actions"]["report"], json!(false), "もう出さない");
+    db.done().await;
+}
+
+/// **7 人で確定した後、既に報告した人の訂正は 409 で断る。**
+///
+/// 確定は追記された事実であり、後から引き直さない（docs/02 §4）。
+/// 「7 人で確定 → 残り 3 人が違う結果 → 6 対 4 だった」という記録はそのまま残す。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_correction_after_an_early_confirmation_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    for reporter in 1..=7u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "7 人で確定していない");
+
+    // 報告済みの人が引き直そうとしても 409。行は消さない
+    let before = report_rows(&db, 1, player(1)).await;
+    let (status, payload) = post(&app, 1, player(1), "/report", json!({ "outcome": "blue" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+    assert_eq!(payload["error"], json!("already_settled"), "{payload}");
+    assert_eq!(
+        report_rows(&db, 1, player(1)).await,
+        before,
+        "行が増えている"
+    );
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    // 残り 3 人が逆の結果を出しても確定は動かない（6 対 4 の記録が残るだけ）
+    for reporter in 8..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "確定が覆っている");
+    assert_eq!(
+        kinds(&db, 1)
+            .await
+            .iter()
+            .filter(|k| **k == K::Confirmed)
+            .count(),
+        1
+    );
     db.done().await;
 }
 
