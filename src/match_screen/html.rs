@@ -6,8 +6,7 @@
 //! ここが描けるのは [`MatchView`] にある値だけ。相手チームのロールも他人の報告状況も
 //! 型に存在しないので、この描画からは出しようがない。
 
-use crate::registration::Viewer;
-use crate::registration::html::{escape, page_with_styles};
+use crate::registration::html::{escape, page_without_nav};
 
 use super::model::{AffordanceView, MatchView, OpponentView, StageView, TeammateView, VoiceView};
 
@@ -57,7 +56,7 @@ const MATCH_STYLES: &str = r#"
 "#;
 
 /// 画面全体。`data-stage` は状態機械の状態名そのもの（テストと運用の照合用）。
-pub(super) fn match_page(viewer: Viewer, view: &MatchView) -> String {
+pub(super) fn match_page(view: &MatchView) -> String {
     let title = stage_title(&view.stage);
     let body = format!(
         "<section id=\"match-app\" data-stage=\"{stage}\" data-formation=\"{formation}\" \
@@ -80,7 +79,7 @@ pub(super) fn match_page(viewer: Viewer, view: &MatchView) -> String {
         room = room_block(view),
         script = POLL_SCRIPT,
     );
-    page_with_styles(viewer, title, &body, MATCH_STYLES)
+    page_without_nav(title, &body, MATCH_STYLES)
 }
 
 fn stage_title(stage: &StageView) -> &'static str {
@@ -552,7 +551,7 @@ mod tests {
         let mut state = view(in_progress(false));
         state.teammates[0].role = "中央".into();
         state.teammates[1].role = "上キャリー".into();
-        let rendered = match_page(Viewer::MEMBER, &state);
+        let rendered = match_page(&state);
         // 自チームのロールは出る
         assert!(rendered.contains("中央"), "{rendered}");
         assert!(rendered.contains("上キャリー"), "{rendered}");
@@ -588,7 +587,7 @@ mod tests {
         ] {
             let mut state = view(stage);
             state.i_reported = true;
-            let rendered = match_page(Viewer::MEMBER, &state);
+            let rendered = match_page(&state);
             for forbidden in ["人が報告", "報告済み:", "9人", "件の報告", "reported_count"]
             {
                 assert!(!rendered.contains(forbidden), "{forbidden}: {rendered}");
@@ -598,34 +597,28 @@ mod tests {
 
     #[test]
     fn only_the_candidate_sees_the_host_buttons() {
-        let mine = match_page(
-            Viewer::MEMBER,
-            &view(StageView::AwaitingHost {
-                pending: Some("自分".into()),
-                i_am_candidate: true,
-            }),
-        );
+        let mine = match_page(&view(StageView::AwaitingHost {
+            pending: Some("自分".into()),
+            i_am_candidate: true,
+        }));
         assert!(mine.contains("id=\"host-accept\""), "{mine}");
         assert!(mine.contains("id=\"host-decline\""), "{mine}");
 
-        let theirs = match_page(
-            Viewer::MEMBER,
-            &view(StageView::AwaitingHost {
-                pending: Some("味方".into()),
-                i_am_candidate: false,
-            }),
-        );
+        let theirs = match_page(&view(StageView::AwaitingHost {
+            pending: Some("味方".into()),
+            i_am_candidate: false,
+        }));
         assert!(!theirs.contains("id=\"host-accept\""), "{theirs}");
         assert!(theirs.contains("味方"), "{theirs}");
     }
 
     #[test]
     fn only_the_host_sees_the_room_code_input() {
-        let host = match_page(Viewer::MEMBER, &view(in_progress(true)));
+        let host = match_page(&view(in_progress(true)));
         assert!(host.contains("id=\"room-code\""), "{host}");
         assert!(host.contains("value=\"12345678\""), "打ち直せること");
 
-        let other = match_page(Viewer::MEMBER, &view(in_progress(false)));
+        let other = match_page(&view(in_progress(false)));
         assert!(!other.contains("id=\"room-code\""), "{other}");
         // ルーム ID そのものは全員に見える
         assert!(other.contains("12345678"), "{other}");
@@ -635,7 +628,7 @@ mod tests {
     fn the_report_choices_never_offer_a_draw() {
         let mut state = view(in_progress(false));
         state.actions.report = true;
-        let rendered = match_page(Viewer::MEMBER, &state);
+        let rendered = match_page(&state);
         assert!(rendered.contains("赤の勝ち"), "{rendered}");
         assert!(rendered.contains("青の勝ち"), "{rendered}");
         assert!(rendered.contains("無効試合"), "{rendered}");
@@ -647,7 +640,7 @@ mod tests {
         let mut state = view(in_progress(false));
         state.i_reported = true;
         state.actions.report = false;
-        let rendered = match_page(Viewer::MEMBER, &state);
+        let rendered = match_page(&state);
         assert!(rendered.contains("受け付けました"), "{rendered}");
         assert!(rendered.contains("確定を待っています"), "{rendered}");
         assert!(!rendered.contains("id=\"report-red\""), "{rendered}");
@@ -655,26 +648,20 @@ mod tests {
 
     #[test]
     fn the_confirmed_page_shows_my_own_delta_and_a_way_back() {
-        let rendered = match_page(
-            Viewer::MEMBER,
-            &view(StageView::Confirmed {
-                outcome: "red".into(),
-                result: "won".into(),
-                my_delta: Some(11.0),
-            }),
-        );
+        let rendered = match_page(&view(StageView::Confirmed {
+            outcome: "red".into(),
+            result: "won".into(),
+            my_delta: Some(11.0),
+        }));
         assert!(rendered.contains("勝ち"), "{rendered}");
         assert!(rendered.contains(">+11<"), "{rendered}");
         assert!(rendered.contains("href=\"/queue\""), "{rendered}");
 
-        let lost = match_page(
-            Viewer::MEMBER,
-            &view(StageView::Confirmed {
-                outcome: "blue".into(),
-                result: "lost".into(),
-                my_delta: Some(-12.0),
-            }),
-        );
+        let lost = match_page(&view(StageView::Confirmed {
+            outcome: "blue".into(),
+            result: "lost".into(),
+            my_delta: Some(-12.0),
+        }));
         assert!(lost.contains(">-12<"), "{lost}");
     }
 
@@ -685,7 +672,7 @@ mod tests {
         state.opponents[0].trainer_name = r#"<script>alert(1)</script>"#.into();
         state.opponents[0].discord_name = Some(r#"<script>alert(2)</script>"#.into());
         state.teammates[0].discord_name = Some(r#"<img src=x onerror=alert(3)>"#.into());
-        let rendered = match_page(Viewer::MEMBER, &state);
+        let rendered = match_page(&state);
         // 表示に使われるのは Discord の表示名。生のタグとして出ていない
         assert!(!rendered.contains("<script>alert"), "{rendered}");
         assert!(!rendered.contains("<img src=x"), "{rendered}");
@@ -697,14 +684,14 @@ mod tests {
 
         // Discord の表示名が取れていなければトレーナー名を出す。そちらも同じく通さない
         state.opponents[0].discord_name = None;
-        let rendered = match_page(Viewer::MEMBER, &state);
+        let rendered = match_page(&state);
         assert!(!rendered.contains("<script>alert(1)"), "{rendered}");
         assert!(rendered.contains("&lt;script&gt;alert(1)"), "{rendered}");
     }
 
     #[test]
     fn the_page_keeps_the_shared_shell_and_mobile_layout() {
-        let rendered = match_page(Viewer::MEMBER, &view(in_progress(false)));
+        let rendered = match_page(&view(in_progress(false)));
         assert!(rendered.starts_with("<!doctype html>"), "{rendered}");
         assert!(
             rendered.contains("<header class=\"site-header\">"),
@@ -749,7 +736,7 @@ mod tests {
             },
             StageView::Disputed,
         ] {
-            let rendered = match_page(Viewer::MEMBER, &view(stage));
+            let rendered = match_page(&view(stage));
             for forbidden in [
                 "sigma",
                 "σ",
@@ -788,7 +775,7 @@ mod tests {
         ];
         for stage in stages {
             let name = stage.name();
-            let rendered = match_page(Viewer::MEMBER, &view(stage));
+            let rendered = match_page(&view(stage));
             assert!(rendered.starts_with("<!doctype html>"), "{name}");
             assert!(rendered.trim_end().ends_with("</html>"), "{name}");
             assert!(
@@ -802,7 +789,7 @@ mod tests {
     fn blue_side_sees_its_own_team_first() {
         let mut state = view(in_progress(false));
         state.my_team = BLUE.into();
-        let rendered = match_page(Viewer::MEMBER, &state);
+        let rendered = match_page(&state);
         let my_title = rendered.find("id=\"my-team-title\"").expect("my team");
         let opponent_title = rendered.find("id=\"opponent-title\"").expect("opponent");
         assert!(my_title < opponent_title, "自分のチームが先");
@@ -859,7 +846,7 @@ mod tests {
         ];
         for (label, state) in stages {
             println!("========== {label} ==========");
-            println!("{}", match_page(Viewer::MEMBER, &state));
+            println!("{}", match_page(&state));
         }
     }
 }

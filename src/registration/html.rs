@@ -2,10 +2,16 @@
 //!
 //! ユーザー由来の値（トレーナー名、Discord の表示名）は必ず [`escape`] を通す。
 //!
-//! **共通ヘッダーはここ 1 か所にしかない**（[`site_header`]）。キュー・戦績・管理の
-//! 各画面も [`page`] / [`page_with_styles`] を通るので、ヘッダーを直すと全画面が直る。
-//! 画面ごとに `<header>` を書かないこと（片方だけ直る事故を防ぐ）。
+//! **共通ヘッダーはここ 1 か所にしかない**（[`site_header`]）。キュー・戦績・ランキング・
+//! プロフィール・管理の各画面も [`page`] / [`page_with_styles`] を通るので、ヘッダーを
+//! 直すと全画面が直る。画面ごとに `<header>` を書かないこと（片方だけ直る事故を防ぐ）。
 //! 出す導線は [`Viewer`] だけで決まり、未ログインには何も出さない。
+//!
+//! **例外はマッチ画面だけ**（[`page_without_nav`]）。試合中に他画面へ移れる導線を作ると
+//! 報告ボタンから離れる経路が増えるので、ナビゲーションを丸ごと出さない。
+//!
+//! **`/admin` へのリンクはどのヘッダーにも出さない。**非管理者の `/admin` は 404 を
+//! 返す方針なので、リンクの有無がそのまま「この人は管理者か」の判別材料になる。
 
 use crate::lifecycle::FormationId;
 
@@ -250,21 +256,30 @@ fn site_header(viewer: Viewer) -> String {
              <nav class=\"site-nav\" aria-label=\"メニュー\">\n{ranking}</nav>\n</header>\n"
         );
     }
-    // 管理パネルはリンクを消すだけ。アクセス制御は /admin 側の照合が正（非管理者には 404）
-    let admin = if viewer.is_admin() {
-        "<a href=\"/admin\">管理</a>\n"
-    } else {
-        ""
-    };
+    // **管理パネルへのリンクは出さない。**非管理者の `/admin` は 404 を返す方針なので、
+    // リンクの有無がそのまま「この人は管理者か」の判別材料になってしまう。
+    // 運営は URL を直接開く（アクセス制御は /admin 側の照合が正）
     format!(
         "<header class=\"site-header\">\n\
          <a class=\"brand\" href=\"/queue\">Assay</a>\n\
          <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
          <a href=\"/status\">戦績</a>\n{ranking}\
-         <a href=\"/profile\">プロフィール</a>\n{admin}\
+         <a href=\"/profile\">プロフィール</a>\n\
          <form method=\"post\" action=\"/auth/logout\">\
          <button type=\"submit\">ログアウト</button></form>\n\
          </nav>\n</header>\n"
+    )
+}
+
+/// ナビゲーションを持たないヘッダー。**マッチ画面専用。**
+///
+/// 試合中に他画面へ移れる導線を作らない（報告ボタンから離れる経路を増やさない）。
+/// ブランド名もリンクにしない——押せばキュー画面へ飛べてしまう。
+fn bare_header() -> String {
+    String::from(
+        "<header class=\"site-header\">\n\
+         <span class=\"brand\">Assay</span>\n\
+         <span class=\"context\">試合が終わるまでこの画面で操作します</span>\n</header>\n",
     )
 }
 
@@ -273,8 +288,17 @@ pub fn page(viewer: Viewer, title: &str, body: &str) -> String {
     page_with_styles(viewer, title, body, "")
 }
 
-/// 登録画面と同じシェルに、画面固有の CSS を追加する。
+/// 登録画面と同じシェルに、画面固有の CSS を追加する。**共通ヘッダー付き。**
 pub fn page_with_styles(viewer: Viewer, title: &str, body: &str, extra_styles: &str) -> String {
+    shell(&site_header(viewer), title, body, extra_styles)
+}
+
+/// 共通ヘッダーを出さないページ。**マッチ画面だけがこれを使う。**
+pub fn page_without_nav(title: &str, body: &str, extra_styles: &str) -> String {
+    shell(&bare_header(), title, body, extra_styles)
+}
+
+fn shell(header: &str, title: &str, body: &str, extra_styles: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"ja\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -285,7 +309,6 @@ pub fn page_with_styles(viewer: Viewer, title: &str, body: &str, extra_styles: &
          <footer class=\"site-footer\">Assay は非公式のコミュニティ運営サービスです。</footer>\n\
          </div>\n</body>\n</html>\n",
         title = escape(title),
-        header = site_header(viewer),
         extra_styles = extra_styles,
     )
 }
@@ -790,13 +813,86 @@ mod tests {
         assert!(!header.contains("管理"), "{header}");
     }
 
+    /// **管理者と非管理者でヘッダーが 1 バイトも違わないこと。**
+    ///
+    /// `/admin` は非管理者に 404 を返す方針なので、リンクの有無がそのまま
+    /// 「この人は管理者か」の判別材料になる。運営は URL を直接開く。
     #[test]
-    fn only_an_admin_gets_the_admin_panel_link() {
-        let page = error_page(Viewer::ADMIN, "エラー", "やり直してください");
+    fn the_header_is_identical_for_admins_and_everyone_else() {
+        for public in [false, true] {
+            let admin = header_of(&error_page(
+                Viewer::ADMIN.with_ranking(public),
+                "エラー",
+                "やり直してください",
+            ))
+            .to_owned();
+            let member = header_of(&error_page(
+                Viewer::MEMBER.with_ranking(public),
+                "エラー",
+                "やり直してください",
+            ))
+            .to_owned();
+            assert_eq!(
+                admin, member,
+                "ランキング公開={public} で管理者とそれ以外のヘッダーが違う"
+            );
+            assert!(!admin.contains("/admin"), "{admin}");
+            assert!(!admin.contains("管理"), "{admin}");
+            println!(
+                "ランキング公開={public}: 管理者と一般のヘッダーは一致（{} バイト）",
+                admin.len()
+            );
+        }
+    }
+
+    /// **ランキングが非公開のあいだはリンクを出さない。**公開したら未ログインにも出す。
+    #[test]
+    fn the_ranking_link_follows_the_public_switch() {
+        for viewer in [Viewer::ANONYMOUS, Viewer::MEMBER, Viewer::ADMIN] {
+            let private = header_of(&error_page(viewer, "エラー", "やり直してください")).to_owned();
+            assert!(
+                !private.contains("href=\"/ranking\""),
+                "非公開なのにリンクがある: {private}"
+            );
+            let public = header_of(&error_page(
+                viewer.with_ranking(true),
+                "エラー",
+                "やり直してください",
+            ))
+            .to_owned();
+            assert!(
+                public.contains("href=\"/ranking\""),
+                "公開なのにリンクが無い: {public}"
+            );
+        }
+        println!("ランキング: 非公開ならリンク無し / 公開なら未ログインにも出る");
+    }
+
+    /// **マッチ画面にはヘッダーの導線を出さない。**
+    ///
+    /// 試合中に他画面へ移れる経路を作らない（報告ボタンから離れる経路を増やさない）。
+    /// ブランド名もリンクにしない。
+    #[test]
+    fn the_match_screen_has_no_navigation_at_all() {
+        let page = page_without_nav("試合中", "<p>本文</p>", "");
         let header = header_of(&page);
-        assert!(header.contains("href=\"/admin\""), "{header}");
-        assert!(header.contains("href=\"/status\""), "{header}");
-        assert!(header.contains("action=\"/auth/logout\""), "{header}");
+        for link in [
+            "href=\"/queue\"",
+            "href=\"/status\"",
+            "href=\"/ranking\"",
+            "href=\"/profile\"",
+            "href=\"/admin\"",
+            "href=\"/\"",
+            "/auth/logout",
+            "<nav",
+        ] {
+            assert!(!header.contains(link), "{link} が残っている: {header}");
+        }
+        assert!(
+            header.contains("<span class=\"brand\">Assay</span>"),
+            "{header}"
+        );
+        println!("マッチ画面のヘッダー: {}", header.trim());
     }
 
     /// **ヘッダーの定義が 1 か所であることの検査。**
@@ -835,7 +931,7 @@ mod tests {
             assert_eq!(header_of(rendered), expected, "{rendered}");
         }
 
-        // 管理パネルも同じ外枠を通る。違うのは管理者向けの 1 リンクだけ
+        // 管理パネルも同じ外枠を通る。**管理者向けの差分はもう無い**
         let admin = search_page(&SearchView {
             matchmaker: MatchmakerView {
                 paused: None,
@@ -849,12 +945,30 @@ mod tests {
         });
         assert_eq!(
             header_of(&admin),
-            header_of(&error_page(Viewer::ADMIN, "エラー", "やり直してください")),
-        );
-        assert_eq!(
-            header_of(&admin).replace("<a href=\"/admin\">管理</a>\n", ""),
             expected,
-            "管理者のヘッダーは一般参加者のものに管理リンクを足しただけ",
+            "管理パネルのヘッダーが他の画面と違う",
+        );
+
+        // プロフィール編集とランキングも同じヘッダーを通る
+        let own = crate::profiles::OwnProfile::default();
+        let edit = crate::profiles::html::edit_page(crate::profiles::html::EditPage {
+            viewer: Viewer::MEMBER,
+            player_id: uuid::Uuid::nil(),
+            own: &own,
+            known_roles: &[],
+            current_blocks: &[],
+            block_query: "",
+            search_results: &[],
+            error: None,
+            saved: false,
+        });
+        assert_eq!(
+            header_of(&edit),
+            expected,
+            "プロフィール編集のヘッダーが違う"
+        );
+        println!(
+            "同じヘッダーを出す画面: 登録 / 登録結果 / エラー / 戦績 / 管理 / プロフィール編集"
         );
     }
 

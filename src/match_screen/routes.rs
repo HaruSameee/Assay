@@ -177,9 +177,9 @@ async fn show_match(
         return not_found(html);
     };
     match build_view(&app, formation, player_id).await {
+        // マッチ画面は共通ヘッダーを出さないので、ここで Viewer を引く必要が無い
         Ok(Some(view)) if html => {
-            let viewer = viewer(&app, player_id).await;
-            (StatusCode::OK, Html(super::html::match_page(viewer, &view))).into_response()
+            (StatusCode::OK, Html(super::html::match_page(&view))).into_response()
         }
         Ok(Some(view)) => (StatusCode::OK, Json(view)).into_response(),
         Ok(None) => not_found(html),
@@ -640,13 +640,6 @@ fn display_name(entry: &MatchPlayer) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(UNNAMED)
         .to_owned()
-}
-
-async fn viewer(app: &MatchState, player_id: PlayerId) -> Viewer {
-    match app.matches.discord_user_id(player_id).await {
-        Ok(Some(discord_user_id)) => app.audience.viewer_for(&discord_user_id),
-        _ => Viewer::MEMBER,
-    }
 }
 
 // ----------------------------------------------------------------------
