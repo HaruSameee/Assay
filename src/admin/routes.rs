@@ -871,9 +871,17 @@ async fn render_reports(app: &AdminState, notice: Option<Notice>) -> Response {
             return internal_error();
         }
     };
+    let disputed = match app.store.disputed_formations().await {
+        Ok(disputed) => disputed,
+        Err(err) => {
+            error!(%err, "could not list the disputed formations");
+            return internal_error();
+        }
+    };
     Html(reports_page(&ReportsView {
         awaiting: &awaiting,
         form_key: &form_key(),
+        disputed: &disputed,
         notice,
     }))
     .into_response()

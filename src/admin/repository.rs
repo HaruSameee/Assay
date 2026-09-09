@@ -847,8 +847,13 @@ impl AdminRepository {
 
         let mut awaiting = Vec::new();
         for formation in &unfinished {
-            // 報告を受け付ける状態だけ（`matched` などはまだ報告できない）
-            if !formation.snapshot.state.requires_reports() {
+            // **係争中は出さない。**この一覧は「未報告が原因で確定しない試合」を
+            // 押し進めるためのもので、disputed は報告が割れたことが原因。未報告者ぶんを
+            // 足しても状態は動かないので、載っていること自体が
+            // 「ここから解決できる」という誤解になる（係争は下の一覧で見る）
+            if !formation.snapshot.state.requires_reports()
+                || formation.snapshot.state == crate::lifecycle::FormationState::Disputed
+            {
                 continue;
             }
             let rows = sqlx::query!(
@@ -977,5 +982,94 @@ impl AdminRepository {
         Ok(StaffReportOutcome::Entered {
             settled: evaluation.event.is_some(),
         })
+    }
+}
+
+// ----------------------------------------------------------------------
+// 係争中の試合（閲覧のみ）
+// ----------------------------------------------------------------------
+//
+// **ここに報告を入力する経路は作らない。**未報告者の一覧から係争中を外したので、
+// そのままだと運営の視界から消える。Discord 上で裁定するための材料として、
+// 誰が何を報告したかを読めるようにするだけ。
+
+/// 係争中の試合における 1 人ぶんの報告。**最新の 1 件だけ**（訂正は反映済み）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisputedVote {
+    pub player_id: Uuid,
+    pub trainer_name: Option<String>,
+    pub team: String,
+    /// `red` / `blue` / `nullified`。まだ報告していなければ `None`。
+    pub outcome: Option<String>,
+    /// 運営が入れた報告なら true（`raw_result->>'source' = 'staff'`）。
+    pub from_staff: bool,
+}
+
+/// 係争中の試合 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisputedFormation {
+    pub formation_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    /// 参加者 10 人の最新報告（未報告も含む）。
+    pub votes: Vec<DisputedVote>,
+}
+
+impl AdminRepository {
+    /// 係争中（`disputed`）の試合と、その報告の内訳。**閲覧専用。**
+    ///
+    /// 件数は 15 分サマリの「係争対応待ち」と同じ判定
+    /// （`list_unfinished` を畳んで `Disputed` を数える）から来る。
+    pub async fn disputed_formations(&self) -> Result<Vec<DisputedFormation>, sqlx::Error> {
+        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => error,
+                other => sqlx::Error::Protocol(other.to_string()),
+            })?;
+
+        let mut disputed = Vec::new();
+        for formation in &unfinished {
+            if formation.snapshot.state != crate::lifecycle::FormationState::Disputed {
+                continue;
+            }
+            // 各プレイヤーの**最新**報告だけ（訂正で打ち消された行は出さない）。
+            // 判定に使うのと同じ「打ち消されていない行」の条件を使う
+            let rows = sqlx::query!(
+                "select fp.player_id, fp.team, p.trainer_name, \
+                        mr.outcome as \"outcome?\", \
+                        (mr.raw_result->>'source' = 'staff') as \"from_staff?\" \
+                 from formation_players fp \
+                 join players p on p.id = fp.player_id \
+                 left join match_reports mr \
+                   on mr.formation_id = fp.formation_id \
+                  and mr.player_id = fp.player_id \
+                  and not exists ( \
+                      select 1 from match_reports correction \
+                      where correction.supersedes_id = mr.id \
+                  ) \
+                 where fp.formation_id = $1 \
+                 order by fp.team, fp.player_id",
+                formation.log.formation_id.0,
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            disputed.push(DisputedFormation {
+                formation_id: formation.log.formation_id.0,
+                created_at: formation.log.created_at,
+                votes: rows
+                    .into_iter()
+                    .map(|row| DisputedVote {
+                        player_id: row.player_id,
+                        trainer_name: row.trainer_name,
+                        team: row.team,
+                        outcome: row.outcome,
+                        from_staff: row.from_staff.unwrap_or(false),
+                    })
+                    .collect(),
+            });
+        }
+        disputed.sort_by_key(|entry| entry.created_at);
+        Ok(disputed)
     }
 }

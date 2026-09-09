@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select fp.player_id, fp.team, p.trainer_name, mr.outcome as \"outcome?\", (mr.raw_result->>'source' = 'staff') as \"from_staff?\" from formation_players fp join players p on p.id = fp.player_id left join match_reports mr on mr.formation_id = fp.formation_id and mr.player_id = fp.player_id and not exists ( select 1 from match_reports correction where correction.supersedes_id = mr.id ) where fp.formation_id = $1 order by fp.team, fp.player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "team",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "team"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "outcome?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "from_staff?",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      null
+    ]
+  },
+  "hash": "afa9cdf4e92e319a97abd5a1c369fe4980d794fdc7efa8e8cc51bf73808d140c"
+}

@@ -1219,13 +1219,28 @@ async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
         .unwrap();
     assert_eq!(state_of(&db, 1).await, S::Disputed);
 
+    // **係争中は一覧に出ない。**報告が割れたことが原因なので、未報告者ぶんを
+    // 足しても状態は動かない（下で実測する）。出ていること自体が誤解を生む
     let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
-    println!(
-        "係争中の試合の未報告者が一覧に出るか: {}",
-        listed(&page, player(11))
+    assert!(
+        !listed(&page, player(11)),
+        "係争中の未報告者が一覧に出ている"
     );
+    println!("係争中の試合の未報告者が入力欄に出るか: false");
 
-    let (status, after) = enter_report(&app, &page, 1, player(11), "red").await;
+    // 画面には出ないが、**エンドポイント自体は塞いでいない**ので直接 POST は通る。
+    // 何が起きるかをここに記録する（裁定の経路は開幕後に決める）
+    let (status, after) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports",
+        &format!(
+            "formation={}&player={}&outcome=red&reason=直接POST&key=disputed-direct",
+            fid(1).0,
+            player(11).0,
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let state = state_of(&db, 1).await;
@@ -1258,6 +1273,108 @@ async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
     println!("状態: {state:?}");
     println!("イベント列: {kinds:?}");
     println!("運営が入れた報告の行数: {staff}");
+
+    db.done().await;
+}
+
+/// **係争中の試合は未報告者の一覧から外れ、閲覧専用の一覧に出る。**
+///
+/// 件数が 15 分サマリの「係争対応待ち」と一致することも同時に測る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_disputed_match_leaves_the_entry_list_and_appears_read_only(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 10).await;
+    // 1 件は普通に報告待ち、2 件目は係争中にする
+    playable_formation(&db, 1).await;
+    playable_formation(&db, 2).await;
+    let app = db.router();
+
+    // formation 1: 9 人が報告して 1 人が未報告（一覧に出る側）
+    for who in 2..=10u128 {
+        player_report(&db, 1, who, "red").await;
+    }
+    // formation 2: 報告が割れたまま disputed（一覧から外れる側）
+    for who in 2..=9u128 {
+        player_report(&db, 2, who, "red").await;
+    }
+    player_report(&db, 2, 10, "blue").await;
+    db.formations
+        .append_event(
+            fid(2),
+            &NewEvent::new(K::Disputed, None, at(20), "disputed-2")
+                .with_payload(json!({ "outcome": "disputed" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(&db, 2).await, S::Disputed);
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // **入力欄が出るのは formation 1 の未報告者だけ。**
+    // 係争中の formation 2 の未報告者（player(11)）には入力欄が無い
+    let entry_forms = page.matches("name=\"player\" value=\"").count();
+    assert_eq!(entry_forms, 1, "入力欄の数が違う: {entry_forms}");
+    assert!(
+        page.contains(&format!("match-{}", &fid(1).0.simple().to_string()[..8])),
+        "報告待ちの試合が出ていない"
+    );
+    println!("入力欄が出る試合: 1 件（報告待ちのみ）");
+
+    // 係争中の試合は**閲覧専用の枠**に出る
+    assert!(page.contains("係争中の試合（1件・閲覧のみ）"), "{page}");
+    assert!(
+        page.contains("ここから結果を入れることはできません"),
+        "{page}"
+    );
+    let disputed_section = page
+        .split("id=\"disputed-title\"")
+        .nth(1)
+        .expect("the disputed section");
+    // **この枠には form も button も無い。**
+    assert!(
+        !disputed_section.contains("<form"),
+        "係争の枠に入力欄がある"
+    );
+    assert!(
+        !disputed_section.contains("<button"),
+        "係争の枠にボタンがある"
+    );
+    println!("係争中の枠: form も button も無い（閲覧のみ）");
+
+    // 誰が何を報告したかが読める
+    assert!(disputed_section.contains("赤の勝ち"), "{disputed_section}");
+    assert!(disputed_section.contains("青の勝ち"), "{disputed_section}");
+    assert!(disputed_section.contains("未報告"), "{disputed_section}");
+    let votes = db.admin.disputed_formations().await.unwrap();
+    assert_eq!(votes.len(), 1);
+    let breakdown = &votes[0];
+    let red = breakdown
+        .votes
+        .iter()
+        .filter(|vote| vote.outcome.as_deref() == Some("red"))
+        .count();
+    let blue = breakdown
+        .votes
+        .iter()
+        .filter(|vote| vote.outcome.as_deref() == Some("blue"))
+        .count();
+    let unreported = breakdown
+        .votes
+        .iter()
+        .filter(|vote| vote.outcome.is_none())
+        .count();
+    println!("係争の内訳: 赤 {red} / 青 {blue} / 未報告 {unreported}");
+    assert_eq!((red, blue, unreported), (8, 1, 1));
+
+    // **15 分サマリの「係争対応待ち」と件数が一致する。**
+    let summary = db.matchmaker(2).summary(Utc::now()).await.expect("summary");
+    println!(
+        "15分サマリの係争対応待ち: {} 件 / 一覧の件数: {} 件",
+        summary.active.awaiting_resolution,
+        votes.len()
+    );
+    assert_eq!(summary.active.awaiting_resolution, votes.len());
 
     db.done().await;
 }

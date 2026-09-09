@@ -12,7 +12,9 @@ use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
-use super::repository::{AdjustmentRow, AwaitingReports, FoundPlayer, QueuedEntry};
+use super::repository::{
+    AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
+};
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
 
 /// 検索画面に渡すデータ。
@@ -1074,6 +1076,8 @@ pub struct ReportsView<'a> {
     pub awaiting: &'a [AwaitingReports],
     /// 冪等キー（フォーム描画時にサーバ発行）。
     pub form_key: &'a str,
+    /// 係争中の試合。**閲覧だけ**（入力欄は出さない）。
+    pub disputed: &'a [DisputedFormation],
     pub notice: Option<Notice>,
 }
 
@@ -1103,11 +1107,16 @@ pub fn reports_page(view: &ReportsView<'_>) -> String {
              <strong>入るのは追記で、プレイヤーの報告は書き換わりません。</strong>\
              確定の条件も変わりません（全員一致 + 全員報告、または受付時間の経過）。</p>\n\
              <p class=\"fine-print\">既に報告している人はこの一覧に出ません。\
-             その人の内容を運営が上書きする経路はありません（裁定は係争のフローで行います）。</p>\n\
+             その人の内容を運営が上書きする経路はありません。\
+             <strong>係争中（disputed）の試合もこの一覧には出ません</strong> — \
+             報告が割れたことが原因なので、未報告者ぶんを足しても状態は動きません。\
+             下の一覧で内訳だけ確認できます。</p>\n\
              {notice}\
              {body}\
+             {disputed}\
              </section>\n",
             nav = admin_nav("/admin/reports"),
+            disputed = disputed_section(view.disputed),
             notice = notice_html(view.notice.as_ref()),
         ),
     )
@@ -1159,4 +1168,77 @@ fn awaiting_block(formation: &AwaitingReports, form_key: &str) -> String {
         at = escape(&display_time(formation.created_at)),
         count = formation.unreported.len(),
     )
+}
+
+/// 係争中の試合の一覧。**閲覧だけ。入力欄もボタンも置かない。**
+///
+/// 未報告者の一覧から係争中を外したので、そのままだと運営の視界から消える。
+/// Discord 上で裁定するための材料として、誰が何を報告したかを読めるようにする。
+/// 裁定結果を反映する経路は**ここには作らない**（開幕後に決める）。
+fn disputed_section(disputed: &[DisputedFormation]) -> String {
+    let body = if disputed.is_empty() {
+        String::from("<p class=\"fine-print\">係争中の試合はありません。</p>\n")
+    } else {
+        disputed.iter().map(disputed_block).collect::<String>()
+    };
+    format!(
+        "<section class=\"section\" aria-labelledby=\"disputed-title\">\n\
+         <h2 id=\"disputed-title\">係争中の試合（{count}件・閲覧のみ）</h2>\n\
+         <p class=\"fine-print\">報告が割れたまま期限を過ぎた試合です。\
+         <strong>ここから結果を入れることはできません。</strong>\
+         内訳を見て、裁定は Discord 上で行ってください。</p>\n\
+         {body}</section>\n",
+        count = disputed.len(),
+    )
+}
+
+/// 係争中の試合 1 件の内訳。
+fn disputed_block(formation: &DisputedFormation) -> String {
+    let rows = formation
+        .votes
+        .iter()
+        .map(|vote| {
+            let name = vote
+                .trainer_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("（名前未登録）");
+            let outcome = vote.outcome.as_deref().map_or_else(
+                || String::from("<span class=\"tag\">未報告</span>"),
+                |outcome| escape(outcome_label(outcome)),
+            );
+            let source = if vote.from_staff {
+                "<span class=\"tag\">運営が入力</span>"
+            } else {
+                ""
+            };
+            format!(
+                "<tr><td>{name}</td><td>{team}</td><td>{outcome} {source}</td></tr>\n",
+                name = escape(name),
+                team = escape(&vote.team),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<h3>{label}</h3>\n<p class=\"fine-print\">成立: {at}</p>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>プレイヤー</th><th>チーム</th><th>最新の報告</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody></table></div>\n",
+        label = escape(&format!(
+            "match-{}",
+            &formation.formation_id.simple().to_string()[..8]
+        )),
+        at = escape(&display_time(formation.created_at)),
+    )
+}
+
+/// 報告の表記。**内部の識別子を画面に出さない。**
+fn outcome_label(outcome: &str) -> &str {
+    match outcome {
+        "red" => "赤の勝ち",
+        "blue" => "青の勝ち",
+        "nullified" => "無効試合",
+        "draw" => "引き分け",
+        other => other,
+    }
 }
