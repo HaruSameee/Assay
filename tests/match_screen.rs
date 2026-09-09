@@ -992,6 +992,60 @@ async fn an_unreported_player_can_still_report_after_confirmation(owner: PgPool)
     db.done().await;
 }
 
+/// **早期確定でも、多数派と違う報告をした人のレートは確定結果どおりに動く。**
+///
+/// レート導出（`player_match_rating_deltas`）は `formation_players` と確定イベントの
+/// `outcome` だけを見ており、`match_reports` を参照していない。つまり
+/// 「自分が何を報告したか」は増減に影響しない——所属チームと確定結果だけで決まる。
+///
+/// 早期確定を入れると少数派が毎試合出るので、そこを固定しておく。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_dissenting_report_still_moves_that_players_rating(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    // 少数派を先に出す。player 1 は red チーム、player 6 は blue チーム
+    assert_eq!(report(&app, 1, 1, "nullified").await, StatusCode::OK);
+    assert_eq!(report(&app, 1, 6, "nullified").await, StatusCode::OK);
+    assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
+
+    // 残りのうち 7 人が red で一致 → 早期確定
+    for reporter in [2u128, 3, 4, 5, 7, 8, 9] {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "7 人で確定していない");
+
+    // **少数派も、所属チームと確定結果どおりに動く。**
+    let red_dissenter = rating_delta(&db, 1, player(1)).await;
+    let blue_dissenter = rating_delta(&db, 1, player(6)).await;
+    assert_eq!(
+        red_dissenter,
+        Some(7.0),
+        "red の少数派が勝ち分を受け取れない"
+    );
+    assert_eq!(
+        blue_dissenter,
+        Some(-7.0),
+        "blue の少数派が負け分を負っていない"
+    );
+
+    // 多数派と同じ額。報告内容で差はつかない
+    assert_eq!(rating_delta(&db, 1, player(2)).await, Some(7.0));
+    assert_eq!(rating_delta(&db, 1, player(7)).await, Some(-7.0));
+    // 未報告のまま残った 10 人目も動く（レートは報告の有無で決まらない）
+    assert_eq!(rating_delta(&db, 1, player(10)).await, Some(-7.0));
+
+    println!(
+        "少数派(red,無効試合と報告): {red_dissenter:?} / 少数派(blue,同): {blue_dissenter:?} / 未報告(blue): {:?}",
+        rating_delta(&db, 1, player(10)).await
+    );
+    db.done().await;
+}
+
 /// **7 人で確定した後、既に報告した人の訂正は 409 で断る。**
 ///
 /// 確定は追記された事実であり、後から引き直さない（docs/02 §4）。
@@ -1184,6 +1238,19 @@ async fn a_correction_is_still_accepted_while_disputed(owner: PgPool) {
 }
 
 /// あるプレイヤーの `match_reports` の行数。
+/// レート導出ビューが出す 1 試合ぶんの増減。確定していなければ行が無い。
+async fn rating_delta(db: &AppDb, n: u128, who: PlayerId) -> Option<f64> {
+    sqlx::query_scalar(
+        "select delta from player_match_rating_deltas \
+         where formation_id = $1 and player_id = $2",
+    )
+    .bind(fid(n).0)
+    .bind(who.0)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap()
+}
+
 async fn report_rows(db: &AppDb, n: u128, who: PlayerId) -> i64 {
     sqlx::query_scalar!(
         "select count(*) as \"count!\" from match_reports \
