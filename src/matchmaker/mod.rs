@@ -22,7 +22,7 @@ pub mod select;
 
 pub use repository::{
     ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerRepository,
-    MatchmakerSummary, RecentCompletionCounts, RunOutcome, SelectionMetrics,
+    MatchmakerSummary, RecentCompletionCounts, RunOutcome, SelectionMetrics, teams_are_swapped,
 };
 pub use runner::{Matchmaker, MatchmakerConfig, MatchmakerConfigError};
 pub use select::{

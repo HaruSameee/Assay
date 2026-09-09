@@ -55,6 +55,14 @@ impl Team {
             Self::Blue => "blue",
         }
     }
+
+    /// 反対側。
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::Red => Self::Blue,
+            Self::Blue => Self::Red,
+        }
+    }
 }
 
 impl std::fmt::Display for Team {
