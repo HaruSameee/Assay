@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::blocks::{CurrentBlock, IncomingBlock};
 use crate::queue::html::role_label;
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
@@ -41,6 +42,8 @@ pub struct PlayerView<'a> {
     pub form_key: &'a str,
     /// 現在のブロック枠（`admin_actions` の最新行からの導出値。既定は 2）。
     pub block_allowance: i32,
+    pub outgoing_blocks: &'a [CurrentBlock],
+    pub incoming_blocks: &'a [IncomingBlock],
     pub notice: Option<Notice>,
 }
 
@@ -308,6 +311,7 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
              </form>\n\
              <h2>このプレイヤーの調整履歴</h2>\n\
              {history}\
+             {blocks}\
              </section>\n",
             name = escape(view.player.trainer_name.as_deref().unwrap_or("(未設定)")),
             nav = admin_nav("/admin/player"),
@@ -318,7 +322,74 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
             notice = notice_html(view.notice.as_ref()),
             form_key = escape(view.form_key),
             history = adjustments_table(view.adjustments, false),
+            blocks = block_section(view),
         ),
+    )
+}
+
+fn block_section(view: &PlayerView<'_>) -> String {
+    let outgoing = if view.outgoing_blocks.is_empty() {
+        "<p class=\"fine-print\">現在ブロックしているプレイヤーはいません。</p>".to_owned()
+    } else {
+        let rows = view
+            .outgoing_blocks
+            .iter()
+            .map(|block| {
+                let name = block
+                    .display_name
+                    .as_deref()
+                    .or(block.trainer_name.as_deref())
+                    .unwrap_or("表示名を取得できませんでした");
+                format!(
+                    "<li><strong>{name}</strong> <span class=\"fine-print\">登録: {blocked_at}</span>\
+                     <form class=\"inline\" method=\"post\" action=\"/admin/blocks/override\">\
+                     <input type=\"hidden\" name=\"player\" value=\"{player_id}\">\
+                     <input type=\"hidden\" name=\"target\" value=\"{target}\">\
+                     <input type=\"hidden\" name=\"key\" value=\"block-override:{form_key}:{target}\">\
+                     <label class=\"sr-only\" for=\"override-reason-{target}\">理由</label>\
+                     <input id=\"override-reason-{target}\" name=\"reason\" type=\"text\" maxlength=\"200\" placeholder=\"理由（任意）\">\
+                     <button class=\"revert\" type=\"submit\">管理解除</button></form></li>",
+                    name = escape(name),
+                    blocked_at = escape(&display_time(block.blocked_at)),
+                    player_id = escape(&view.player.player_id.to_string()),
+                    target = escape(&block.blocked_player_id.to_string()),
+                    form_key = escape(view.form_key),
+                )
+            })
+            .collect::<String>();
+        format!("<ul class=\"block-list\">{rows}</ul>")
+    };
+    let incoming = if view.incoming_blocks.is_empty() {
+        "<p class=\"fine-print\">このプレイヤーをブロックしているプレイヤーはいません。</p>"
+            .to_owned()
+    } else {
+        let rows = view
+            .incoming_blocks
+            .iter()
+            .map(|block| {
+                let name = block
+                    .display_name
+                    .as_deref()
+                    .or(block.trainer_name.as_deref())
+                    .unwrap_or("表示名を取得できませんでした");
+                format!(
+                    "<li><strong>{}</strong> <span class=\"fine-print\">登録: {}</span></li>",
+                    escape(name),
+                    escape(&display_time(block.blocked_at)),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<p class=\"fine-print\">ブロックされている件数: {}</p><ul class=\"block-list\">{rows}</ul>",
+            view.incoming_blocks.len()
+        )
+    };
+    format!(
+        "<section class=\"ops\" aria-labelledby=\"block-relationships-title\">\
+         <h2 id=\"block-relationships-title\">味方ブロック</h2>\
+         <h3>このプレイヤーがブロックしている相手</h3>{outgoing}\
+         <h3>このプレイヤーをブロックしている相手</h3>{incoming}\
+         </section>"
     )
 }
 
@@ -772,6 +843,8 @@ mod tests {
             adjustments: &[],
             form_key: "0f6f0b7a-6e31-7a2c-9b93-0a3c6f9d2a11",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            outgoing_blocks: &[],
+            incoming_blocks: &[],
             notice: None,
         });
         assert!(rendered.contains("action=\"/admin/adjustments\""));
@@ -794,6 +867,8 @@ mod tests {
             adjustments: &rows,
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            outgoing_blocks: &[],
+            incoming_blocks: &[],
             notice: None,
         });
         assert_eq!(rendered.matches("action=\"/admin/revert\"").count(), 1);
@@ -811,6 +886,8 @@ mod tests {
             adjustments: &[],
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            outgoing_blocks: &[],
+            incoming_blocks: &[],
             notice: Some(Notice {
                 kind: NoticeKind::Error,
                 message: "<b>not html</b>".to_owned(),
@@ -993,6 +1070,8 @@ mod tests {
             adjustments: &[],
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            outgoing_blocks: &[],
+            incoming_blocks: &[],
             notice: None,
         });
         assert!(rendered.contains("<dt>ブロック枠</dt><dd>2 枠</dd>"));
@@ -1001,6 +1080,41 @@ mod tests {
         assert!(rendered.contains(&format!("max=\"{MAX_BLOCK_ALLOWANCE}\"")));
         // 調整フォームの冪等キーと衝突しない
         assert!(rendered.contains("name=\"key\" value=\"k\""));
+    }
+
+    #[test]
+    fn the_player_page_lists_block_relationships_and_the_override_form() {
+        let outgoing = [CurrentBlock {
+            blocked_player_id: Uuid::from_u128(8),
+            display_name: Some("Global Outgoing".to_owned()),
+            trainer_name: None,
+            blocked_at: Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap(),
+        }];
+        let incoming = [IncomingBlock {
+            player_id: Uuid::from_u128(9),
+            display_name: Some("Global Incoming".to_owned()),
+            trainer_name: None,
+            blocked_at: Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap(),
+        }];
+        let rendered = player_page(&PlayerView {
+            player: &player(),
+            adjustments: &[],
+            form_key: "k",
+            block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            outgoing_blocks: &outgoing,
+            incoming_blocks: &incoming,
+            notice: None,
+        });
+        assert!(rendered.contains("Global Outgoing"), "{rendered}");
+        assert!(rendered.contains("Global Incoming"), "{rendered}");
+        assert!(
+            rendered.contains("action=\"/admin/blocks/override\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("value=\"{}\"", Uuid::from_u128(8))),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1053,6 +1167,8 @@ mod tests {
                     adjustments: &[],
                     form_key: "k",
                     block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+                    outgoing_blocks: &[],
+                    incoming_blocks: &[],
                     notice: None,
                 }),
             ),

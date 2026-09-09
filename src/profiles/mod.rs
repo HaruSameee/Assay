@@ -17,5 +17,5 @@ pub use model::{
     DiscordAppearance, MAX_BIO_CHARS, MAX_MAIN_ROLES, ProfileEdit, ProfileError, PublicProfile,
     avatar_url, validate_edit,
 };
-pub use repository::{OwnProfile, ProfileRepository};
+pub use repository::{OwnProfile, PlayerDiscordIdentity, ProfileRepository};
 pub use routes::{ProfileState, router};

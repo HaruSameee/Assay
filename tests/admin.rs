@@ -29,6 +29,7 @@ use sqlx::postgres::PgPoolOptions;
 use unite_matchsystem::admin::{
     AdminIds, AdminRepository, AdminState, parse_admin_ids, router as admin_router,
 };
+use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::lifecycle::PlayerId;
 use unite_matchsystem::matchmaker::ROLES;
 use unite_matchsystem::queue::QueueRepository;
@@ -59,6 +60,7 @@ fn app_with_admin(db: &AppDb, oauth: Arc<FakeOAuth>, ids: Option<AdminIds>) -> R
             config(),
             ids,
             db.store.clone(),
+            db.blocks.clone(),
         ))),
         None => base,
     }
@@ -94,6 +96,7 @@ struct AppDb {
     ratings: RatingAdjustmentRepository,
     queue: QueueRepository,
     store: AdminRepository,
+    blocks: BlockRepository,
     registration: RegistrationRepository,
 }
 
@@ -112,6 +115,7 @@ impl AppDb {
             ratings: RatingAdjustmentRepository::new(pool.clone()),
             queue: QueueRepository::new(pool.clone()),
             store: AdminRepository::new(pool.clone()),
+            blocks: BlockRepository::new(pool.clone()),
             registration: RegistrationRepository::new(pool.clone()),
             pool,
         }

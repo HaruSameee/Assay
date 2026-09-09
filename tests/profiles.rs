@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use common::{APP_ROLE, APP_ROLE_PASSWORD, Browser, FakeOAuth, config, player, sign_in};
+use common::{APP_ROLE, APP_ROLE_PASSWORD, Browser, FakeOAuth, body_text, config, player, sign_in};
 use serde_json::Value;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::lifecycle::PlayerId;
 use unite_matchsystem::profiles::{ProfileRepository, ProfileState, router as profile_router};
 use unite_matchsystem::registration::{
@@ -28,6 +29,7 @@ use unite_matchsystem::registration::{
 struct AppDb {
     pool: PgPool,
     profiles: ProfileRepository,
+    blocks: BlockRepository,
     registration: RegistrationRepository,
 }
 
@@ -44,6 +46,7 @@ impl AppDb {
             .expect("connect as the app role");
         Self {
             profiles: ProfileRepository::new(pool.clone()),
+            blocks: BlockRepository::new(pool.clone()),
             registration: RegistrationRepository::new(pool.clone()),
             pool,
         }
@@ -63,6 +66,7 @@ fn app(db: &AppDb, oauth: Arc<FakeOAuth>) -> Router {
         config(),
         db.profiles.clone(),
         db.registration.clone(),
+        db.blocks.clone(),
     )))
 }
 
@@ -182,23 +186,44 @@ async fn the_main_roles_key_only_appears_when_published(owner: PgPool) {
 async fn the_public_profile_carries_no_internal_identifiers(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let oauth = Arc::new(FakeOAuth::new("2002"));
-    let (_, me) = signed_in(&db, &oauth, "2002").await;
-    let json = public_json(&db, &oauth, me).await;
-    let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
-    println!("公開プロフィールのキー: {keys:?}");
-    for forbidden in [
-        "discord_user_id",
-        "main_roles_public",
-        "blocked",
-        "blocks",
-        "block_allowance",
-    ] {
-        assert!(
-            json.get(forbidden).is_none(),
-            "{forbidden} が載っている: {json}"
-        );
+    let (mut browser, me) = signed_in(&db, &oauth, "2002").await;
+    oauth.set_display_name(Some("Target Global Name"));
+    let (_, target) = signed_in(&db, &oauth, "2009").await;
+
+    let search = browser.get("/profile?block_query=Target").await;
+    assert_eq!(search.status(), StatusCode::OK);
+    let search_html = body_text(search).await;
+    assert!(search_html.contains("Target Global Name"), "{search_html}");
+    assert!(search_html.contains(&target.0.to_string()), "{search_html}");
+    let response = browser
+        .post_form(
+            "/profile/blocks",
+            &format!("action=block&target={}&key=block-privacy", target.0),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(db.blocks.current_for(me).await.unwrap().len(), 1);
+
+    for player_id in [me, target] {
+        let json = public_json(&db, &oauth, player_id).await;
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        println!("public profile JSON for {player_id:?}: {json}");
+        println!("public profile keys for {player_id:?}: {keys:?}");
+        for forbidden in [
+            "discord_user_id",
+            "main_roles_public",
+            "blocked",
+            "blocks",
+            "block_allowance",
+        ] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "{forbidden} leaked for {player_id:?}: {json}"
+            );
+        }
     }
     // アバター未設定のときは、既定アバターの URL に discord_user_id が入らない
+    let json = public_json(&db, &oauth, me).await;
     let body = serde_json::to_string(&json).unwrap();
     assert_eq!(
         body.matches("2002").count(),

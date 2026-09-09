@@ -105,4 +105,5 @@ jobs:
         run: |
           DATABASE_URL="$TEST_ADMIN_DATABASE_URL" \
             cargo test --test persistence --test discord --test schema --test registration \
-              --test queue --test matchmaker --test rating --test status --test admin
+              --test queue --test matchmaker --test rating --test status --test admin \
+              --test admin_ops --test profiles --test blocks

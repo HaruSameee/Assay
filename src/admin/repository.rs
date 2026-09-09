@@ -551,7 +551,7 @@ impl AdminRepository {
 }
 
 /// 追記の実体。プールからでもトランザクションからでも同じ経路を通す。
-async fn append_action_on(
+pub(crate) async fn append_action_on(
     conn: &mut PgConnection,
     input: &NewAdminAction,
 ) -> Result<ActionOutcome, AdminStoreError> {

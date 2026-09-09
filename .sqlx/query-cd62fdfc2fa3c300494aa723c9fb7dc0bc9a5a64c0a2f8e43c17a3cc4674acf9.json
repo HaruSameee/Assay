@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select snapshot.player_id, snapshot.display_name, target.trainer_name from ( select distinct on (player_id) player_id, display_name from player_discord_snapshots order by player_id, id desc ) snapshot join players target on target.id = snapshot.player_id where snapshot.player_id <> $1 and position(lower($2) in lower(snapshot.display_name)) > 0 order by snapshot.display_name, snapshot.player_id limit 20",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "player_discord_snapshots",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "player_discord_snapshots",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "cd62fdfc2fa3c300494aa723c9fb7dc0bc9a5a64c0a2f8e43c17a3cc4674acf9"
+}

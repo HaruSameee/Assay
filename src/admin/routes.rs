@@ -26,6 +26,8 @@ use serde::Deserialize;
 use tracing::error;
 use uuid::Uuid;
 
+use crate::blocks::{AdminBlockOverrideError, BlockRepository};
+use crate::lifecycle::PlayerId;
 use crate::registration::html::error_page;
 use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
@@ -57,16 +59,23 @@ pub struct AdminState {
     key: Key,
     ids: AdminIds,
     pub store: AdminRepository,
+    pub blocks: BlockRepository,
 }
 
 impl AdminState {
-    pub fn new(config: AuthConfig, ids: AdminIds, store: AdminRepository) -> Self {
+    pub fn new(
+        config: AuthConfig,
+        ids: AdminIds,
+        store: AdminRepository,
+        blocks: BlockRepository,
+    ) -> Self {
         let key = config.cookie_key();
         Self {
             config,
             key,
             ids,
             store,
+            blocks,
         }
     }
 }
@@ -96,6 +105,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/matchmaker", post(control_matchmaker))
         .route("/admin/queue/remove", post(remove_from_queue))
         .route("/admin/blocks", post(set_block_allowance))
+        .route("/admin/blocks/override", post(override_block))
         // シーズン境界（導出の起点）。2 段階の確認。実行は POST /admin/season
         .route("/admin/season", get(show_season).post(start_season))
         .route("/admin/season/confirm", post(confirm_season))
@@ -298,6 +308,20 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
             return internal_error();
         }
     };
+    let outgoing_blocks = match app.blocks.current_for(PlayerId(player_id)).await {
+        Ok(blocks) => blocks,
+        Err(err) => {
+            error!(%err, "could not read outgoing blocks");
+            return internal_error();
+        }
+    };
+    let incoming_blocks = match app.blocks.blocked_by(PlayerId(player_id)).await {
+        Ok(blocks) => blocks,
+        Err(err) => {
+            error!(%err, "could not read incoming blocks");
+            return internal_error();
+        }
+    };
     // 冪等キーはフォーム描画のたびに発行。同じフォームの再送信は同じキーを持つ
     let form_key = form_key();
     Html(player_page(&PlayerView {
@@ -305,9 +329,88 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
         adjustments: &adjustments,
         form_key: &form_key,
         block_allowance,
+        outgoing_blocks: &outgoing_blocks,
+        incoming_blocks: &incoming_blocks,
         notice,
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockOverrideForm {
+    #[serde(default)]
+    player: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn override_block(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<BlockOverrideForm>,
+) -> Response {
+    let Ok(player_id) = Uuid::parse_str(form.player.trim()) else {
+        return not_found();
+    };
+    let Ok(target_id) = Uuid::parse_str(form.target.trim()) else {
+        return not_found();
+    };
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    if form.key.trim().is_empty() {
+        return render_player(
+            &app,
+            player_id,
+            Some(fail("操作をやり直してください。".to_owned())),
+        )
+        .await;
+    }
+    let reason = normalize_reason(&form.reason);
+    match app
+        .blocks
+        .override_unblock(
+            actor.discord_user_id,
+            PlayerId(player_id),
+            PlayerId(target_id),
+            reason,
+            &form.key,
+            Utc::now(),
+        )
+        .await
+    {
+        Ok(()) => {
+            render_player(
+                &app,
+                player_id,
+                Some(info(
+                    "ブロックを管理解除しました。操作は管理ログに記録されています。".to_owned(),
+                )),
+            )
+            .await
+        }
+        Err(AdminBlockOverrideError::NotBlocked) => {
+            render_player(
+                &app,
+                player_id,
+                Some(fail("このブロックはすでに解除されています。".to_owned())),
+            )
+            .await
+        }
+        Err(AdminBlockOverrideError::Database(error)) => {
+            error!(%error, "could not override a block");
+            internal_error()
+        }
+        Err(AdminBlockOverrideError::Admin(error)) => {
+            error!(%error, "could not record a block override");
+            internal_error()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,7 +753,7 @@ struct BlockForm {
     reason: String,
 }
 
-/// ブロック枠の変更。ブロック機能そのものは未実装で、ここでは**枠数を持つだけ**。
+/// ブロック枠の変更。現在の有効ブロック数は、`player_blocks` の最新行から導出する。
 async fn set_block_allowance(
     State(app): State<AdminState>,
     session: Option<CurrentSession>,

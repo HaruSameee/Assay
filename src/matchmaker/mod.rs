@@ -26,6 +26,7 @@ pub use repository::{
 };
 pub use runner::{Matchmaker, MatchmakerConfig, MatchmakerConfigError};
 pub use select::{
-    Candidate, MATCH_SIZE, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch,
-    ProposedPlayer, ROLES, RoleWish, TEAM_SIZE, select_matches,
+    AllyBlocks, Candidate, MATCH_SIZE, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB,
+    ProposedMatch, ProposedPlayer, ROLES, RoleWish, TEAM_SIZE, select_matches,
+    select_matches_with_ally_blocks,
 };
