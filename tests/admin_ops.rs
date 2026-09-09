@@ -1166,9 +1166,13 @@ async fn a_reported_player_cannot_be_overwritten_by_staff(owner: PgPool) {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "上書きの試みが 409 で断られていない"
+    );
     assert!(after.contains("既に報告しています"), "{after}");
-    println!("報告済みの人への上書き: 拒否された");
+    println!("報告済みの人への上書き: 409 で拒否された");
 
     // **行は増えていない。**元の報告も書き換わっていない
     let rows: i64 = sqlx::query_scalar("select count(*) from match_reports")
@@ -1228,8 +1232,11 @@ async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
     );
     println!("係争中の試合の未報告者が入力欄に出るか: false");
 
-    // 画面には出ないが、**エンドポイント自体は塞いでいない**ので直接 POST は通る。
-    // 何が起きるかをここに記録する（裁定の経路は開幕後に決める）
+    // **エンドポイント自体も塞ぐ。**直接 POST しても 409 で断る
+    let before: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     let (status, after) = post_form(
         &app,
         player(ADMIN),
@@ -1241,7 +1248,38 @@ async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "係争中が 409 で断られていない"
+    );
+    assert!(after.contains("係争中です"), "{after}");
+    assert!(
+        after.contains("Discord の係争チャンネルで対応してください"),
+        "{after}"
+    );
+
+    // **match_reports の行は増えていない。**
+    let rows: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, before, "係争中なのに報告が積まれている");
+
+    // 断った事実は admin_actions に残る
+    let rejected: Vec<(Option<Uuid>, i64, Value)> = sqlx::query_as(
+        "select target_player_id, actor_discord_user_id, payload \n         from admin_actions where kind = 'report_rejected' order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    println!("=== admin_actions（report_rejected）");
+    for row in &rejected {
+        println!("  target={:?} actor={} payload={}", row.0, row.1, row.2);
+    }
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].0, Some(player(11).0));
+    assert_eq!(rejected[0].2["state"], "disputed");
 
     let state = state_of(&db, 1).await;
     let kinds: Vec<&str> = db
@@ -1259,20 +1297,12 @@ async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    let notice = if after.contains("結果が確定しました") {
-        "確定した"
-    } else if after.contains("まだ確定していません") {
-        "追記されたが未確定"
-    } else if after.contains("受け付けていません") {
-        "受け付けられなかった"
-    } else {
-        "その他"
-    };
-    println!("=== 係争中に運営が報告を入れた結果");
-    println!("画面の通知: {notice}");
-    println!("状態: {state:?}");
+    println!("=== 係争中に運営が報告を入れようとした結果");
+    println!("HTTP: 409 Conflict");
+    println!("状態: {state:?}（動いていない）");
     println!("イベント列: {kinds:?}");
-    println!("運営が入れた報告の行数: {staff}");
+    println!("match_reports の行数: {rows}（送信前と同じ）");
+    println!("運営が積めた報告の行数: {staff}");
 
     db.done().await;
 }
@@ -1375,6 +1405,137 @@ async fn a_disputed_match_leaves_the_entry_list_and_appears_read_only(owner: PgP
         votes.len()
     );
     assert_eq!(summary.active.awaiting_resolution, votes.len());
+
+    db.done().await;
+}
+
+/// **確定済み・無効試合・不成立も 409。**どれも `match_reports` に積まない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_settled_match_refuses_the_staff_report(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 10).await;
+    let app = db.router();
+
+    // 3 件を、確定 / 無効試合 / 不成立 にする
+    for (n, kind, outcome) in [
+        (1u128, K::Confirmed, "red"),
+        (2, K::Nullified, "nullified"),
+        (3, K::Voided, "voided"),
+    ] {
+        playable_formation(&db, n).await;
+        db.formations
+            .append_event(
+                fid(n),
+                &NewEvent::new(kind, None, at(20), format!("fin-{n}"))
+                    .with_payload(json!({ "outcome": outcome })),
+            )
+            .await
+            .unwrap();
+    }
+
+    let before: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(before, 0);
+
+    for (n, expected) in [
+        (1u128, "もう結果が出ています"),
+        (2, "もう結果が出ています"),
+        (3, "不成立で終わっています"),
+    ] {
+        let (status, after) = post_form(
+            &app,
+            player(ADMIN),
+            "/admin/reports",
+            &format!(
+                "formation={}&player={}&outcome=red&reason=直接POST&key=settled-{n}",
+                fid(n).0,
+                player(11).0,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "formation {n} が 409 でない");
+        assert!(after.contains(expected), "formation {n}: {after}");
+        println!("formation {n}: 409 / 「{expected}」");
+    }
+
+    // **1 行も積まれていない。**
+    let rows: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, before, "確定済みなのに報告が積まれている");
+    println!("match_reports の行数: {rows}（3 回断っても増えない）");
+
+    // 断った記録は 3 件残る
+    let rejected: Vec<(Option<Uuid>, Value)> = sqlx::query_as(
+        "select target_player_id, payload from admin_actions \
+         where kind = 'report_rejected' order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected.len(), 3);
+    let states: Vec<&str> = rejected
+        .iter()
+        .map(|row| row.1["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, vec!["confirmed", "nullified", "voided"]);
+    println!("admin_actions の report_rejected: {states:?}");
+    // 追記した側（report_entered）は 1 件も無い
+    let entered: i64 =
+        sqlx::query_scalar("select count(*) from admin_actions where kind = 'report_entered'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(entered, 0);
+
+    db.done().await;
+}
+
+/// **通常の入力（`in_progress`）が回帰していないこと。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_normal_entry_path_still_works(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 10).await;
+    playable_formation(&db, 1).await;
+    let app = db.router();
+
+    // 9 人が報告済み、1 人が未報告（in_progress のまま）
+    for who in 2..=10u128 {
+        player_report(&db, 1, who, "red").await;
+    }
+    assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed(&page, player(11)));
+
+    let (status, after) = enter_report(&app, &page, 1, player(11), "red").await;
+    assert_eq!(status, StatusCode::OK, "通常の入力が 200 で通らない");
+    assert!(after.contains("結果が確定しました"), "{after}");
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    let rows: i64 = sqlx::query_scalar("select count(*) from match_reports")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 10, "運営の報告が積まれていない");
+    let entered: i64 =
+        sqlx::query_scalar("select count(*) from admin_actions where kind = 'report_entered'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let rejected: i64 =
+        sqlx::query_scalar("select count(*) from admin_actions where kind = 'report_rejected'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((entered, rejected), (1, 0));
+    println!(
+        "通常の入力: HTTP 200 / match_reports {rows} 行 / report_entered {entered} 件 / report_rejected {rejected} 件"
+    );
 
     db.done().await;
 }

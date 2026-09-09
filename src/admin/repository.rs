@@ -806,8 +806,12 @@ pub enum StaffReportOutcome {
     },
     /// **その人は既に報告している。**運営でも上書きしない。
     AlreadyReported,
-    /// いまは報告を受け付けない状態（`voided` / `abandoned` など）。
-    NotAccepted,
+    /// **いまは報告を入れられない状態。**係争中・確定済み・まだ始まっていない、のいずれか。
+    /// 断ったことは `admin_actions` に `report_rejected` として残す。
+    Rejected {
+        /// そのときの状態（`disputed` / `confirmed` など）。画面の文言に使う。
+        state: String,
+    },
     /// その formation にそのプレイヤーが居ない。
     NotAParticipant,
 }
@@ -915,6 +919,43 @@ impl AdminRepository {
             return Ok(StaffReportOutcome::NotAParticipant);
         }
 
+        // **`in_progress` 以外は断る。**画面から入力欄を外しても直接 POST は届く。
+        //
+        // 係争中は報告が割れたことが原因なので、未報告者ぶんを足しても状態は動かない。
+        // 確定済み・無効試合・不成立も同じで、`evaluate_reports` が何もしないため
+        // 「受理したのに何も起きない」応答になる（マッチ画面の訂正を 409 にしたのと同じ理由）。
+        // **`match_reports` には 1 行も積まない。**断った事実だけを記録に残す。
+        let state = formations
+            .load_events(input.formation_id)
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => {
+                    AdminStoreError::Database(error)
+                }
+                other => AdminStoreError::Database(sqlx::Error::Protocol(other.to_string())),
+            })?
+            .snapshot()
+            .state;
+        if !matches!(state, crate::lifecycle::FormationState::InProgress { .. }) {
+            self.append_action(&NewAdminAction {
+                kind: AdminActionKind::ReportRejected,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: Some(input.player_id.0),
+                reason: input.reason.clone(),
+                payload: serde_json::json!({
+                    "formation_id": input.formation_id.0,
+                    "outcome": input.outcome.as_str(),
+                    "state": state.name(),
+                }),
+                occurred_at: input.occurred_at,
+                idempotency_key: format!("admin_report_rejected:{}", input.idempotency_key),
+            })
+            .await?;
+            return Ok(StaffReportOutcome::Rejected {
+                state: state.name().to_owned(),
+            });
+        }
+
         // **運営の報告だと分かる形で残す。**集計は従来どおり outcome だけを読むが、
         // 誰が入れたかは raw_result から後で数えられる
         let raw_result = serde_json::json!({
@@ -935,8 +976,11 @@ impl AdminRepository {
             Ok(Some(id)) => id,
             // **既に報告している人は上書きしない。**
             Ok(None) => return Ok(StaffReportOutcome::AlreadyReported),
+            // 上でロック外に読んだ状態と食い違った（競合）。ここも積まずに断る
             Err(crate::persistence::RepositoryError::ReportsNotAccepted { .. }) => {
-                return Ok(StaffReportOutcome::NotAccepted);
+                return Ok(StaffReportOutcome::Rejected {
+                    state: state.name().to_owned(),
+                });
             }
             Err(crate::persistence::RepositoryError::Database(error)) => {
                 return Err(AdminStoreError::Database(error));

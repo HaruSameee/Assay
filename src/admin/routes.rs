@@ -945,28 +945,58 @@ async fn enter_report(
         occurred_at: now,
         idempotency_key: form.key.clone(),
     };
-    let notice = match app.store.enter_report(&input).await {
-        Ok(StaffReportOutcome::Entered { settled: true }) => info(
-            "報告を追記しました。この報告で試合の結果が確定しました。".to_owned(),
+    // **断ったときは 409 を返す。**マッチ画面の訂正を 409 にしたのと同じ方針で、
+    // 「受理したのに何も起きない」応答を返さない
+    let (status, notice) = match app.store.enter_report(&input).await {
+        Ok(StaffReportOutcome::Entered { settled: true }) => (
+            StatusCode::OK,
+            info("報告を追記しました。この報告で試合の結果が確定しました。".to_owned()),
         ),
-        Ok(StaffReportOutcome::Entered { settled: false }) => info(
-            "報告を追記しました。まだ確定していません（全員の報告か、受付時間の経過を待ちます）。"
-                .to_owned(),
+        Ok(StaffReportOutcome::Entered { settled: false }) => (
+            StatusCode::OK,
+            info(
+                "報告を追記しました。まだ確定していません（全員の報告か、受付時間の経過を待ちます）。"
+                    .to_owned(),
+            ),
         ),
-        Ok(StaffReportOutcome::AlreadyReported) => fail(
-            "その人は既に報告しています。運営が上書きすることはできません（係争のフローで裁定してください）。"
-                .to_owned(),
+        Ok(StaffReportOutcome::AlreadyReported) => (
+            StatusCode::CONFLICT,
+            fail(
+                "その人は既に報告しています。運営が上書きすることはできません（係争のフローで裁定してください）。"
+                    .to_owned(),
+            ),
         ),
-        Ok(StaffReportOutcome::NotAccepted) => {
-            fail("この試合はもう報告を受け付けていません。".to_owned())
+        Ok(StaffReportOutcome::Rejected { state }) => {
+            (StatusCode::CONFLICT, fail(rejection_message(&state)))
         }
-        Ok(StaffReportOutcome::NotAParticipant) => {
-            fail("その人はこの試合の参加者ではありません。".to_owned())
-        }
+        Ok(StaffReportOutcome::NotAParticipant) => (
+            StatusCode::CONFLICT,
+            fail("その人はこの試合の参加者ではありません。".to_owned()),
+        ),
         Err(err) => {
             error!(%err, "could not enter the staff report");
             return internal_error();
         }
     };
-    render_reports(&app, Some(notice)).await
+    let page = render_reports(&app, Some(notice)).await;
+    if status == StatusCode::OK {
+        return page;
+    }
+    (status, page).into_response()
+}
+
+/// 断った理由の説明。**状態ごとに、次に何をすればよいかまで書く。**
+fn rejection_message(state: &str) -> String {
+    match state {
+        "disputed" => "この試合は係争中です。Discord の係争チャンネルで対応してください\
+                       （ここから報告を入れても状態は動きません）。"
+            .to_owned(),
+        "confirmed" | "nullified" => {
+            "この試合はもう結果が出ています。運営が報告を足しても結果は変わりません。".to_owned()
+        }
+        "voided" | "abandoned" => {
+            "この試合は不成立で終わっています。報告は受け付けません。".to_owned()
+        }
+        _ => "この試合はまだ報告を受け付けられる段階にありません。".to_owned(),
+    }
 }
