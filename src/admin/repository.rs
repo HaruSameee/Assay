@@ -17,6 +17,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::lifecycle::{FormationId, PlayerId};
+use crate::persistence::Outcome;
 use crate::queue::model::clamp_down_range;
 use crate::rating::DEFAULT_DISPLAY_MU;
 
@@ -764,5 +766,354 @@ impl AdminRepository {
         .await?;
         tx.commit().await?;
         Ok(SeasonOutcome::Started { id })
+    }
+}
+
+// ----------------------------------------------------------------------
+// 運営による報告の入力
+// ----------------------------------------------------------------------
+//
+// **プレイヤーの報告を UPDATE しない。**運営の報告も 1 行の追記で、確定判定は
+// 従来どおり「各プレイヤーの最新報告」を読む。対象は未報告の人だけで、
+// 既に報告している人の内容は運営でも書き換えられない（裁定は disputed のフロー）。
+
+/// 運営が入れる報告 1 件。
+#[derive(Debug, Clone)]
+pub struct NewStaffReport {
+    /// 対象の formation。
+    pub formation_id: FormationId,
+    /// 対象のプレイヤー。**未報告の人に限る。**
+    pub player_id: PlayerId,
+    /// 入れる結果（`red` / `blue` / `nullified`）。
+    pub outcome: Outcome,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 理由（Discord 上の裁定の要約など）。空なら記録しない。
+    pub reason: Option<String>,
+    /// 入力時刻。
+    pub occurred_at: DateTime<Utc>,
+    /// 冪等キー。同一キーのみ no-op。
+    pub idempotency_key: String,
+}
+
+/// 運営の報告を入れた結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaffReportOutcome {
+    /// 追記した。
+    Entered {
+        /// 追記後に確定したか（`confirmed` / `nullified` / `disputed` が積まれたか）。
+        settled: bool,
+    },
+    /// **その人は既に報告している。**運営でも上書きしない。
+    AlreadyReported,
+    /// **いまは報告を入れられない状態。**係争中・確定済み・まだ始まっていない、のいずれか。
+    /// 断ったことは `admin_actions` に `report_rejected` として残す。
+    Rejected {
+        /// そのときの状態（`disputed` / `confirmed` など）。画面の文言に使う。
+        state: String,
+    },
+    /// その formation にそのプレイヤーが居ない。
+    NotAParticipant,
+}
+
+/// 未報告のプレイヤー 1 人。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreportedPlayer {
+    pub player_id: Uuid,
+    pub trainer_name: Option<String>,
+    pub team: String,
+}
+
+/// 報告待ちの formation 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingReports {
+    pub formation_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    /// 状態の名前（`in_progress` / `disputed`）。
+    pub state: String,
+    /// まだ報告していない人。
+    pub unreported: Vec<UnreportedPlayer>,
+}
+
+impl AdminRepository {
+    /// 報告待ちの formation と、その未報告者。
+    ///
+    /// 進行中の判定は `list_unfinished`（イベント列を Rust の状態機械で畳む）を使う。
+    /// 状態列は無いので、最終イベントの種別だけを見て取り違えることがない。
+    pub async fn formations_awaiting_reports(&self) -> Result<Vec<AwaitingReports>, sqlx::Error> {
+        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => error,
+                other => sqlx::Error::Protocol(other.to_string()),
+            })?;
+
+        let mut awaiting = Vec::new();
+        for formation in &unfinished {
+            // **係争中は出さない。**この一覧は「未報告が原因で確定しない試合」を
+            // 押し進めるためのもので、disputed は報告が割れたことが原因。未報告者ぶんを
+            // 足しても状態は動かないので、載っていること自体が
+            // 「ここから解決できる」という誤解になる（係争は下の一覧で見る）
+            if !formation.snapshot.state.requires_reports()
+                || formation.snapshot.state == crate::lifecycle::FormationState::Disputed
+            {
+                continue;
+            }
+            let rows = sqlx::query!(
+                "select fp.player_id, fp.team, p.trainer_name \
+                 from formation_players fp \
+                 join players p on p.id = fp.player_id \
+                 where fp.formation_id = $1 \
+                   and not exists ( \
+                       select 1 from match_reports mr \
+                       where mr.formation_id = fp.formation_id and mr.player_id = fp.player_id \
+                   ) \
+                 order by fp.team, fp.player_id",
+                formation.log.formation_id.0,
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                continue;
+            }
+            awaiting.push(AwaitingReports {
+                formation_id: formation.log.formation_id.0,
+                created_at: formation.log.created_at,
+                state: formation.snapshot.state.name().to_owned(),
+                unreported: rows
+                    .into_iter()
+                    .map(|row| UnreportedPlayer {
+                        player_id: row.player_id,
+                        trainer_name: row.trainer_name,
+                        team: row.team,
+                    })
+                    .collect(),
+            });
+        }
+        awaiting.sort_by_key(|entry| entry.created_at);
+        Ok(awaiting)
+    }
+
+    /// 運営の報告を 1 件追記する。**未報告の人に限る。**
+    ///
+    /// 追記したあとは通常の経路と同じ `evaluate_reports` を呼ぶので、確定条件も
+    /// レートの導出も変わらない（`unanimous && (all_reported || report_window_elapsed)`）。
+    pub async fn enter_report(
+        &self,
+        input: &NewStaffReport,
+    ) -> Result<StaffReportOutcome, AdminStoreError> {
+        let formations = crate::persistence::FormationRepository::new(self.pool.clone());
+
+        // 参加者でなければ複合 FK で弾かれるが、理由を返せる形で先に見る
+        let participates = sqlx::query_scalar!(
+            "select exists( \
+                 select 1 from formation_players where formation_id = $1 and player_id = $2 \
+             ) as \"found!\"",
+            input.formation_id.0,
+            input.player_id.0,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !participates {
+            return Ok(StaffReportOutcome::NotAParticipant);
+        }
+
+        // **`in_progress` 以外は断る。**画面から入力欄を外しても直接 POST は届く。
+        //
+        // 係争中は報告が割れたことが原因なので、未報告者ぶんを足しても状態は動かない。
+        // 確定済み・無効試合・不成立も同じで、`evaluate_reports` が何もしないため
+        // 「受理したのに何も起きない」応答になる（マッチ画面の訂正を 409 にしたのと同じ理由）。
+        // **`match_reports` には 1 行も積まない。**断った事実だけを記録に残す。
+        let state = formations
+            .load_events(input.formation_id)
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => {
+                    AdminStoreError::Database(error)
+                }
+                other => AdminStoreError::Database(sqlx::Error::Protocol(other.to_string())),
+            })?
+            .snapshot()
+            .state;
+        if !matches!(state, crate::lifecycle::FormationState::InProgress { .. }) {
+            self.append_action(&NewAdminAction {
+                kind: AdminActionKind::ReportRejected,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: Some(input.player_id.0),
+                reason: input.reason.clone(),
+                payload: serde_json::json!({
+                    "formation_id": input.formation_id.0,
+                    "outcome": input.outcome.as_str(),
+                    "state": state.name(),
+                }),
+                occurred_at: input.occurred_at,
+                idempotency_key: format!("admin_report_rejected:{}", input.idempotency_key),
+            })
+            .await?;
+            return Ok(StaffReportOutcome::Rejected {
+                state: state.name().to_owned(),
+            });
+        }
+
+        // **運営の報告だと分かる形で残す。**集計は従来どおり outcome だけを読むが、
+        // 誰が入れたかは raw_result から後で数えられる
+        let raw_result = serde_json::json!({
+            "source": "staff",
+            "actor_discord_user_id": input.actor_discord_user_id,
+            "reason": input.reason,
+        });
+        let report = crate::persistence::NewReport {
+            formation_id: input.formation_id,
+            player_id: input.player_id,
+            reported_at: input.occurred_at,
+            outcome: input.outcome,
+            raw_result,
+            idempotency_key: input.idempotency_key.clone(),
+            supersedes_id: None,
+        };
+        let inserted = match formations.append_report_if_absent(&report).await {
+            Ok(Some(id)) => id,
+            // **既に報告している人は上書きしない。**
+            Ok(None) => return Ok(StaffReportOutcome::AlreadyReported),
+            // 上でロック外に読んだ状態と食い違った（競合）。ここも積まずに断る
+            Err(crate::persistence::RepositoryError::ReportsNotAccepted { .. }) => {
+                return Ok(StaffReportOutcome::Rejected {
+                    state: state.name().to_owned(),
+                });
+            }
+            Err(crate::persistence::RepositoryError::Database(error)) => {
+                return Err(AdminStoreError::Database(error));
+            }
+            Err(other) => {
+                return Err(AdminStoreError::Database(sqlx::Error::Protocol(
+                    other.to_string(),
+                )));
+            }
+        };
+
+        // 通常の経路と同じ判定。確定条件は変えない
+        let evaluation = formations
+            .evaluate_reports(
+                input.formation_id,
+                false,
+                input.occurred_at,
+                format!("report_evaluation:staff:{}", input.idempotency_key),
+            )
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => {
+                    AdminStoreError::Database(error)
+                }
+                other => AdminStoreError::Database(sqlx::Error::Protocol(other.to_string())),
+            })?;
+
+        self.append_action(&NewAdminAction {
+            kind: AdminActionKind::ReportEntered,
+            actor_discord_user_id: input.actor_discord_user_id,
+            target_player_id: Some(input.player_id.0),
+            reason: input.reason.clone(),
+            payload: serde_json::json!({
+                "formation_id": input.formation_id.0,
+                "outcome": input.outcome.as_str(),
+                "report_id": inserted.0,
+            }),
+            occurred_at: input.occurred_at,
+            idempotency_key: format!("admin_report:{}", input.idempotency_key),
+        })
+        .await?;
+
+        Ok(StaffReportOutcome::Entered {
+            settled: evaluation.event.is_some(),
+        })
+    }
+}
+
+// ----------------------------------------------------------------------
+// 係争中の試合（閲覧のみ）
+// ----------------------------------------------------------------------
+//
+// **ここに報告を入力する経路は作らない。**未報告者の一覧から係争中を外したので、
+// そのままだと運営の視界から消える。Discord 上で裁定するための材料として、
+// 誰が何を報告したかを読めるようにするだけ。
+
+/// 係争中の試合における 1 人ぶんの報告。**最新の 1 件だけ**（訂正は反映済み）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisputedVote {
+    pub player_id: Uuid,
+    pub trainer_name: Option<String>,
+    pub team: String,
+    /// `red` / `blue` / `nullified`。まだ報告していなければ `None`。
+    pub outcome: Option<String>,
+    /// 運営が入れた報告なら true（`raw_result->>'source' = 'staff'`）。
+    pub from_staff: bool,
+}
+
+/// 係争中の試合 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisputedFormation {
+    pub formation_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    /// 参加者 10 人の最新報告（未報告も含む）。
+    pub votes: Vec<DisputedVote>,
+}
+
+impl AdminRepository {
+    /// 係争中（`disputed`）の試合と、その報告の内訳。**閲覧専用。**
+    ///
+    /// 件数は 15 分サマリの「係争対応待ち」と同じ判定
+    /// （`list_unfinished` を畳んで `Disputed` を数える）から来る。
+    pub async fn disputed_formations(&self) -> Result<Vec<DisputedFormation>, sqlx::Error> {
+        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => error,
+                other => sqlx::Error::Protocol(other.to_string()),
+            })?;
+
+        let mut disputed = Vec::new();
+        for formation in &unfinished {
+            if formation.snapshot.state != crate::lifecycle::FormationState::Disputed {
+                continue;
+            }
+            // 各プレイヤーの**最新**報告だけ（訂正で打ち消された行は出さない）。
+            // 判定に使うのと同じ「打ち消されていない行」の条件を使う
+            let rows = sqlx::query!(
+                "select fp.player_id, fp.team, p.trainer_name, \
+                        mr.outcome as \"outcome?\", \
+                        (mr.raw_result->>'source' = 'staff') as \"from_staff?\" \
+                 from formation_players fp \
+                 join players p on p.id = fp.player_id \
+                 left join match_reports mr \
+                   on mr.formation_id = fp.formation_id \
+                  and mr.player_id = fp.player_id \
+                  and not exists ( \
+                      select 1 from match_reports correction \
+                      where correction.supersedes_id = mr.id \
+                  ) \
+                 where fp.formation_id = $1 \
+                 order by fp.team, fp.player_id",
+                formation.log.formation_id.0,
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            disputed.push(DisputedFormation {
+                formation_id: formation.log.formation_id.0,
+                created_at: formation.log.created_at,
+                votes: rows
+                    .into_iter()
+                    .map(|row| DisputedVote {
+                        player_id: row.player_id,
+                        trainer_name: row.trainer_name,
+                        team: row.team,
+                        outcome: row.outcome,
+                        from_staff: row.from_staff.unwrap_or(false),
+                    })
+                    .collect(),
+            });
+        }
+        disputed.sort_by_key(|entry| entry.created_at);
+        Ok(disputed)
     }
 }

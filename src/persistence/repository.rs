@@ -475,6 +475,34 @@ impl FormationRepository {
         Ok(inserted)
     }
 
+    /// **まだ 1 件も報告していないプレイヤーのときだけ**追記する。
+    ///
+    /// 運営が未報告の人の代わりに入れる経路で使う。既に報告している人の内容を
+    /// 上書きする経路にはしない（裁定は disputed のフローで行う）。
+    ///
+    /// 判定と追記を**同じロックの中**で行う。分けると、確認した直後に本人が報告して
+    /// `supersedes_id` が `None` のまま 2 行目が入り、**同じ人の最新報告が 2 つ**になる
+    /// （確定判定がそのプレイヤーを二重に数える）。
+    ///
+    /// 既に報告があれば `Ok(None)`、追記したら `Ok(Some(id))`。
+    pub async fn append_report_if_absent(
+        &self,
+        report: &NewReport,
+    ) -> Result<Option<ReportId>, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let log = lock_and_load(&mut tx, report.formation_id).await?;
+        if latest_report_id(&mut tx, report.formation_id, report.player_id)
+            .await?
+            .is_some()
+        {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let inserted = append_report_locked(&mut tx, &log, report, false).await?;
+        tx.commit().await?;
+        Ok(Some(inserted.report_id))
+    }
+
     /// 最新報告で確定判定し、必要なら同じ formation ロック下で終端イベントを追記する。
     /// 最初の報告は一致率指標にだけ使い、判定には混ぜない。
     pub(crate) async fn evaluate_reports(

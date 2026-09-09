@@ -27,7 +27,8 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::blocks::{AdminBlockOverrideError, BlockRepository};
-use crate::lifecycle::PlayerId;
+use crate::lifecycle::{FormationId, PlayerId};
+use crate::persistence::{Outcome, Team};
 use crate::registration::html::error_page;
 use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
@@ -36,12 +37,12 @@ use super::actions::{
 };
 use super::config::AdminIds;
 use super::html::{
-    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, SearchView, SeasonView, player_page,
-    queue_page, search_page, season_page,
+    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, ReportsView, SearchView, SeasonView,
+    player_page, queue_page, reports_page, search_page, season_page,
 };
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewSeasonBoundary, RemovalOutcome,
+    NewSeasonBoundary, NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::season::{
     MAX_SEASON_LABEL_LENGTH, SeasonOutcome, confirmation_matches, normalize_label,
@@ -107,6 +108,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/blocks", post(set_block_allowance))
         .route("/admin/blocks/override", post(override_block))
         // シーズン境界（導出の起点）。2 段階の確認。実行は POST /admin/season
+        .route("/admin/reports", get(show_reports).post(enter_report))
         .route("/admin/season", get(show_season).post(start_season))
         .route("/admin/season/confirm", post(confirm_season))
         .with_state(state)
@@ -961,4 +963,150 @@ async fn start_season(
         }
     };
     render_season(&app, None, Some(notice)).await
+}
+
+// ----------------------------------------------------------------------
+// 運営による報告の入力
+// ----------------------------------------------------------------------
+//
+// **プレイヤーの報告を UPDATE しない。**運営の報告も 1 行の追記で、確定判定は
+// 従来どおり各プレイヤーの最新報告を読む。対象は未報告の人だけ。
+
+/// 報告の入力画面を描く。一覧は毎回引き直す（保存しない）。
+async fn render_reports(app: &AdminState, notice: Option<Notice>) -> Response {
+    let awaiting = match app.store.formations_awaiting_reports().await {
+        Ok(awaiting) => awaiting,
+        Err(err) => {
+            error!(%err, "could not list the formations awaiting reports");
+            return internal_error();
+        }
+    };
+    let disputed = match app.store.disputed_formations().await {
+        Ok(disputed) => disputed,
+        Err(err) => {
+            error!(%err, "could not list the disputed formations");
+            return internal_error();
+        }
+    };
+    Html(reports_page(&ReportsView {
+        awaiting: &awaiting,
+        form_key: &form_key(),
+        disputed: &disputed,
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_reports(State(app): State<AdminState>, session: Option<CurrentSession>) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_reports(&app, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct EnterReportForm {
+    #[serde(default)]
+    formation: String,
+    #[serde(default)]
+    player: String,
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn enter_report(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<EnterReportForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let (Ok(formation), Ok(player)) = (
+        Uuid::parse_str(form.formation.trim()),
+        Uuid::parse_str(form.player.trim()),
+    ) else {
+        return render_reports(&app, Some(fail("対象が不正です。".to_owned()))).await;
+    };
+    // **`draw` は受け付けない**（マッチ画面の3択と揃える。無効試合に寄せる）
+    let outcome = match form.outcome.trim() {
+        "red" => Outcome::Win(Team::Red),
+        "blue" => Outcome::Win(Team::Blue),
+        "nullified" => Outcome::Nullified,
+        _ => {
+            let notice =
+                fail("赤の勝ち / 青の勝ち / 無効試合 のいずれかを選んでください。".to_owned());
+            return render_reports(&app, Some(notice)).await;
+        }
+    };
+
+    let now = Utc::now();
+    let input = NewStaffReport {
+        formation_id: FormationId(formation),
+        player_id: PlayerId(player),
+        outcome,
+        actor_discord_user_id: actor.discord_user_id,
+        reason: normalize_reason(&form.reason),
+        occurred_at: now,
+        idempotency_key: form.key.clone(),
+    };
+    // **断ったときは 409 を返す。**マッチ画面の訂正を 409 にしたのと同じ方針で、
+    // 「受理したのに何も起きない」応答を返さない
+    let (status, notice) = match app.store.enter_report(&input).await {
+        Ok(StaffReportOutcome::Entered { settled: true }) => (
+            StatusCode::OK,
+            info("報告を追記しました。この報告で試合の結果が確定しました。".to_owned()),
+        ),
+        Ok(StaffReportOutcome::Entered { settled: false }) => (
+            StatusCode::OK,
+            info(
+                "報告を追記しました。まだ確定していません（全員の報告か、受付時間の経過を待ちます）。"
+                    .to_owned(),
+            ),
+        ),
+        Ok(StaffReportOutcome::AlreadyReported) => (
+            StatusCode::CONFLICT,
+            fail(
+                "その人は既に報告しています。運営が上書きすることはできません（係争のフローで裁定してください）。"
+                    .to_owned(),
+            ),
+        ),
+        Ok(StaffReportOutcome::Rejected { state }) => {
+            (StatusCode::CONFLICT, fail(rejection_message(&state)))
+        }
+        Ok(StaffReportOutcome::NotAParticipant) => (
+            StatusCode::CONFLICT,
+            fail("その人はこの試合の参加者ではありません。".to_owned()),
+        ),
+        Err(err) => {
+            error!(%err, "could not enter the staff report");
+            return internal_error();
+        }
+    };
+    let page = render_reports(&app, Some(notice)).await;
+    if status == StatusCode::OK {
+        return page;
+    }
+    (status, page).into_response()
+}
+
+/// 断った理由の説明。**状態ごとに、次に何をすればよいかまで書く。**
+fn rejection_message(state: &str) -> String {
+    match state {
+        "disputed" => "この試合は係争中です。Discord の係争チャンネルで対応してください\
+                       （ここから報告を入れても状態は動きません）。"
+            .to_owned(),
+        "confirmed" | "nullified" => {
+            "この試合はもう結果が出ています。運営が報告を足しても結果は変わりません。".to_owned()
+        }
+        "voided" | "abandoned" => {
+            "この試合は不成立で終わっています。報告は受け付けません。".to_owned()
+        }
+        _ => "この試合はまだ報告を受け付けられる段階にありません。".to_owned(),
+    }
 }
