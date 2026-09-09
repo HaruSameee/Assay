@@ -1050,16 +1050,16 @@ mod tests {
     fn received_block_counts_are_rendered_in_the_repository_order() {
         let received_blocks = vec![
             ReceivedBlockCount {
-                player_id: Uuid::from_u128(9),
-                display_name: Some("少ない方".to_owned()),
-                trainer_name: None,
-                count: 1,
-            },
-            ReceivedBlockCount {
                 player_id: Uuid::from_u128(8),
                 display_name: Some("多い方".to_owned()),
                 trainer_name: None,
                 count: 3,
+            },
+            ReceivedBlockCount {
+                player_id: Uuid::from_u128(9),
+                display_name: Some("少ない方".to_owned()),
+                trainer_name: None,
+                count: 1,
             },
         ];
         let rendered = search_page(&SearchView {
