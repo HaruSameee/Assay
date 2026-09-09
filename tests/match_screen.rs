@@ -843,7 +843,7 @@ async fn split_reports_do_not_confirm_and_never_show_the_breakdown(owner: PgPool
     for reporter in 6..=10u128 {
         assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
     }
-    // 全員が出していても一致していないので、期限まで待つ。多数決で決めない
+    // 全員が出していても、どちらの結果も早期確定の閾値（7人）に届かないので期限まで待つ
     assert!(
         matches!(state_of(&db, 1).await, S::InProgress { .. }),
         "{:?}",
@@ -954,6 +954,10 @@ async fn a_correction_moves_the_confirmation_but_not_the_agreement_metric(owner:
 ///
 /// 00 §5「報告ゲートの解除条件を『確定』にしない」。ここで入口を閉じると、
 /// 未報告のままキューのゲートが開かなくなる。
+///
+/// **早期確定（閾値 7 人）を入れてから、これは例外ではなく通常になった。**
+/// 7 人で確定した時点で 3 人が未報告のまま残るので、その 3 人の入口を閉じると
+/// 毎試合 3 人がキューへ戻れなくなる。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
@@ -963,23 +967,128 @@ async fn an_unreported_player_can_still_report_after_confirmation(owner: PgPool)
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    for reporter in 1..=9u128 {
+    // 6 人では閾値に届かない
+    for reporter in 1..=6u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
-    // 10 人目が未報告のまま、期限まで待たずには確定しない
     assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
-    assert_eq!(report(&app, 1, 10, "red").await, StatusCode::OK);
+
+    // 7 人目で確定する（残り 3 人を待たない）
+    assert_eq!(report(&app, 1, 7, "red").await, StatusCode::OK);
     assert_eq!(state_of(&db, 1).await, S::Confirmed);
 
-    // 別の formation で「確定後に未報告の人が報告する」経路を見る
-    formation_at(&db, 2, Stage::InProgress).await;
-    for reporter in 1..=10u128 {
-        assert_eq!(report(&app, 2, reporter, "blue").await, StatusCode::OK);
+    // **残り 3 人は確定後も報告できる。**受理はするが確定は動かさない
+    for reporter in 8..=10u128 {
+        assert_eq!(
+            report(&app, 1, reporter, "blue").await,
+            StatusCode::OK,
+            "未報告の {reporter} 人目が報告できない"
+        );
+        assert_eq!(state_of(&db, 1).await, S::Confirmed, "確定が覆っている");
     }
-    assert_eq!(state_of(&db, 2).await, S::Confirmed);
-    let (_, view) = get_json(&app, 2, player(1)).await;
+    let (_, view) = get_json(&app, 1, player(10)).await;
     assert_eq!(view["i_reported"], json!(true));
     assert_eq!(view["actions"]["report"], json!(false), "もう出さない");
+    db.done().await;
+}
+
+/// **早期確定でも、多数派と違う報告をした人のレートは確定結果どおりに動く。**
+///
+/// レート導出（`player_match_rating_deltas`）は `formation_players` と確定イベントの
+/// `outcome` だけを見ており、`match_reports` を参照していない。つまり
+/// 「自分が何を報告したか」は増減に影響しない——所属チームと確定結果だけで決まる。
+///
+/// 早期確定を入れると少数派が毎試合出るので、そこを固定しておく。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_dissenting_report_still_moves_that_players_rating(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    // 少数派を先に出す。player 1 は red チーム、player 6 は blue チーム
+    assert_eq!(report(&app, 1, 1, "nullified").await, StatusCode::OK);
+    assert_eq!(report(&app, 1, 6, "nullified").await, StatusCode::OK);
+    assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
+
+    // 残りのうち 7 人が red で一致 → 早期確定
+    for reporter in [2u128, 3, 4, 5, 7, 8, 9] {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "7 人で確定していない");
+
+    // **少数派も、所属チームと確定結果どおりに動く。**
+    let red_dissenter = rating_delta(&db, 1, player(1)).await;
+    let blue_dissenter = rating_delta(&db, 1, player(6)).await;
+    assert_eq!(
+        red_dissenter,
+        Some(7.0),
+        "red の少数派が勝ち分を受け取れない"
+    );
+    assert_eq!(
+        blue_dissenter,
+        Some(-7.0),
+        "blue の少数派が負け分を負っていない"
+    );
+
+    // 多数派と同じ額。報告内容で差はつかない
+    assert_eq!(rating_delta(&db, 1, player(2)).await, Some(7.0));
+    assert_eq!(rating_delta(&db, 1, player(7)).await, Some(-7.0));
+    // 未報告のまま残った 10 人目も動く（レートは報告の有無で決まらない）
+    assert_eq!(rating_delta(&db, 1, player(10)).await, Some(-7.0));
+
+    println!(
+        "少数派(red,無効試合と報告): {red_dissenter:?} / 少数派(blue,同): {blue_dissenter:?} / 未報告(blue): {:?}",
+        rating_delta(&db, 1, player(10)).await
+    );
+    db.done().await;
+}
+
+/// **7 人で確定した後、既に報告した人の訂正は 409 で断る。**
+///
+/// 確定は追記された事実であり、後から引き直さない（docs/02 §4）。
+/// 「7 人で確定 → 残り 3 人が違う結果 → 6 対 4 だった」という記録はそのまま残す。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_correction_after_an_early_confirmation_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+
+    for reporter in 1..=7u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "7 人で確定していない");
+
+    // 報告済みの人が引き直そうとしても 409。行は消さない
+    let before = report_rows(&db, 1, player(1)).await;
+    let (status, payload) = post(&app, 1, player(1), "/report", json!({ "outcome": "blue" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+    assert_eq!(payload["error"], json!("already_settled"), "{payload}");
+    assert_eq!(
+        report_rows(&db, 1, player(1)).await,
+        before,
+        "行が増えている"
+    );
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    // 残り 3 人が逆の結果を出しても確定は動かない（6 対 4 の記録が残るだけ）
+    for reporter in 8..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "確定が覆っている");
+    assert_eq!(
+        kinds(&db, 1)
+            .await
+            .iter()
+            .filter(|k| **k == K::Confirmed)
+            .count(),
+        1
+    );
     db.done().await;
 }
 
@@ -1129,6 +1238,19 @@ async fn a_correction_is_still_accepted_while_disputed(owner: PgPool) {
 }
 
 /// あるプレイヤーの `match_reports` の行数。
+/// レート導出ビューが出す 1 試合ぶんの増減。確定していなければ行が無い。
+async fn rating_delta(db: &AppDb, n: u128, who: PlayerId) -> Option<f64> {
+    sqlx::query_scalar(
+        "select delta from player_match_rating_deltas \
+         where formation_id = $1 and player_id = $2",
+    )
+    .bind(fid(n).0)
+    .bind(who.0)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap()
+}
+
 async fn report_rows(db: &AppDb, n: u128, who: PlayerId) -> i64 {
     sqlx::query_scalar!(
         "select count(*) as \"count!\" from match_reports \

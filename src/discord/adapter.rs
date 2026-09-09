@@ -446,6 +446,7 @@ impl Adapter {
                     .evaluate_reports(
                         id,
                         true,
+                        self.lifecycle.report_majority_threshold,
                         now,
                         format!("report_evaluation:{}", deadline_at.timestamp_micros()),
                     )

@@ -410,6 +410,7 @@ async fn submit_report(
         .evaluate_reports(
             formation,
             false,
+            app.lifecycle.report_majority_threshold,
             now,
             format!("report_evaluation:all:web:{}", now.timestamp_micros()),
         )

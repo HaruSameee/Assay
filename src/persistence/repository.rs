@@ -16,7 +16,9 @@ use super::model::{
     NewFormation, NewReport, Outcome, ReportDecision, ReportEvaluation, ReportEvidence, ReportId,
     ReportVote, RosterEntry, Team, UnfinishedFormation, VcAssignment,
 };
-use super::reporting::{confirmation_from_latest_reports, first_report_agreement_counts};
+use super::reporting::{
+    BASIS_WINDOW_ELAPSED, confirmation_from_latest_reports, first_report_agreement_counts,
+};
 
 /// 終端状態を作る種別。[`FormationRepository::list_unfinished`] の SQL 側の絞り込みに使う。
 const TERMINAL_KINDS: [FormationEventKind; 4] = [
@@ -509,6 +511,7 @@ impl FormationRepository {
         &self,
         formation_id: FormationId,
         report_window_elapsed: bool,
+        majority_threshold: usize,
         occurred_at: Timestamp,
         idempotency_key: String,
     ) -> Result<ReportEvaluation, RepositoryError> {
@@ -523,14 +526,18 @@ impl FormationRepository {
                 event: None,
             });
         }
-        let decision = confirmation_from_latest_reports(&evidence, report_window_elapsed);
+        let confirmation =
+            confirmation_from_latest_reports(&evidence, report_window_elapsed, majority_threshold);
+        let decision = confirmation.decision;
+        // 根拠は判定側が決める（早期確定は `majority_threshold`）。ここで組み立て直さない
+        let basis = confirmation.basis.unwrap_or(BASIS_WINDOW_ELAPSED);
         let event = match decision {
             ReportDecision::Pending => None,
             ReportDecision::Confirmed(outcome) => {
                 let (matching, total) = first_report_agreement_counts(&evidence, outcome);
                 let payload = serde_json::json!({
                     FINAL_OUTCOME_KEY: outcome.as_str(),
-                    DECISION_BASIS_KEY: if report_window_elapsed { "report_window_elapsed" } else { "all_players_reported" },
+                    DECISION_BASIS_KEY: basis,
                     AGREEMENT_MATCHING_KEY: matching,
                     AGREEMENT_TOTAL_KEY: total,
                 });
@@ -548,7 +555,7 @@ impl FormationRepository {
                     first_report_agreement_counts(&evidence, Outcome::Nullified);
                 let payload = serde_json::json!({
                     FINAL_OUTCOME_KEY: Outcome::Nullified.as_str(),
-                    DECISION_BASIS_KEY: if report_window_elapsed { "report_window_elapsed" } else { "all_players_reported" },
+                    DECISION_BASIS_KEY: basis,
                     AGREEMENT_MATCHING_KEY: matching,
                     AGREEMENT_TOTAL_KEY: total,
                 });

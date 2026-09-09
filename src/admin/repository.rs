@@ -121,11 +121,22 @@ macro_rules! adjustment_row {
 #[derive(Debug, Clone)]
 pub struct AdminRepository {
     pool: PgPool,
+    /// 運営の報告入力も通常の経路と同じ判定にかける。**確定条件は共有する。**
+    report_majority_threshold: usize,
 }
 
 impl AdminRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            report_majority_threshold: crate::lifecycle::DEFAULT_REPORT_MAJORITY_THRESHOLD,
+        }
+    }
+
+    /// 早期確定の閾値を設定値に合わせる。運営の入力だけ別の閾値で判定されないようにする。
+    pub fn with_majority_threshold(mut self, threshold: usize) -> Self {
+        self.report_majority_threshold = threshold;
+        self
     }
 
     /// セッションのプレイヤーの Discord ID。ルート照合（管理者リストとの突合）に使う。
@@ -997,6 +1008,7 @@ impl AdminRepository {
             .evaluate_reports(
                 input.formation_id,
                 false,
+                self.report_majority_threshold,
                 input.occurred_at,
                 format!("report_evaluation:staff:{}", input.idempotency_key),
             )
