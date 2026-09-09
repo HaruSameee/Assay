@@ -1149,7 +1149,7 @@ async fn the_queue_page_carries_the_shared_header(owner: PgPool) {
     );
     assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
     assert!(page.contains("action=\"/auth/logout\""), "{page}");
-    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!page.contains("admin"), "{page}");
 
     // 別人だけが管理者: 出さない
     let others = router(
@@ -1157,22 +1157,20 @@ async fn the_queue_page_carries_the_shared_header(owner: PgPool) {
             .with_admins(parse_admin_ids(Some("900000000000000001")).unwrap()),
     );
     let (_, page) = get_queue_html(&others, me, "/queue").await;
-    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!page.contains("admin"), "{page}");
 
-    // **本人が管理者でもヘッダーは変わらない。**
-    // リンクの有無がそのまま「この人は管理者か」の判別材料になる
     let mine = router(
         QueueState::new(config(), db.registration.clone(), db.queue.clone())
             .with_admins(parse_admin_ids(Some(&discord_user_id)).unwrap()),
     );
     let (_, as_admin) = get_queue_html(&mine, me, "/queue").await;
-    assert!(!as_admin.contains("href=\"/admin\""), "{as_admin}");
+    assert!(as_admin.contains("href=\"/admin\""), "{as_admin}");
     let header_of = |body: &str| {
         let start = body.find("<header").expect("a header");
         let end = body.find("</header>").expect("a header end") + "</header>".len();
         body[start..end].to_owned()
     };
-    assert_eq!(
+    assert_ne!(
         header_of(&as_admin),
         header_of(&page),
         "管理者と一般参加者でヘッダーが違う"

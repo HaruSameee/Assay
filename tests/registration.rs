@@ -1130,7 +1130,7 @@ async fn the_header_offers_nothing_until_you_are_signed_in(owner: PgPool) {
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
-async fn nobody_sees_an_admin_link_in_the_header(owner: PgPool) {
+async fn only_a_listed_admin_sees_an_admin_link_in_the_header(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let discord_id = "900000000000000005";
     let other_admin = parse_admin_ids(Some("900000000000000001")).unwrap();
@@ -1145,20 +1145,20 @@ async fn nobody_sees_an_admin_link_in_the_header(owner: PgPool) {
     let page = body_text(browser.get("/register").await).await;
     assert!(page.contains("href=\"/status\""), "{page}");
     assert!(page.contains("action=\"/auth/logout\""), "{page}");
-    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!page.contains("admin"), "{page}");
 
-    // 2. **リストに載っていても出さない。**リンクの有無で管理者かどうかが分かってしまう
+    // 2. リストに載っている本人には出す。
     let mut browser = Browser::new(router(
         AuthState::new(config(), oauth.clone(), db.repo.clone()).with_admins(this_player_is_admin),
     ));
     sign_in(&mut browser, &db, discord_id).await;
     let page = body_text(browser.get("/register").await).await;
-    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(page.contains("href=\"/admin\""), "{page}");
 
     // 3. リスト未設定（パネル自体がマウントされない構成）では誰にも出さない
     let mut browser = Browser::new(router(AuthState::new(config(), oauth, db.repo.clone())));
     sign_in(&mut browser, &db, discord_id).await;
     let page = body_text(browser.get("/register").await).await;
-    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!page.contains("admin"), "{page}");
     db.done().await;
 }

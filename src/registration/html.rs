@@ -242,6 +242,11 @@ fn site_header(viewer: Viewer) -> String {
     } else {
         ""
     };
+    let admin = if viewer.is_admin() {
+        "<a href=\"/admin\">管理</a>\n"
+    } else {
+        ""
+    };
     if !viewer.signed_in() {
         if ranking.is_empty() {
             return String::from(
@@ -256,15 +261,15 @@ fn site_header(viewer: Viewer) -> String {
              <nav class=\"site-nav\" aria-label=\"メニュー\">\n{ranking}</nav>\n</header>\n"
         );
     }
-    // **管理パネルへのリンクは出さない。**非管理者の `/admin` は 404 を返す方針なので、
-    // リンクの有無がそのまま「この人は管理者か」の判別材料になってしまう。
-    // 運営は URL を直接開く（アクセス制御は /admin 側の照合が正）
+    // 管理者にだけパネルへの導線を出す。アクセス制御は /admin 側の照合が正で、
+    // 非管理者にはこの断片自体を送らない。
     format!(
         "<header class=\"site-header\">\n\
          <a class=\"brand\" href=\"/queue\">Assay</a>\n\
          <nav class=\"site-nav\" aria-label=\"メニュー\">\n\
          <a href=\"/status\">戦績</a>\n{ranking}\
          <a href=\"/profile\">プロフィール</a>\n\
+         {admin}\
          <form method=\"post\" action=\"/auth/logout\">\
          <button type=\"submit\">ログアウト</button></form>\n\
          </nav>\n</header>\n"
@@ -813,12 +818,9 @@ mod tests {
         assert!(!header.contains("管理"), "{header}");
     }
 
-    /// **管理者と非管理者でヘッダーが 1 バイトも違わないこと。**
-    ///
-    /// `/admin` は非管理者に 404 を返す方針なので、リンクの有無がそのまま
-    /// 「この人は管理者か」の判別材料になる。運営は URL を直接開く。
+    /// 管理者にだけ、サーバーが `/admin` 導線を含むヘッダーを送る。
     #[test]
-    fn the_header_is_identical_for_admins_and_everyone_else() {
+    fn the_header_shows_the_admin_link_only_to_admins() {
         for public in [false, true] {
             let admin = header_of(&error_page(
                 Viewer::ADMIN.with_ranking(public),
@@ -832,20 +834,32 @@ mod tests {
                 "やり直してください",
             ))
             .to_owned();
-            assert_eq!(
+            assert_ne!(
                 admin, member,
                 "ランキング公開={public} で管理者とそれ以外のヘッダーが違う"
             );
-            assert!(!admin.contains("/admin"), "{admin}");
-            assert!(!admin.contains("管理"), "{admin}");
+            assert!(admin.contains("href=\"/admin\""), "{admin}");
+            assert!(!member.contains("admin"), "{member}");
+            let anonymous = header_of(&error_page(
+                Viewer::ANONYMOUS.with_ranking(public),
+                "error",
+                "retry",
+            ))
+            .to_owned();
+            assert!(!anonymous.contains("admin"), "{anonymous}");
             println!(
-                "ランキング公開={public}: 管理者と一般のヘッダーは一致（{} バイト）",
-                admin.len()
+                "ランキング公開={public}:\n管理者ヘッダー={admin}\n一般参加者ヘッダー={member}\n未ログインヘッダー={anonymous}"
             );
         }
     }
 
     /// **ランキングが非公開のあいだはリンクを出さない。**公開したら未ログインにも出す。
+    #[test]
+    fn anonymous_header_never_contains_an_admin_link() {
+        let header = header_of(&error_page(Viewer::ANONYMOUS, "error", "retry")).to_owned();
+        assert!(!header.contains("admin"), "{header}");
+    }
+
     #[test]
     fn the_ranking_link_follows_the_public_switch() {
         for viewer in [Viewer::ANONYMOUS, Viewer::MEMBER, Viewer::ADMIN] {
@@ -901,7 +915,7 @@ mod tests {
     /// どれかの画面が自前のヘッダーを持ち始めたら、ここで落ちる
     /// （キュー画面の同じ検査は `queue::html` 側にある）。
     #[test]
-    fn every_screen_renders_the_same_header() {
+    fn every_screen_renders_the_header_for_its_viewer() {
         use crate::admin::html::{MatchmakerView, SearchView, search_page};
         use crate::status::StatusSummary;
         use crate::status::html::{StatusView, status_page};
@@ -943,9 +957,10 @@ mod tests {
             received_blocks: &[],
             notice: None,
         });
-        assert_eq!(
-            header_of(&admin),
-            expected,
+        let admin_header = header_of(&admin);
+        assert!(admin_header.contains("href=\"/admin\""), "{admin_header}");
+        assert_ne!(
+            admin_header, expected,
             "管理パネルのヘッダーが他の画面と違う",
         );
 
@@ -968,7 +983,7 @@ mod tests {
             "プロフィール編集のヘッダーが違う"
         );
         println!(
-            "同じヘッダーを出す画面: 登録 / 登録結果 / エラー / 戦績 / 管理 / プロフィール編集"
+            "同じ一般参加者ヘッダーを出す画面: 登録 / 登録結果 / エラー / 戦績 / プロフィール編集"
         );
     }
 

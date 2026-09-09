@@ -604,23 +604,22 @@ async fn players_are_found_by_trainer_name_or_discord_id(owner: PgPool) {
     db.done().await;
 }
 
-/// 管理パネルは**誰の画面にもリンクされない。**運営は URL を直接開く。
+/// 管理パネルは管理者の画面にだけリンクされる。
 ///
-/// リンクを消すことはアクセス制御ではない（`/admin` は非管理者に 404 を返し続ける）。
-/// 消す理由は、**リンクの有無がそのまま「この人は管理者か」の判別材料になる**ためである。
+/// リンクを出すことはアクセス制御ではない（`/admin` は非管理者に 404 を返し続ける）。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn the_admin_panel_is_reachable_but_never_linked(owner: PgPool) {
+async fn the_admin_panel_is_reachable_and_linked_only_for_admins(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_cast(&db, 3).await;
     let ids = || parse_admin_ids(Some(&ADMIN_ID.to_string())).unwrap();
     let oauth = Arc::new(FakeOAuth::new("1002"));
 
-    // 管理者: パネルは開けるが、**どの画面にも導線は出ない**
+    // 管理者: パネルを開け、各画面のヘッダーに導線がある。
     let mut admin = admin_browser(&db, &oauth, ids()).await;
     let panel = body_text(admin.get("/admin").await).await;
     assert!(panel.contains("レート調整パネル"), "{panel}");
     assert!(panel.contains("<a href=\"/status\">戦績</a>"), "{panel}");
-    assert!(!panel.contains("href=\"/admin\""), "{panel}");
+    assert!(panel.contains("href=\"/admin\""), "{panel}");
     // 「管理」の有無はヘッダーだけで見る。本文にはトレーナー名「管理者」が出る
     let header_of = |body: &str| {
         let start = body.find("<header").expect("a header");
@@ -629,8 +628,11 @@ async fn the_admin_panel_is_reachable_but_never_linked(owner: PgPool) {
     };
     let elsewhere = body_text(admin.get("/register").await).await;
     let admin_header = header_of(&elsewhere);
-    assert!(!elsewhere.contains("href=\"/admin\""), "{elsewhere}");
-    assert!(!admin_header.contains("管理"), "{admin_header}");
+    assert!(elsewhere.contains("href=\"/admin\""), "{elsewhere}");
+    assert!(
+        admin_header.contains("<a href=\"/admin\">管理</a>"),
+        "{admin_header}"
+    );
 
     // 一般プレイヤー: 同じ構成。/admin は 404 のまま
     let mut nope = player_browser(&db, &oauth, ids(), 2).await;
@@ -639,10 +641,10 @@ async fn the_admin_panel_is_reachable_but_never_linked(owner: PgPool) {
     assert!(page.contains("<a href=\"/status\">戦績</a>"), "{page}");
     assert!(page.contains("action=\"/auth/logout\""), "{page}");
     assert!(!page.contains("href=\"/admin\""), "{page}");
-    assert!(!player_header.contains("管理"), "{player_header}");
+    assert!(!player_header.contains("admin"), "{player_header}");
 
-    // **管理者と一般参加者のヘッダーが 1 バイトも違わないこと。**
-    assert_eq!(
+    // 管理者だけに導線があるため、ヘッダーは一致しない。
+    assert_ne!(
         admin_header, player_header,
         "管理者と一般参加者でヘッダーが違う"
     );
@@ -657,7 +659,7 @@ async fn the_admin_panel_is_reachable_but_never_linked(owner: PgPool) {
     // リスト未設定（パネル未マウント）の構成でも同じ
     let mut unset = admin_browser(&db, &oauth, None).await;
     let page = body_text(unset.get("/register").await).await;
-    assert!(!page.contains("href=\"/admin\""), "{page}");
+    assert!(!page.contains("admin"), "{page}");
     assert_eq!(unset.get("/admin").await.status(), StatusCode::NOT_FOUND);
 
     db.done().await;
