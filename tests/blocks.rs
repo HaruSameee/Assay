@@ -43,10 +43,6 @@ async fn user_blocks_are_append_only_capacity_limited_and_cooldown_limited(owner
         .block(player(1), player(2), "block-one", at(0))
         .await
         .unwrap();
-    blocks
-        .block(player(1), player(3), "block-two", at(1))
-        .await
-        .unwrap();
     // The same idempotency key is the only no-op condition.
     blocks
         .block(player(1), player(2), "block-one", at(2))
@@ -54,16 +50,16 @@ async fn user_blocks_are_append_only_capacity_limited_and_cooldown_limited(owner
         .unwrap();
 
     let current = blocks.current_for(player(1)).await.unwrap();
-    assert_eq!(current.len(), 2);
-    assert_eq!(current[0].blocked_player_id, player(3).0);
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].blocked_player_id, player(2).0);
 
     let capacity = blocks
-        .block(player(1), player(4), "block-three", at(3))
+        .block(player(1), player(3), "block-two", at(3))
         .await
         .unwrap_err();
     assert!(matches!(
         capacity,
-        UserBlockError::AllowanceFull { allowance: 2 }
+        UserBlockError::AllowanceFull { allowance: 1 }
     ));
 
     let cooldown = blocks
@@ -78,8 +74,7 @@ async fn user_blocks_are_append_only_capacity_limited_and_cooldown_limited(owner
         .await
         .unwrap();
     let current = blocks.current_for(player(1)).await.unwrap();
-    assert_eq!(current.len(), 1);
-    assert_eq!(current[0].blocked_player_id, player(3).0);
+    assert!(current.is_empty());
 
     for (pool, expected) in [(&app, "42501"), (&owner, "0A000")] {
         for statement in [
@@ -94,6 +89,47 @@ async fn user_blocks_are_append_only_capacity_limited_and_cooldown_limited(owner
             );
         }
     }
+    app.close().await;
+}
+
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn received_block_counts_are_derived_from_current_events_and_sorted(owner: PgPool) {
+    let app = app_pool(&owner).await;
+    let blocks = BlockRepository::new(app.clone());
+
+    blocks
+        .block(player(1), player(5), "one-five", at(0))
+        .await
+        .unwrap();
+    blocks
+        .block(player(2), player(5), "two-five", at(1))
+        .await
+        .unwrap();
+    blocks
+        .block(player(3), player(6), "three-six", at(2))
+        .await
+        .unwrap();
+    blocks
+        .block(player(4), player(7), "four-seven", at(3))
+        .await
+        .unwrap();
+    blocks
+        .unblock(
+            player(4),
+            player(7),
+            "four-seven-unblock",
+            at(3) + TimeDelta::days(BLOCK_COOLDOWN_DAYS),
+        )
+        .await
+        .unwrap();
+
+    let counts = blocks.received_block_counts().await.unwrap();
+    assert_eq!(counts.len(), 2, "解除済みの対象は集計しない");
+    assert_eq!((counts[0].player_id, counts[0].count), (player(5).0, 2));
+    assert_eq!((counts[1].player_id, counts[1].count), (player(6).0, 1));
     app.close().await;
 }
 

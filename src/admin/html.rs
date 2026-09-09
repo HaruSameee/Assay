@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::blocks::{CurrentBlock, IncomingBlock};
+use crate::blocks::{CurrentBlock, IncomingBlock, ReceivedBlockCount};
 use crate::queue::html::role_label;
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
@@ -25,6 +25,8 @@ pub struct SearchView<'a> {
     pub players: &'a [FoundPlayer],
     /// 直近の調整履歴（新しい順）。
     pub recent: &'a [AdjustmentRow],
+    /// 現在受信しているブロック数。件数の多い順で、運営だけに表示する。
+    pub received_blocks: &'a [ReceivedBlockCount],
     /// マッチメイカの停止・再開。**当日いちばん先に触る操作なので入口の画面に置く。**
     pub matchmaker: MatchmakerView<'a>,
     /// 操作後の通知。
@@ -40,7 +42,7 @@ pub struct PlayerView<'a> {
     /// 調整フォームの冪等キー（フォーム描画時にサーバ発行。同一フォームの
     /// 二重送信は同じキーを持つので、2 回目の送信は行を増やさない）。
     pub form_key: &'a str,
-    /// 現在のブロック枠（`admin_actions` の最新行からの導出値。既定は 2）。
+    /// 現在のブロック枠（`admin_actions` の最新行からの導出値。既定は 1）。
     pub block_allowance: i32,
     pub outgoing_blocks: &'a [CurrentBlock],
     pub incoming_blocks: &'a [IncomingBlock],
@@ -228,6 +230,7 @@ pub fn search_page(view: &SearchView<'_>) -> String {
              <tbody>\n{results}</tbody>\n</table></div>\n"
         )
     };
+    let received_blocks = received_block_counts_table(view.received_blocks);
 
     // この画面は管理者しか到達しない（非管理者は 404）。ヘッダーも管理者のもの
     page(
@@ -249,6 +252,9 @@ pub fn search_page(view: &SearchView<'_>) -> String {
              <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">検索</button></div>\
              </form>\n\
              {found}\
+             <h2>受信ブロック件数</h2>\n\
+             <p class=\"fine-print\">現在有効な味方ブロックのみを、件数の多い順に表示します。</p>\n\
+             {received_blocks}\
              <h2>直近の調整履歴</h2>\n\
              {recent}\
              </section>\n",
@@ -257,8 +263,37 @@ pub fn search_page(view: &SearchView<'_>) -> String {
             matchmaker = matchmaker_section(view.matchmaker),
             q = escape(view.query),
             found = found,
+            received_blocks = received_blocks,
             recent = adjustments_table(view.recent, true),
         ),
+    )
+}
+
+fn received_block_counts_table(rows: &[ReceivedBlockCount]) -> String {
+    if rows.is_empty() {
+        return String::from("<p class=\"muted\">現在有効な受信ブロックはありません。</p>\n");
+    }
+    let body = rows
+        .iter()
+        .map(|row| {
+            let name = row
+                .display_name
+                .as_deref()
+                .or(row.trainer_name.as_deref())
+                .unwrap_or("(未設定)");
+            format!(
+                "<tr><td><a href=\"/admin/player?player={id}\">{name}</a></td>\
+                 <td class=\"num\">{count}</td></tr>\n",
+                id = escape(&row.player_id.to_string()),
+                name = escape(name),
+                count = row.count,
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>プレイヤー</th><th>受信件数</th></tr></thead>\n\
+         <tbody>\n{body}</tbody>\n</table></div>\n"
     )
 }
 
@@ -281,7 +316,7 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
              </dl>\n\
              {notice}\
              <h2>ブロック枠</h2>\n\
-             <p class=\"fine-print\">既定は 2 枠です。変更は追記として記録され、\
+             <p class=\"fine-print\">既定は 1 枠です。変更は追記として記録され、\
              ブロック機能が入ったときにこの値が参照されます。0〜{max} の整数で指定します。</p>\n\
              <form method=\"post\" action=\"/admin/blocks\">\
              <input type=\"hidden\" name=\"player\" value=\"{player_id}\">\
@@ -826,6 +861,7 @@ mod tests {
             query: "ハル",
             players: &players,
             recent: &recent,
+            received_blocks: &[],
             matchmaker: running(),
             notice: None,
         });
@@ -904,6 +940,7 @@ mod tests {
             query: "",
             players: &[],
             recent: &[],
+            received_blocks: &[],
             matchmaker: running(),
             notice: None,
         });
@@ -980,6 +1017,7 @@ mod tests {
             query: "",
             players: &[],
             recent: &[],
+            received_blocks: &[],
             matchmaker: running(),
             notice: None,
         });
@@ -992,6 +1030,7 @@ mod tests {
             query: "",
             players: &[],
             recent: &[],
+            received_blocks: &[],
             matchmaker: MatchmakerView {
                 paused: Some(&pause),
                 form_key: "form-key",
@@ -1005,6 +1044,38 @@ mod tests {
         assert!(paused_page.contains("discord:900000000000000001"));
         assert!(paused_page.contains("2026-09-12 21:30"), "JST で出す");
         assert!(paused_page.contains("VC が落ちた"));
+    }
+
+    #[test]
+    fn received_block_counts_are_rendered_in_the_repository_order() {
+        let received_blocks = vec![
+            ReceivedBlockCount {
+                player_id: Uuid::from_u128(9),
+                display_name: Some("少ない方".to_owned()),
+                trainer_name: None,
+                count: 1,
+            },
+            ReceivedBlockCount {
+                player_id: Uuid::from_u128(8),
+                display_name: Some("多い方".to_owned()),
+                trainer_name: None,
+                count: 3,
+            },
+        ];
+        let rendered = search_page(&SearchView {
+            query: "",
+            players: &[],
+            recent: &[],
+            received_blocks: &received_blocks,
+            matchmaker: running(),
+            notice: None,
+        });
+        assert!(rendered.contains("受信ブロック件数"));
+        assert!(rendered.contains("現在有効な味方ブロックのみ"));
+        assert!(
+            rendered.find("多い方").unwrap() < rendered.find("少ない方").unwrap(),
+            "集計済みの降順を表示順も保つ: {rendered}"
+        );
     }
 
     #[test]
@@ -1074,7 +1145,7 @@ mod tests {
             incoming_blocks: &[],
             notice: None,
         });
-        assert!(rendered.contains("<dt>ブロック枠</dt><dd>2 枠</dd>"));
+        assert!(rendered.contains("<dt>ブロック枠</dt><dd>1 枠</dd>"));
         assert!(rendered.contains("action=\"/admin/blocks\""));
         assert!(rendered.contains("name=\"key\" value=\"blocks:k\""));
         assert!(rendered.contains(&format!("max=\"{MAX_BLOCK_ALLOWANCE}\"")));

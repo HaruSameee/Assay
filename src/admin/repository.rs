@@ -417,7 +417,7 @@ impl AdminRepository {
 
     /// そのプレイヤーのブロック枠。行が無ければ [`DEFAULT_BLOCK_ALLOWANCE`]。
     ///
-    /// ブロック機能そのものは未実装で、いまは枠数を持つだけ（機能側が入ったらここを読む）。
+    /// 既定値は 1。運営が `block_allowance_set` を追記した場合だけ、その最新行で上書きする。
     pub async fn block_allowance(&self, player_id: Uuid) -> Result<i32, sqlx::Error> {
         let row = sqlx::query_scalar!(
             "select (payload->>'allowance')::int as \"allowance!\" \

@@ -9,7 +9,7 @@ use crate::persistence::repository::lock_vc_pool;
 
 use super::model::{
     AdminBlockOverrideError, BlockKind, BlockSearchResult, CurrentBlock, IncomingBlock,
-    UserBlockError, cooldown_ends_at,
+    ReceivedBlockCount, UserBlockError, cooldown_ends_at,
 };
 
 #[derive(Debug, Clone)]
@@ -120,6 +120,44 @@ impl BlockRepository {
                 display_name: row.display_name,
                 trainer_name: row.trainer_name,
                 blocked_at: row.blocked_at,
+            })
+            .collect())
+    }
+
+    /// 現在有効な受信ブロックを、件数の多い順で集計する。
+    ///
+    /// 管理画面だけが使う。履歴全体ではなく、各ブロッカー・対象ペアの最新行から
+    /// 導出するため、解除済みの行は数えない。
+    pub async fn received_block_counts(&self) -> Result<Vec<ReceivedBlockCount>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select latest.blocked_player_id, \
+                    snapshot.display_name as \"display_name?\", target.trainer_name, \
+                    count(*)::bigint as \"count!\" \
+             from ( \
+                 select distinct on (player_id, blocked_player_id) \
+                        player_id, blocked_player_id, kind \
+                 from player_blocks \
+                 order by player_id, blocked_player_id, id desc \
+             ) latest \
+             join players target on target.id = latest.blocked_player_id \
+             left join lateral ( \
+                 select display_name from player_discord_snapshots \
+                 where player_id = latest.blocked_player_id \
+                 order by id desc limit 1 \
+             ) snapshot on true \
+             where latest.kind = 'blocked' \
+             group by latest.blocked_player_id, snapshot.display_name, target.trainer_name \
+             order by count(*) desc, latest.blocked_player_id"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ReceivedBlockCount {
+                player_id: row.blocked_player_id,
+                display_name: row.display_name,
+                trainer_name: row.trainer_name,
+                count: usize::try_from(row.count).unwrap_or(usize::MAX),
             })
             .collect())
     }

@@ -245,6 +245,13 @@ async fn show_search(
             return internal_error();
         }
     };
+    let received_blocks = match app.blocks.received_block_counts().await {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(%err, "could not count received blocks");
+            return internal_error();
+        }
+    };
     // 当日の入口の画面。マッチメイカの状態はここでも読めるようにする
     let paused = match app.store.matchmaker_pause().await {
         Ok(paused) => paused,
@@ -258,6 +265,7 @@ async fn show_search(
         query,
         players: &players,
         recent: &recent,
+        received_blocks: &received_blocks,
         matchmaker: MatchmakerView {
             paused: paused.as_ref(),
             form_key: &key,

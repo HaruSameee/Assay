@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// ブロック枠の既定値。行が 1 つも無いプレイヤーはこの枠数を持つ。
-pub const DEFAULT_BLOCK_ALLOWANCE: i32 = 2;
+pub const DEFAULT_BLOCK_ALLOWANCE: i32 = 1;
 /// ブロック枠の上限。DB の CHECK（0〜99）と同じ値にしてある。
 pub const MAX_BLOCK_ALLOWANCE: i32 = 99;
 
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_allowance_is_two() {
-        assert_eq!(DEFAULT_BLOCK_ALLOWANCE, 2);
+    fn the_default_allowance_is_one() {
+        assert_eq!(DEFAULT_BLOCK_ALLOWANCE, 1);
     }
 }

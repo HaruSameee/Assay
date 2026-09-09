@@ -695,9 +695,9 @@ async fn removing_a_player_does_not_disturb_their_running_match(owner: PgPool) {
 // C. ブロック枠
 // ----------------------------------------------------------------------
 
-/// 既定は 2 枠。変更は追記として記録され、誰がいつ変えたかが残る。
+/// 既定は 1 枠。変更は追記として記録され、誰がいつ変えたかが残る。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn the_block_allowance_defaults_to_two_and_records_the_change(owner: PgPool) {
+async fn the_block_allowance_defaults_to_one_and_records_the_change(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_cast(&db, 2).await;
     let app = db.router();
@@ -709,7 +709,7 @@ async fn the_block_allowance_defaults_to_two_and_records_the_change(owner: PgPoo
     let path = format!("/admin/player?player={}", player(2).0);
     let (status, page) = get_html(&app, player(ADMIN), &path).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("<dt>ブロック枠</dt><dd>2 枠</dd>"), "{page}");
+    assert!(page.contains("<dt>ブロック枠</dt><dd>1 枠</dd>"), "{page}");
 
     let key = form_key(&page, "/admin/blocks");
     let (status, page) = post_form(

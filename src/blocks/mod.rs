@@ -9,6 +9,6 @@ pub mod repository;
 
 pub use model::{
     AdminBlockOverrideError, BLOCK_COOLDOWN_DAYS, BlockKind, BlockSearchResult, CurrentBlock,
-    IncomingBlock, UserBlockError, cooldown_ends_at,
+    IncomingBlock, ReceivedBlockCount, UserBlockError, cooldown_ends_at,
 };
 pub use repository::BlockRepository;

@@ -68,6 +68,17 @@ pub struct IncomingBlock {
     pub blocked_at: Timestamp,
 }
 
+/// 運営だけが見る、現在受信している味方ブロックの集計行。
+///
+/// 一覧は件数の多い順に出す。利用者向けの API や公開プロフィールには載せない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedBlockCount {
+    pub player_id: Uuid,
+    pub display_name: Option<String>,
+    pub trainer_name: Option<String>,
+    pub count: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum UserBlockError {
     #[error("a player cannot block themselves")]
