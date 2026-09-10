@@ -479,7 +479,8 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     assert_eq!(fake.sends_in(vc.red)[0], red_assignment);
     assert_eq!(fake.sends_in(vc.blue)[0], blue_assignment);
 
-    // 招集は**チームごとに 1 通**。相手チームの顔ぶれと行き先が同じ投稿に並ばない
+    // 招集は**10 人ぶんを 1 通**。相手の顔ぶれは元から同じチャンネルに並んでいたので、
+    // 分けても隠せていなかった（隠れているのは各 VC の割り当て表の方）
     let (summon_channel, _) = record.summon_notification.unwrap();
     assert_eq!(summon_channel, ChannelId::new(998));
     let summons: Vec<OutgoingMessage> = fake
@@ -487,38 +488,48 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
         .into_iter()
         .map(|id| fake.message(summon_channel, id))
         .collect();
-    assert_eq!(summons.len(), 3, "red / blue の招集とホストの通知");
-    for (summon, channel) in summons[..2].iter().zip(["<#101>", "<#102>"]) {
-        assert_eq!(summon.mention_users.len(), 5, "{}", summon.content);
-        assert!(summon.content.contains("マッチが成立しました"));
-        assert!(summon.content.contains(channel), "{}", summon.content);
-        assert_eq!(
-            summon.content.lines().next().unwrap().matches("<@").count(),
-            5
-        );
-        // 相手側の VC は出てこない
-        let other = if channel == "<#101>" {
-            "<#102>"
-        } else {
-            "<#101>"
-        };
-        assert!(!summon.content.contains(other), "{}", summon.content);
-        for forbidden in ["レート", "top_carry", "上キャリー", "報告"] {
-            assert!(!summon.content.contains(forbidden), "{}", summon.content);
-        }
-        // 操作の行き先が必ず書いてある
-        assert!(summon.content.contains(SITE), "{}", summon.content);
+    assert_eq!(summons.len(), 2, "成立の招集 1 通とホストの通知 1 通");
+    let summon = &summons[0];
+    assert_eq!(summon.mention_users.len(), 10, "{}", summon.content);
+    assert!(summon.content.contains("マッチが成立しました"));
+    // 両チームの行き先が 1 通に載る
+    assert!(summon.content.contains("<#101>"), "{}", summon.content);
+    assert!(summon.content.contains("<#102>"), "{}", summon.content);
+    assert_eq!(
+        summon.content.matches("<@").count(),
+        10,
+        "{}",
+        summon.content
+    );
+    // **URL は 1 つだけ**
+    assert_eq!(
+        summon.content.matches(SITE).count(),
+        1,
+        "{}",
+        summon.content
+    );
+    for forbidden in ["レート", "top_carry", "上キャリー", "報告"] {
+        assert!(!summon.content.contains(forbidden), "{}", summon.content);
     }
-    // 3 通目はホストの通知。ホストは相手チームにも伝えるので招集チャンネルに出す
-    let announcement = &summons[2];
+
+    // 2 通目はホストの通知。ホストは相手チームにも伝えるので招集チャンネルに出す
+    let announcement = &summons[1];
     assert_eq!(announcement.mention_users, vec![user(1)]);
     assert!(
         announcement.content.contains("ホストは"),
         "{}",
         announcement.content
     );
+    // **URL は載せない**（直前の招集に同じリンクがある）
     assert!(
-        announcement.content.contains(SITE),
+        !announcement.content.contains(SITE),
+        "{}",
+        announcement.content
+    );
+    assert!(
+        announcement
+            .content
+            .contains("ルーム ID を入力してください"),
         "{}",
         announcement.content
     );
@@ -1436,16 +1447,16 @@ async fn a_failed_summon_is_recorded_without_abandoning_the_formation(owner: PgP
     );
     assert_eq!(record.assignment_message_ids.len(), 2);
     assert_eq!(record.summon_notification, None);
-    // 招集はチームごとに 1 通ずつ出すので、失敗も 2 件残る
+    // 招集は 1 通なので、失敗も 1 件だけ残る
     let failures = log.events[1].payload[DISCORD_FAILURES_KEY]
         .as_array()
         .unwrap();
-    assert_eq!(failures.len(), 2, "{failures:?}");
+    assert_eq!(failures.len(), 1, "{failures:?}");
     let operations: Vec<&str> = failures
         .iter()
         .map(|failure| failure[OPERATION_KEY].as_str().unwrap())
         .collect();
-    assert_eq!(operations, ["send:summon:red", "send:summon:blue"]);
+    assert_eq!(operations, ["send:summon"]);
     assert_eq!(failures[0][ATTEMPTS_KEY], 3);
     let indexed = sqlx::query!(
         "select kind, operation from discord_failures where formation_id = $1 order by id",
@@ -1459,13 +1470,7 @@ async fn a_failed_summon_is_recorded_without_abandoning_the_formation(owner: PgP
     assert!(
         indexed
             .iter()
-            .any(|row| row.kind == "summon_notification" && row.operation == "send:summon:red"),
-        "{indexed:?}"
-    );
-    assert!(
-        indexed
-            .iter()
-            .any(|row| row.kind == "summon_notification" && row.operation == "send:summon:blue"),
+            .any(|row| row.kind == "summon_notification" && row.operation == "send:summon"),
         "{indexed:?}"
     );
     assert!(
@@ -1702,16 +1707,16 @@ async fn internal_formations_endpoint_requires_the_token_and_starts_a_formation(
     db.done().await;
 }
 
-/// **招集チャンネルは1本。**チームごとに分かれているのは*メッセージ*だけ。
+/// **招集チャンネルは1本で、成立の通知も1通。**
 ///
-/// 「割り当て表を招集チャンネルへ移す」案の前提を実測する。分かれているのが
-/// チャンネルではなくメッセージである以上、そこへ名前とロールの一覧を出すと
-/// **公開チャンネルに両チームの構成が並ぶ**ことになる。
+/// 以前はチームごとに 2 通に分けていたが、どちらも同じチャンネルに並ぶので
+/// 相手の構成は隠せていなかった。隠れているのは各 VC に出す割り当て表の方である。
+/// ここではその前提（チャンネルが 1 本であること）を実測する。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
-async fn the_summon_channel_is_one_channel_with_two_messages(owner: PgPool) {
+async fn the_summon_channel_is_one_channel_with_one_summon(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
     let adapter = adapter(&db, fake.clone(), 1);
@@ -1719,9 +1724,8 @@ async fn the_summon_channel_is_one_channel_with_two_messages(owner: PgPool) {
 
     let summon_channel = config().summon_channel_id;
     let summons = fake.sends_in(summon_channel);
-    // red と blue の成立通知 2 通 + ホスト決定の通知 1 通。**すべて同じ 1 本の
-    // チャンネル**に入る（分かれているのはメッセージだけ）
-    assert_eq!(summons.len(), 3, "成立2通 + ホスト決定1通");
+    // 成立の招集 1 通（10 人ぶん）+ ホスト決定の通知 1 通。**同じ 1 本のチャンネル**
+    assert_eq!(summons.len(), 2, "成立1通 + ホスト決定1通");
     assert_ne!(summon_channel, vc.red);
     assert_ne!(summon_channel, vc.blue);
     println!(

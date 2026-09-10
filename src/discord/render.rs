@@ -296,35 +296,52 @@ fn rating(value: f64) -> String {
     }
 }
 
-/// 公開招集チャンネルに出す、片チーム分の成立通知。
+/// 公開招集チャンネルに出す成立通知。**10 人ぶんを 1 通にまとめる。**
 ///
-/// **チームごとに別のメッセージにする。**同じメッセージに両チームを入れると、そこから
-/// 相手の構成が読めてしまう（割り当て表を VC ごとに分けた意味が消える）。呼ぶ側が
-/// [`Team::ALL`] を回して 2 通投稿する。
+/// 以前はチームごとに 2 通に分けていた。「同じメッセージに両チームを入れると相手の
+/// 構成が読めてしまう」という理由だったが、**2 通とも同じ招集チャンネルに並ぶ**ので
+/// 隠せていなかった。実際に相手から隠れているのは各チームの VC に出す割り当て表の方で、
+/// そちらは分けたままである。
+///
+/// 分けない方が読みやすい。1 通にまとめれば URL が 1 つで済み、
+/// 自分がメンションされたかどうかも 1 か所を見れば分かる。
 ///
 /// レート、ロール割り当て、報告に関わる情報は全員が見る場所へ出さない（00 §3-5）。
 /// 出してよいのは**参加者名・チーム・行き先 VC と、サイトへの導線だけ**。
-/// 本文のメンションと `mention_users` は同じ5人に揃える。
-pub fn summon(roster: &[RosterEntry], vc: &VcPair, team: Team, match_url: &str) -> OutgoingMessage {
-    // チーム内はユーザー ID 順で安定させる
-    let mut users: Vec<UserId> = roster
-        .iter()
-        .filter(|entry| entry.team == team)
-        .filter_map(user_of)
-        .collect();
-    users.sort_unstable();
-    users.dedup();
-    let mentions = users
-        .iter()
-        .map(|user| mention(*user))
-        .collect::<Vec<_>>()
-        .join(" ");
+/// 本文のメンションと `mention_users` は同じ 10 人に揃える。
+pub fn summon(roster: &[RosterEntry], vc: &VcPair, match_url: &str) -> OutgoingMessage {
+    // チーム内はユーザー ID 順で安定させる（同じ編成なら毎回同じ本文になる）
+    let team_users = |team: Team| -> Vec<UserId> {
+        let mut users: Vec<UserId> = roster
+            .iter()
+            .filter(|entry| entry.team == team)
+            .filter_map(user_of)
+            .collect();
+        users.sort_unstable();
+        users.dedup();
+        users
+    };
+    let line = |team: Team, label: &str| -> String {
+        let mentions = team_users(team)
+            .iter()
+            .map(|user| mention(*user))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "{label}: {mentions} → <#{channel}>",
+            channel = vc.channel(team).get(),
+        )
+    };
+    // 赤が先。マッチ画面もチーム表記も赤 → 青の順で揃えてある
+    let mut users = team_users(Team::Red);
+    users.extend(team_users(Team::Blue));
     OutgoingMessage {
         content: format!(
-            "{mentions} → <#{channel}>\n\
-             マッチが成立しました。**操作はすべてマッチ画面から**行います: {match_url}\n\
+            "マッチが成立しました。**操作はすべてマッチ画面から**行います: {match_url}\n\
+             {red}\n{blue}\n\
              割り当てと部屋設定もマッチ画面にあります",
-            channel = vc.channel(team).get(),
+            red = line(Team::Red, "赤"),
+            blue = line(Team::Blue, "青"),
         ),
         buttons: Vec::new(),
         mention_users: users,
@@ -335,12 +352,15 @@ pub fn summon(roster: &[RosterEntry], vc: &VcPair, team: Team, match_url: &str) 
 /// （誰が部屋を建てたか分からないと、入れなかったときに聞く相手が分からない）。
 ///
 /// ホストのロールは出さない。メンションはホスト1人だけなので、招集の通知と重複しない。
+///
+/// **URL は載せない。**同じチャンネルの直前に出る成立通知（[`summon`]）に
+/// マッチ画面へのリンクがあり、同じ URL を 2 行あとにもう一度出すと
+/// 「別の場所へ行くのか」と読ませてしまう。
 pub fn host_announcement(
     formation: FormationId,
     host: UserId,
     index: usize,
     total: usize,
-    match_url: &str,
 ) -> OutgoingMessage {
     let changed = if index > 1 {
         format!("（候補 {index}/{total} に交代しました）")
@@ -350,7 +370,7 @@ pub fn host_announcement(
     OutgoingMessage {
         content: format!(
             "**{label}** ホストは {host} さんです{changed}。\n\
-             ホストの方はサイトで部屋を作って、ルーム ID を入力してください: {match_url}",
+             ホストの方はマッチ画面で部屋を作って、ルーム ID を入力してください",
             label = match_label(formation),
             host = mention(host),
         ),
@@ -725,60 +745,67 @@ mod tests {
         assert!(!blue.content.contains("vc3-red"), "{}", blue.content);
     }
 
-    /// **チームごとに別のメッセージ。**片方の投稿に相手チームが混ざらないこと。
+    /// **招集は 1 通。**10 人ぶんのメンションと URL 1 つで、行き先だけチームごとに書く。
+    ///
+    /// 以前はチームごとに 2 通に分けていた。相手の構成を隠す意図だったが、
+    /// 2 通とも同じ招集チャンネルに並ぶので隠せていなかった。
     #[test]
-    fn the_summon_is_split_per_team() {
-        let red = summon(&roster(), &vc(), Team::Red, SITE);
-        let blue = summon(&roster(), &vc(), Team::Blue, SITE);
+    fn the_summon_is_one_message_for_all_ten() {
+        let message = summon(&roster(), &vc(), SITE);
         assert_eq!(
-            red.content,
+            message.content,
             format!(
-                "<@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
-                 マッチが成立しました。**操作はすべてマッチ画面から**行います: {SITE}\n\
+                "マッチが成立しました。**操作はすべてマッチ画面から**行います: {SITE}\n\
+                 赤: <@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
+                 青: <@1006> <@1007> <@1008> <@1009> <@1010> → <#32>\n\
                  割り当てと部屋設定もマッチ画面にあります"
             )
         );
-        // 相手チームのメンションも、相手の行き先 VC も入らない
-        assert!(!red.content.contains("<#32>"), "{}", red.content);
-        for user in 1006..=1010 {
+        // **URL は 1 つだけ。**2 通に分かれていた頃は同じ URL が 2 回出ていた
+        assert_eq!(
+            message.content.matches(SITE).count(),
+            1,
+            "{}",
+            message.content
+        );
+        // 10 人全員がメンションされる（本文と mention_users が一致すること）
+        assert_eq!(
+            message.mention_users,
+            (1001..=1010).map(UserId::new).collect::<Vec<_>>()
+        );
+        for user in 1001..=1010 {
             assert!(
-                !red.content.contains(&format!("<@{user}>")),
+                message.content.contains(&format!("<@{user}>")),
                 "{}",
-                red.content
+                message.content
             );
         }
-        for user in 1001..=1005 {
-            assert!(
-                !blue.content.contains(&format!("<@{user}>")),
-                "{}",
-                blue.content
-            );
-        }
-        assert_eq!(
-            red.mention_users,
-            (1001..=1005).map(UserId::new).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            blue.mention_users,
-            (1006..=1010).map(UserId::new).collect::<Vec<_>>()
-        );
-        assert!(red.buttons.is_empty() && blue.buttons.is_empty());
+        // 行き先は両方書く（どちらの VC に行くかが 1 通で分かる）
+        assert!(message.content.contains("<#31>"), "{}", message.content);
+        assert!(message.content.contains("<#32>"), "{}", message.content);
+        assert!(message.buttons.is_empty());
     }
 
     /// ホストは**相手チームの人にも**伝える。メンションはホスト1人だけ。
     #[test]
     fn the_host_announcement_names_the_host_once() {
-        let first = host_announcement(formation(), UserId::new(1001), 1, 3, SITE);
+        let first = host_announcement(formation(), UserId::new(1001), 1, 3);
         assert!(first.content.contains("<@1001>"), "{}", first.content);
         assert_eq!(first.content.matches("<@").count(), 1, "{}", first.content);
         assert_eq!(first.mention_users, vec![UserId::new(1001)]);
-        assert!(first.content.contains(SITE), "{}", first.content);
+        // **URL は載せない。**直前の成立通知に同じリンクがある
+        assert!(!first.content.contains(SITE), "{}", first.content);
+        assert!(
+            first.content.contains("ルーム ID を入力してください"),
+            "{}",
+            first.content
+        );
         // 1人目は「交代」と書かない
         assert!(!first.content.contains("交代"), "{}", first.content);
         assert!(first.buttons.is_empty());
 
         // 候補が移ったら、その旨も招集チャンネルに出る
-        let second = host_announcement(formation(), UserId::new(1002), 2, 3, SITE);
+        let second = host_announcement(formation(), UserId::new(1002), 2, 3);
         assert!(second.content.contains("交代"), "{}", second.content);
         assert!(second.content.contains("2/3"), "{}", second.content);
         // ロールは出さない
@@ -966,7 +993,7 @@ mod tests {
         );
         println!(
             "========== 招集通知（red） ==========\n{}",
-            summon(&roster(), &vc(), Team::Red, SITE).content
+            summon(&roster(), &vc(), SITE).content
         );
         println!(
             "========== 成立時ログ ==========\n{}",
@@ -993,19 +1020,14 @@ mod tests {
     #[test]
     fn dump_notifications_for_review() {
         let host = UserId::new(1001);
-        println!("========== 招集チャンネル: 成立（red） ==========");
-        println!("{}", summon(&roster(), &vc(), Team::Red, SITE).content);
-        println!("\n========== 招集チャンネル: 成立（blue） ==========");
-        println!("{}", summon(&roster(), &vc(), Team::Blue, SITE).content);
+        println!("========== 招集チャンネル: 成立（10 人ぶん 1 通） ==========");
+        println!("{}", summon(&roster(), &vc(), SITE).content);
         println!("\n========== 招集チャンネル: ホスト決定 ==========");
-        println!(
-            "{}",
-            host_announcement(formation(), host, 1, 3, SITE).content
-        );
+        println!("{}", host_announcement(formation(), host, 1, 3).content);
         println!("\n========== 招集チャンネル: ホスト交代 ==========");
         println!(
             "{}",
-            host_announcement(formation(), UserId::new(1006), 2, 3, SITE).content
+            host_announcement(formation(), UserId::new(1006), 2, 3).content
         );
         println!("\n========== red の VC: 割り当て表 ==========");
         println!("{}", assignment(&head(), &vc(), Team::Red, SITE).content);
@@ -1031,8 +1053,8 @@ mod tests {
     /// 招集チャンネルは全員が見る。**レート・ロール割り当て・報告の情報を出さない**（00 §3-5）。
     #[test]
     fn summon_never_leaks_ratings_roles_or_reports() {
-        for team in Team::ALL {
-            let message = summon(&roster(), &vc(), team, SITE);
+        {
+            let message = summon(&roster(), &vc(), SITE);
             for forbidden in [
                 "1500",
                 "レート",
@@ -1214,8 +1236,7 @@ mod tests {
             )
         );
         for message in [
-            summon(&roster(), &vc(), Team::Red, &url),
-            host_announcement(formation(), UserId::new(1001), 1, 3, &url),
+            summon(&roster(), &vc(), &url),
             host_prompt(&head(), UserId::new(1001), 1, 3, &url),
             host_accepted(&head(), UserId::new(1001), &url),
             report_prompt(&head(), &url),
@@ -1234,14 +1255,8 @@ mod tests {
     fn no_message_carries_an_interaction() {
         let mut messages = all_messages();
         messages.push(report_prompt(&head(), SITE));
-        messages.push(summon(&roster(), &vc(), Team::Red, SITE));
-        messages.push(host_announcement(
-            formation(),
-            UserId::new(1001),
-            1,
-            3,
-            SITE,
-        ));
+        messages.push(summon(&roster(), &vc(), SITE));
+        messages.push(host_announcement(formation(), UserId::new(1001), 1, 3));
         for message in messages {
             assert!(message.buttons.is_empty(), "{message:?}");
         }

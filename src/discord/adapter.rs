@@ -517,40 +517,37 @@ impl Adapter {
             }
         }
         let assignment_failed = !failures.is_empty();
-        // 招集もチームごとに分ける。1 通に両チームを入れると相手の顔ぶれと行き先が
-        // 同じ場所に並ぶので、割り当てを VC ごとに分けた意味が薄れる
+        // 招集は**10 人ぶんを 1 通**にまとめる。以前はチームごとに 2 通に分けていたが、
+        // どちらも同じ招集チャンネルに並ぶので相手の構成は隠せていなかった。
+        // 相手から隠れているのは各 VC に出す割り当て表の方で、そちらは分けたまま。
         let summon = if assignment_failed {
             None
         } else if let Some(existing) = record.summon_notification {
             Some(existing)
         } else {
-            let mut first = None;
-            for team in Team::ALL {
-                let message = render::summon(&roster, vc, team, &match_url);
-                match self
-                    .retry(&format!("send:summon:{team}"), || {
-                        self.gateway
-                            .send_message(self.config.summon_channel_id, &message)
-                    })
-                    .await
-                {
-                    Ok(message_id) => {
-                        info!(
-                            formation = %id,
-                            channel = %self.config.summon_channel_id,
-                            %message_id,
-                            %team,
-                            "match summon posted"
-                        );
-                        first.get_or_insert((self.config.summon_channel_id, message_id));
-                    }
-                    Err(failure) => {
-                        error!(formation = %id, %team, error = %failure.error, "match summon failed; formation continues");
-                        failures.push(failure);
-                    }
+            let message = render::summon(&roster, vc, &match_url);
+            match self
+                .retry("send:summon", || {
+                    self.gateway
+                        .send_message(self.config.summon_channel_id, &message)
+                })
+                .await
+            {
+                Ok(message_id) => {
+                    info!(
+                        formation = %id,
+                        channel = %self.config.summon_channel_id,
+                        %message_id,
+                        "match summon posted"
+                    );
+                    Some((self.config.summon_channel_id, message_id))
+                }
+                Err(failure) => {
+                    error!(formation = %id, error = %failure.error, "match summon failed; formation continues");
+                    failures.push(failure);
+                    None
                 }
             }
-            first
         };
         let event = NewEvent::new(
             FormationEventKind::VcAssigned,
@@ -689,7 +686,7 @@ impl Adapter {
         // 建てたか分からないと、入れなかったときに聞く相手が分からない）。候補が次に
         // 移ったときも同じ経路で投稿するので、交代したことが公開の場に残る
         let announcement =
-            render::host_announcement(id, user, candidate_index + 1, candidates.len(), &match_url);
+            render::host_announcement(id, user, candidate_index + 1, candidates.len());
         if let Err(failure) = self
             .retry("send:host_announcement", || {
                 self.gateway
