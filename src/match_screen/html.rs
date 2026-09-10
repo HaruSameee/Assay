@@ -231,9 +231,17 @@ fn stage_block(view: &MatchView) -> String {
     if view.actions.report {
         block.push_str(REPORT_BLOCK);
     } else if view.i_reported && !view.stage.is_closed() {
+        // **この画面に留まってよい**ことと、**離れてよい**ことの両方を書く。
+        // 確定後に出る聞き専報告の入口はこの画面にしか無いので、待つ選択肢を先に置く。
+        // 待たずに戻れるのは、報告ゲートがプレイヤー単位だから（10 人目を待たない）
         block.push_str(
             "<div class=\"notice\"><p><strong>受け付けました。</strong>確定を待っています。</p>\n\
-             <p class=\"fine-print\">他の参加者の報告状況は表示されません。</p></div>\n",
+             <p class=\"fine-print\">確定するとこの画面が自動で切り替わり、\
+             聞き専だった人の報告もそこから出せます。</p>\n\
+             <p class=\"fine-print\">他の参加者の報告状況は表示されません。</p></div>\n\
+             <div class=\"actions\">\
+             <a class=\"button button-secondary\" href=\"/queue\">確定を待たずにキューへ戻る</a>\
+             </div>\n",
         );
     }
     if view.stage.is_closed() || matches!(view.stage, StageView::Confirmed { .. }) {
@@ -393,8 +401,16 @@ fn teammate_row(entry: &TeammateView) -> String {
     )
 }
 
-/// カードに出す名前。**Discord の表示名を優先**し、取れていなければトレーナー名。
+/// カードに出す名前。**登録時のトレーナー名を優先**し、空なら Discord の表示名。
+///
+/// トレーナー名はゲーム内で使っている名前で、**ロビーで相手を探すときに突き合わせるのは
+/// こちら**である。Discord の表示名は本人が自由に変えられるうえ、ゲーム内の名前と
+/// 一致している保証が無い。登録フォームでも「他の参加者に公開されます」と書いて
+/// 入力させているので、画面に出す名前もそれに揃える。
 fn card_name<'a>(discord_name: Option<&'a str>, trainer_name: &'a str) -> &'a str {
+    if !trainer_name.trim().is_empty() {
+        return trainer_name;
+    }
     discord_name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(trainer_name)
@@ -618,8 +634,8 @@ mod tests {
         // 自チームのロールは出る
         assert!(rendered.contains("中央"), "{rendered}");
         assert!(rendered.contains("上キャリー"), "{rendered}");
-        // 相手の名前（Discord の表示名）とレートは出るが、行にロールの入る場所が無い
-        assert!(rendered.contains("相手ディスコ"), "{rendered}");
+        // 相手の名前（登録時のトレーナー名）とレートは出るが、行にロールの入る場所が無い
+        assert!(rendered.contains("相手A"), "{rendered}");
         assert!(rendered.contains("1489"), "{rendered}");
         assert!(
             rendered.contains("相手のロールは部屋に入るまで表示されません"),
@@ -731,25 +747,28 @@ mod tests {
     #[test]
     fn a_hostile_trainer_name_cannot_break_out() {
         let mut state = view(in_progress(false));
-        // Discord の表示名も本人が自由に変えられる。**そちらが優先されるので両方試す**
+        // **トレーナー名が優先される。**Discord の表示名も本人が自由に変えられるので、
+        // 落ちてくる経路として両方試す
         state.opponents[0].trainer_name = r#"<script>alert(1)</script>"#.into();
         state.opponents[0].discord_name = Some(r#"<script>alert(2)</script>"#.into());
-        state.teammates[0].discord_name = Some(r#"<img src=x onerror=alert(3)>"#.into());
+        state.teammates[0].trainer_name = r#"<img src=x onerror=alert(3)>"#.into();
         let rendered = match_page(&state);
-        // 表示に使われるのは Discord の表示名。生のタグとして出ていない
+        // 表示に使われるのはトレーナー名。生のタグとして出ていない
         assert!(!rendered.contains("<script>alert"), "{rendered}");
         assert!(!rendered.contains("<img src=x"), "{rendered}");
-        assert!(rendered.contains("&lt;script&gt;alert(2)"), "{rendered}");
+        assert!(rendered.contains("&lt;script&gt;alert(1)"), "{rendered}");
         assert!(
             rendered.contains("&lt;img src=x onerror=alert(3)&gt;"),
             "{rendered}"
         );
+        // 優先される側なので、Discord の表示名は出ない
+        assert!(!rendered.contains("alert(2)"), "{rendered}");
 
-        // Discord の表示名が取れていなければトレーナー名を出す。そちらも同じく通さない
-        state.opponents[0].discord_name = None;
+        // トレーナー名が空なら Discord の表示名を出す。そちらも同じく通さない
+        state.opponents[0].trainer_name = "   ".into();
         let rendered = match_page(&state);
-        assert!(!rendered.contains("<script>alert(1)"), "{rendered}");
-        assert!(rendered.contains("&lt;script&gt;alert(1)"), "{rendered}");
+        assert!(!rendered.contains("<script>alert(2)"), "{rendered}");
+        assert!(rendered.contains("&lt;script&gt;alert(2)"), "{rendered}");
     }
 
     #[test]

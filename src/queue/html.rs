@@ -246,6 +246,7 @@ fn queued_page(
         })
         .collect::<String>();
     let in_range = status.in_range.unwrap_or(0);
+    let queue_total = status.queue_total.unwrap_or(0);
     let waiting = format_wait(now, &entry.enqueued_at);
     let body = format!(
         "<section id=\"queue-app\" data-view=\"queued\" data-enqueued-at=\"{enqueued}\" aria-labelledby=\"queue-title\">\n\
@@ -253,6 +254,7 @@ fn queued_page(
          <p class=\"lead\">マッチ成立までこの画面を開いたまま待機してください。</p>\n\
          {reported}\
          <div class=\"metrics\">\n<div class=\"metric\"><span class=\"metric-label\">待ち時間</span><strong id=\"wait-time\" class=\"metric-value\">{waiting}</strong></div>\n\
+         <div class=\"metric\"><span class=\"metric-label\">全体でキュー中</span><strong id=\"queue-total\" class=\"metric-value\">{queue_total}人</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">範囲内でキュー中</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
          {breakdown}\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
@@ -306,10 +308,28 @@ fn blocked_page(viewer: Viewer, status: &StatusView, reported: Option<FormationI
         ));
     }
     if !status.eligibility.pending_reports.is_empty() {
+        // **マッチ画面への導線を必ず出す。**報告は Discord のボタンでもできるが、
+        // 押し忘れたまま VC を出た人には、この画面から辿れる経路しか残らない。
+        // 未報告のあいだキューへは入れないので、ここで行き止まりにしない
+        let links = status
+            .eligibility
+            .pending_reports
+            .iter()
+            .map(|formation| {
+                format!(
+                    "<a class=\"button button-primary\" href=\"/match/{formation}\">\
+                     マッチ画面で報告する</a>",
+                    formation = escape(&formation.to_string()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
         gates.push_str(&format!(
             "<section class=\"gate-block\" data-gate=\"pending_reports\"><h2>未報告の試合</h2>\n\
-             <p>未報告の試合が {} 件あります。DiscordのVCテキストチャットにある報告ボタンを押してください。</p></section>\n",
-            status.eligibility.pending_reports.len()
+             <p>未報告の試合が {count} 件あります。下のボタンからマッチ画面を開いて報告してください\
+             （DiscordのVCテキストチャットにある報告ボタンからでも同じです）。</p>\n\
+             <div class=\"actions\">{links}</div></section>\n",
+            count = status.eligibility.pending_reports.len(),
         ));
     }
 
@@ -462,6 +482,7 @@ const QUEUED_SCRIPT: &str = r#"
   const root = document.getElementById('queue-app');
   const waitTime = document.getElementById('wait-time');
   const inRange = document.getElementById('in-range');
+  const queueTotal = document.getElementById('queue-total');
   const pollStatus = document.getElementById('poll-status');
   const errorBox = document.getElementById('queue-error');
   const blocked = (state) => state.eligibility.registration !== null ||
@@ -487,6 +508,7 @@ const QUEUED_SCRIPT: &str = r#"
       const matched = state.eligibility.active_formation;
       if (matched) return window.location.assign('/match/' + encodeURIComponent(matched));
       if (!state.queued || blocked(state)) return window.location.reload();
+      if (queueTotal) queueTotal.textContent = `${state.queue_total ?? 0}人`;
       inRange.textContent = `${state.in_range ?? 0}人`;
       for (const entry of state.in_range_by_first_choice ?? []) {
         const cell = document.querySelector(`[data-count="${entry.role}"]`);
@@ -561,6 +583,7 @@ mod tests {
         StatusView {
             queued: false,
             entry: None,
+            queue_total: Some(9),
             in_range: Some(4),
             // 4 人ぶんの内訳。タンクは 0 人（0 も出ることを画面のテストで見る）
             in_range_by_first_choice: vec![
@@ -627,6 +650,24 @@ mod tests {
         assert!(rendered.contains("上下 ±50（固定）"));
         assert!(rendered.contains("キューを離脱"));
         assert!(rendered.contains("setInterval(poll, 10000)"));
+        // **全体と範囲内を 2 つ並べる。**「範囲内 4 人」だけだと、
+        // 待たされているのが人数不足なのかレート帯の偏りなのか分からない
+        assert!(rendered.contains("全体でキュー中"), "{rendered}");
+        assert!(
+            rendered.contains("id=\"queue-total\" class=\"metric-value\">9人"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("範囲内でキュー中"), "{rendered}");
+        assert!(
+            rendered.contains("id=\"in-range\" class=\"metric-value\">4人"),
+            "{rendered}"
+        );
+        // 全体が先、範囲内が後（狭い方へ絞り込む順に読ませる）
+        let total_at = rendered.find("全体でキュー中").expect("全体");
+        let range_at = rendered.find("範囲内でキュー中").expect("範囲内");
+        assert!(total_at < range_at, "{rendered}");
+        // ポーリングでも両方が更新される
+        assert!(rendered.contains("state.queue_total"), "{rendered}");
     }
 
     #[test]
@@ -654,6 +695,13 @@ mod tests {
         assert!(rendered.contains("vc3-red"));
         assert!(rendered.contains("登録画面へ"));
         assert!(rendered.contains("報告ボタン"));
+        // **未報告のゲートで行き止まりにしない。**Discord のボタンを押し忘れたまま
+        // VC を出た人には、この画面から辿れる経路しか残らない
+        assert!(rendered.contains("マッチ画面で報告する"), "{rendered}");
+        assert!(
+            rendered.contains("href=\"/match/00000000-0000-0000-0000-000000000009\""),
+            "未報告の試合へのリンクが無い: {rendered}"
+        );
     }
 
     /// 成立は**朗報として見せる**。ゲートの判定も `data-view` も変えず、見た目だけ分ける。
