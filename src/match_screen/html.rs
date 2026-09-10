@@ -45,6 +45,8 @@ const MATCH_STYLES: &str = r#"
 .button-blue:hover { background: #191d2a; }
 .code-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; margin-top: 16px; }
 .code-form input { min-width: 0; }
+.quiet-notes { margin: 10px 0 0; padding-left: 1.25rem; }
+.quiet-notes li { padding: 3px 0; }
 .poll-status { min-height: 1.5em; margin-top: 14px; color: var(--danger); font-size: 0.875rem; }
 @media (max-width: 600px) {
   .teams { grid-template-columns: 1fr; }
@@ -222,6 +224,10 @@ fn stage_block(view: &MatchView) -> String {
         }
         _ => {}
     }
+    // **聞き専報告は勝敗報告の上に置く。**確定後にだけ出る（確定前は入口ごと無い）
+    if view.actions.quiet_report {
+        block.push_str(&quiet_report_block(view));
+    }
     if view.actions.report {
         block.push_str(REPORT_BLOCK);
     } else if view.i_reported && !view.stage.is_closed() {
@@ -246,6 +252,56 @@ impl StageView {
             Self::Nullified | Self::Voided | Self::Abandoned | Self::Confirmed { .. }
         )
     }
+}
+
+/// 聞き専報告の入口。**確定後にだけ出す。**
+///
+/// **票数も閾値も書かない。**「一定以上の報告で −1」としか書かないのは、
+/// 「あと何票で成立するか」を逆算させないため（docs/09: サーバー側でそもそも送らない）。
+/// 味方だけが対象なので、選べるのは同じチームのメンバーだけである。
+fn quiet_report_block(view: &MatchView) -> String {
+    if view.actions.quiet_reported {
+        return String::from(
+            "<section class=\"section\" aria-labelledby=\"quiet-title\">\n\
+             <h2 id=\"quiet-title\">聞き専の報告</h2>\n\
+             <div class=\"notice\"><p><strong>受け付けました。</strong>\
+             同じ試合で追加の報告はできません。</p>\n\
+             <p class=\"fine-print\">何票入っているかは表示されません。</p></div>\n\
+             </section>\n",
+        );
+    }
+    let options = view
+        .teammates
+        .iter()
+        .filter(|teammate| !teammate.is_me)
+        .map(|teammate| {
+            format!(
+                "<option value=\"{id}\">{name}（{role}）</option>\n",
+                id = escape(&teammate.player_id.to_string()),
+                name = escape(&teammate.trainer_name),
+                role = escape(&teammate.role),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"section\" aria-labelledby=\"quiet-title\">\n\
+         <h2 id=\"quiet-title\">聞き専の報告</h2>\n\
+         <p class=\"field-help\">VC で発言せず、指示にも従わなかった味方がいた場合に報告できます。\
+         一定以上の報告が集まると、その人のレートが 1 下がります。</p>\n\
+         <ul class=\"fine-print quiet-notes\">\n\
+         <li><strong>通報の義務はありません。</strong>聞き専でも活躍していたと判断した場合は、\
+         報告しなくて構いません。個人の判断に任せます。</li>\n\
+         <li>運営が通報履歴を確認しています。聞き専以外の理由による報告が散見される場合、\
+         <strong>報告した側にペナルティが付与されます</strong>。</li>\n\
+         <li>同じ試合で報告できるのは 1 回だけです。取り消しはできません。</li>\n\
+         </ul>\n\
+         <div class=\"field\"><label for=\"quiet-target\">対象（味方チーム）</label>\n\
+         <select id=\"quiet-target\">\n\
+         <option value=\"\">選択しない</option>\n{options}</select></div>\n\
+         <div class=\"actions\">\
+         <button id=\"quiet-submit\" class=\"button-secondary\" type=\"button\">聞き専として報告する</button>\
+         </div>\n</section>\n"
+    )
 }
 
 const REPORT_BLOCK: &str = "<section class=\"section\" aria-labelledby=\"report-title\">\n\
@@ -459,6 +515,13 @@ const POLL_SCRIPT: &str = r#"
     const value = input ? input.value.trim() : '';
     if (!value) { showError('ルーム ID を入力してください。'); return; }
     send('/room-code', { room_code: value });
+  });
+  // 聞き専報告。**選んだ相手だけを送る。**票数も閾値もクライアントには無い
+  click('quiet-submit', () => {
+    const select = document.getElementById('quiet-target');
+    const target = select ? select.value : '';
+    if (!target) { showError('対象を選んでください。'); return; }
+    send('/quiet-report', { target });
   });
 
   // 状態が変わったら描き直す。判定や他人の状況を JS 側で組み立てない

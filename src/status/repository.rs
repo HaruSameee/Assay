@@ -18,8 +18,14 @@ pub struct MatchHistoryEntry {
     pub team: String,
     /// 自分から見た結果。
     pub result: MatchResult,
-    /// その試合での増減（表示スケール）。
+    /// その試合での増減（表示スケール）。**聞き専ペナルティは含まない。**
     pub delta: f64,
+    /// その試合で受けた聞き専ペナルティ（表示スケール）。受けていなければ 0。
+    ///
+    /// **試合の増減とは別の列に出す。**±7 の系で −8 が出ると説明できない数字になり、
+    /// 合算しないと履歴の合計と現在レートが一致しなくなる。ペナルティは一律 −1 なので、
+    /// ここから読めるのは「閾値に達した」ことだけで、**何票入ったかは分からない**。
+    pub penalty: f64,
     /// 試合開始時点の自分のレート（表示スケール、`mu_at_match * 60`）。
     pub rating_at_start: f64,
     /// どの formation か。画面には出さないが照合用に持つ。
@@ -74,9 +80,12 @@ impl StatusRepository {
         let rows = sqlx::query!(
             "select d.formation_id as \"formation_id!\", d.team as \"team!\", \
                     d.outcome as \"outcome!\", d.own_rating as \"own_rating!\", \
-                    d.delta as \"delta!\", f.created_at as \"played_at!\" \
+                    d.delta as \"delta!\", f.created_at as \"played_at!\", \
+                    coalesce(q.delta, 0::double precision) as \"penalty!\" \
              from player_match_rating_deltas d \
              join formations f on f.id = d.formation_id \
+             left join quiet_report_penalties q \
+                 on q.formation_id = d.formation_id and q.player_id = d.player_id \
              where d.player_id = $1 \
              order by f.created_at desc, d.formation_id desc \
              limit $2",
@@ -99,6 +108,7 @@ impl StatusRepository {
                     team,
                     result,
                     delta: row.delta,
+                    penalty: row.penalty,
                     rating_at_start: row.own_rating,
                     formation_id: FormationId(row.formation_id),
                 }

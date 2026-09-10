@@ -337,6 +337,12 @@ pub fn parse_formation_id(raw: &str) -> Option<FormationId> {
     Uuid::parse_str(raw.trim()).ok().map(FormationId)
 }
 
+/// リクエストボディの対象プレイヤー。**存在確認はしない**——参加者かどうかは
+/// 追記側が `formation_players` と突き合わせて判定する。
+pub fn parse_player_id(raw: &str) -> Option<PlayerId> {
+    Uuid::parse_str(raw.trim()).ok().map(PlayerId)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};

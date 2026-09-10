@@ -5,6 +5,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use serenity::http::Http;
 use serenity::model::id::UserId;
 use sqlx::postgres::PgPoolOptions;
@@ -29,6 +30,7 @@ use unite_matchsystem::profiles::{ProfileRepository, ProfileState, router as pro
 use unite_matchsystem::queue::{
     DOWN_RANGE, QueueRepository, QueueState, UP_RANGE, router as queue_router,
 };
+use unite_matchsystem::quiet::{QuietReportConfig, QuietReportRepository};
 use unite_matchsystem::ranking::{
     RANKING_PUBLIC, RankingRepository, RankingState, ranking_is_public, router as ranking_router,
 };
@@ -129,6 +131,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
         Err(error) => {
             warn!(%error, "could not read the rating params in effect");
+        }
+    }
+    // 聞き専報告。閾値は環境変数が正だが、レートの合算は player_current_ratings 1 か所に
+    // 集約してあるので、判定に使う閾値も SQL から見えるよう起動時に同期する
+    let quiet_repo = QuietReportRepository::new(pool.clone());
+    let quiet_config = QuietReportConfig::from_env()?;
+    match quiet_repo.sync_thresholds(quiet_config, Utc::now()).await {
+        Ok(changed) => info!(
+            quiet_winner_threshold = quiet_config.winner_threshold,
+            quiet_loser_threshold = quiet_config.loser_threshold,
+            appended = changed,
+            "quiet report thresholds in effect"
+        ),
+        Err(error) => {
+            // 同期できないと過去の閾値のまま判定される。黙って進めない
+            error!(%error, "could not sync the quiet report thresholds");
+            return Err(error.into());
         }
     }
     let block_repo = BlockRepository::new(pool.clone());
@@ -235,6 +254,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             auth_config.clone(),
             repo,
             MatchRepository::new(match_pool),
+            quiet_repo.clone(),
             lifecycle.clone(),
             &room_map,
             &room_checklist,
@@ -273,6 +293,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ids,
                 admin_store,
                 block_repo,
+                quiet_repo,
             )))
         }
         None => {

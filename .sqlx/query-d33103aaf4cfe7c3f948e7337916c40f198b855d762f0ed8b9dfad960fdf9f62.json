@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into quiet_report_param_changes (winner_threshold, loser_threshold, source, created_at) values ($1, $2, 'environment', $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d33103aaf4cfe7c3f948e7337916c40f198b855d762f0ed8b9dfad960fdf9f62"
+}

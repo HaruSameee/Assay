@@ -18,6 +18,7 @@ use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
 };
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
+use crate::quiet::{QuietReportRow, QuietReporterTally};
 
 /// 検索画面に渡すデータ。
 #[derive(Debug, Clone)]
@@ -470,12 +471,13 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/queue", "キューと運用"),
         link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
         link("/admin/rating-params", "レート増減幅"),
+        link("/admin/quiet-reports", "聞き専報告"),
     )
 }
 
@@ -1042,6 +1044,121 @@ pub fn rating_params_page(view: &RatingParamsView<'_>) -> String {
         ),
     )
 }
+
+// ----------------------------------------------------------------------
+// 聞き専報告（運営だけが見る）
+// ----------------------------------------------------------------------
+//
+// **ここが票数を見られる唯一の画面。**プレイヤー向けの経路には票数も閾値も出ない。
+
+pub struct QuietReportsView<'a> {
+    /// プレイヤーごとの集計。**報告した数の多い順**（乱用の検出）。
+    pub tallies: &'a [QuietReporterTally],
+    /// 誰が誰を報告したかの履歴（新しい順）。
+    pub history: &'a [QuietReportRow],
+    /// いま効いている閾値。**運営にだけ出す。**
+    pub winner_threshold: i32,
+    pub loser_threshold: i32,
+    pub notice: Option<Notice>,
+}
+
+/// 勝ち負けの表記。確定していない・勝敗が無い試合は「—」。
+fn reporter_side(won: Option<bool>) -> &'static str {
+    match won {
+        Some(true) => "勝ち",
+        Some(false) => "<strong>負け</strong>",
+        None => "—",
+    }
+}
+
+pub fn quiet_reports_page(view: &QuietReportsView<'_>) -> String {
+    let tallies = if view.tallies.is_empty() {
+        String::from("<p class=\"muted\">まだ聞き専報告はありません。</p>\n")
+    } else {
+        let rows = view
+            .tallies
+            .iter()
+            .map(|row| {
+                format!(
+                    "<tr><td>{name}</td>\
+                     <td class=\"num\">{made}</td><td class=\"num\">{losing}</td>\
+                     <td class=\"num\">{received}</td><td class=\"num\">{penalties}</td></tr>\n",
+                    name = escape(row.trainer_name.as_deref().unwrap_or("（未設定）")),
+                    made = row.reports_made,
+                    losing = row.made_while_losing,
+                    received = row.reports_received,
+                    penalties = row.penalties,
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"table-wrap\"><table class=\"log\">\n\
+             <thead><tr><th>プレイヤー</th><th>報告した数</th><th>うち負け試合</th>\
+             <th>報告された数</th><th>ペナルティ成立</th></tr></thead>\n\
+             <tbody>\n{rows}</tbody>\n</table></div>\n"
+        )
+    };
+
+    let history = if view.history.is_empty() {
+        String::new()
+    } else {
+        let rows = view
+            .history
+            .iter()
+            .map(|row| {
+                format!(
+                    "<tr><td>{at}</td><td>{reporter}</td><td>{side}</td>\
+                     <td>{target}</td><td>{penalised}</td><td class=\"mono\">{formation}</td></tr>\n",
+                    at = escape(&display_time(row.reported_at)),
+                    reporter = escape(row.reporter_name.as_deref().unwrap_or("（未設定）")),
+                    side = reporter_side(row.reporter_won),
+                    target = escape(row.target_name.as_deref().unwrap_or("（未設定）")),
+                    penalised = if row.penalised { "成立" } else { "—" },
+                    formation = escape(&row.formation_id.simple().to_string()[..8]),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<h2>報告の履歴</h2>\n\
+             <div class=\"table-wrap\"><table class=\"log\">\n\
+             <thead><tr><th>時刻</th><th>報告した人</th><th>その試合</th>\
+             <th>報告された人</th><th>ペナルティ</th><th>試合</th></tr></thead>\n\
+             <tbody>\n{rows}</tbody>\n</table></div>\n"
+        )
+    };
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / 聞き専報告",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-quiet-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-quiet-title\">聞き専報告</h1>\n\
+             {nav}\
+             {notice}\
+             <p class=\"lead\">誰が誰を報告したかは<strong>この画面からしか読めません</strong>。\
+             プレイヤー側の画面にも API にも、票数・閾値・報告の内容は出ません。</p>\n\
+             <p class=\"notice\">現在の閾値: 勝ちチームからの報告 <strong>{winner}</strong> 票 / \
+             負けチームからの報告 <strong>{loser}</strong> 票。\
+             負けチームは対象者を除くと 4 人しか報告できないため、\
+             {loser} 票は満場一致にあたります。閾値は環境変数で変えられ、\
+             変更すると過去の試合も新しい閾値で再判定されます。</p>\n\
+             <h2>プレイヤーごとの集計</h2>\n\
+             <p class=\"field-help\"><strong>報告した数の多い順</strong>に並べています。\
+             負け試合でしか報告していない人は「うち負け試合」が「報告した数」と同じになります。</p>\n\
+             {tallies}\
+             {history}\
+             </section>\n",
+            nav = admin_nav("/admin/quiet-reports"),
+            notice = notice_html(view.notice.as_ref()),
+            winner = view.winner_threshold,
+            loser = view.loser_threshold,
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};

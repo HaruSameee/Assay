@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::blocks::{AdminBlockOverrideError, BlockRepository};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::{Outcome, Team};
+use crate::quiet::QuietReportRepository;
 use crate::registration::html::error_page;
 use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
@@ -37,9 +38,9 @@ use super::actions::{
 };
 use super::config::AdminIds;
 use super::html::{
-    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, RatingParamsView, ReportsView,
-    SearchView, SeasonView, player_page, queue_page, rating_params_page, reports_page, search_page,
-    season_page,
+    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView, RatingParamsView,
+    ReportsView, SearchView, SeasonView, player_page, queue_page, quiet_reports_page,
+    rating_params_page, reports_page, search_page, season_page,
 };
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
@@ -63,6 +64,8 @@ pub struct AdminState {
     ids: AdminIds,
     pub store: AdminRepository,
     pub blocks: BlockRepository,
+    /// 聞き専報告。**運営パネルだけがこれを読む**（票数と閾値を見られる唯一の経路）。
+    pub quiet: QuietReportRepository,
 }
 
 impl AdminState {
@@ -71,6 +74,7 @@ impl AdminState {
         ids: AdminIds,
         store: AdminRepository,
         blocks: BlockRepository,
+        quiet: QuietReportRepository,
     ) -> Self {
         let key = config.cookie_key();
         Self {
@@ -79,6 +83,7 @@ impl AdminState {
             ids,
             store,
             blocks,
+            quiet,
         }
     }
 }
@@ -118,6 +123,8 @@ pub fn router(state: AdminState) -> Router {
             get(show_rating_params).post(change_rating_params),
         )
         .route("/admin/rating-params/confirm", post(confirm_rating_params))
+        // 聞き専報告。**閲覧だけ**（運営が代理で入れる経路は作らない）
+        .route("/admin/quiet-reports", get(show_quiet_reports))
         .route("/admin/season/confirm", post(confirm_season))
         .with_state(state)
 }
@@ -1251,4 +1258,53 @@ async fn change_rating_params(
         }
     };
     render_rating_params(&app, None, Some(notice), None).await
+}
+
+// ----------------------------------------------------------------------
+// 聞き専報告（閲覧のみ）
+// ----------------------------------------------------------------------
+//
+// **ここが票数と閾値を見られる唯一の画面。**入力の経路は作らない
+// （報告はプレイヤーがマッチ画面から出すもので、運営が代理で入れるものではない）。
+
+/// 一覧に出す件数の上限。
+const QUIET_HISTORY_LIMIT: i64 = 200;
+const QUIET_TALLY_LIMIT: i64 = 200;
+
+async fn show_quiet_reports(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    let tallies = match app.quiet.admin_tallies(QUIET_TALLY_LIMIT).await {
+        Ok(tallies) => tallies,
+        Err(err) => {
+            error!(%err, "could not read the quiet report tallies");
+            return internal_error();
+        }
+    };
+    let history = match app.quiet.admin_history(QUIET_HISTORY_LIMIT).await {
+        Ok(history) => history,
+        Err(err) => {
+            error!(%err, "could not read the quiet report history");
+            return internal_error();
+        }
+    };
+    let thresholds = match app.quiet.thresholds().await {
+        Ok(thresholds) => thresholds,
+        Err(err) => {
+            error!(%err, "could not read the quiet report thresholds");
+            return internal_error();
+        }
+    };
+    Html(quiet_reports_page(&QuietReportsView {
+        tallies: &tallies,
+        history: &history,
+        winner_threshold: thresholds.winner_threshold,
+        loser_threshold: thresholds.loser_threshold,
+        notice: None,
+    }))
+    .into_response()
 }

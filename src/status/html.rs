@@ -110,6 +110,7 @@ pub fn status_page(viewer: Viewer, view: &StatusView) -> String {
              <td><span class=\"badge {badge}\">{team}</span></td>\
              <td class=\"{result_class}\">{result}</td>\
              <td class=\"{delta_class}\">{delta}</td>\
+             <td class=\"{penalty_class}\">{penalty}</td>\
              <td>{rating_at_start:.0}</td></tr>\n",
             played_at = played_at,
             badge = badge,
@@ -118,6 +119,18 @@ pub fn status_page(viewer: Viewer, view: &StatusView) -> String {
             result = result_label(entry.result),
             delta_class = delta_class(entry.delta),
             delta = format_delta(entry.delta),
+            // **試合の増減とは別の列に出す。**合算しない（±7 の系で −8 は説明できない）。
+            // 一律 −1 なので、ここから読めるのは「閾値に達した」ことだけ
+            penalty_class = if entry.penalty < 0.0 {
+                "delta-loss"
+            } else {
+                "muted"
+            },
+            penalty = if entry.penalty < 0.0 {
+                format_delta(entry.penalty)
+            } else {
+                String::from("—")
+            },
             rating_at_start = entry.rating_at_start,
         ));
     }
@@ -129,7 +142,8 @@ pub fn status_page(viewer: Viewer, view: &StatusView) -> String {
         format!(
             "<div class=\"table-wrap\"><table class=\"history\">\n\
              <thead><tr><th>日時</th><th>チーム</th><th>結果</th><th>増減</th>\
-             <th>試合時点のレート</th></tr></thead>\n<tbody>\n{rows}</tbody>\n</table></div>\n"
+             <th>ペナルティ</th><th>試合時点のレート</th></tr></thead>\n\
+             <tbody>\n{rows}</tbody>\n</table></div>\n"
         )
     };
 
@@ -190,6 +204,7 @@ mod tests {
             team: team.to_owned(),
             result,
             delta,
+            penalty: 0.0,
             rating_at_start: 1500.0,
             formation_id: FormationId(Uuid::from_u128(1)),
         }

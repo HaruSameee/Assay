@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select e.payload->>'outcome' as \"outcome?\" from formation_events e where e.formation_id = $1 and e.kind = 'confirmed' order by e.id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "outcome?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "eb7db3986995179c1cb807a5a5ea8e096eba78d03c1f7524c6ddcc88465346cf"
+}

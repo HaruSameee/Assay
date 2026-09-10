@@ -35,6 +35,7 @@ use unite_matchsystem::match_screen::{MatchRepository, MatchState, router};
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team,
 };
+use unite_matchsystem::quiet::QuietReportRepository;
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
 use unite_matchsystem::registration::{AuthConfig, site_base_url};
 use uuid::Uuid;
@@ -110,6 +111,7 @@ impl AppDb {
             config(),
             self.formations.clone(),
             self.matches.clone(),
+            QuietReportRepository::new(self.pool.clone()),
             LifecycleConfig::default(),
             "kyogre",
             &["大会モード".to_owned()],
