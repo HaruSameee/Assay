@@ -6,7 +6,7 @@ use crate::lifecycle::{FormationId, Timestamp};
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page_with_styles};
 
-use super::model::{RolePreference, UP_RANGE};
+use super::model::RolePreference;
 use super::routes::{EntryView, RegistrationBlockView, StatusView};
 
 const QUEUE_STYLES: &str = r#"
@@ -186,14 +186,15 @@ fn unqueued_page(
          <div class=\"field\"><label for=\"role-2\">第2希望</label>\n<select id=\"role-2\">{second}</select></div>\n\
          <div class=\"field\"><label for=\"role-3\">第3希望</label>\n<select id=\"role-3\"{third_disabled}>{third}</select></div>\n\
          </div>\n</fieldset>\n\
-         <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上下 ±{range} 固定です。\
+         <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上 +{up} / 下 -{down} です。\
          現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p>\n\
          {breakdown}</div>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button type=\"submit\">キューに入る</button></div>\n\
          </form>\n<p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
-        range = UP_RANGE,
+        up = status.up_range,
+        down = status.down_range,
         reported = reported_notice(reported),
         breakdown = first_choice_breakdown(status),
         removal = removal_notice(status),
@@ -560,6 +561,8 @@ mod tests {
     fn status() -> StatusView {
         StatusView {
             queued: false,
+            up_range: 50,
+            down_range: 50,
             entry: None,
             in_range: Some(4),
             // 4 人ぶんの内訳。タンクは 0 人（0 も出ることを画面のテストで見る）
@@ -590,10 +593,10 @@ mod tests {
             assert!(rendered.contains(&format!("value=\"{role}\"")));
             assert!(rendered.contains(label));
         }
-        // 調整UIは無い。範囲は固定であることだけを書く
+        // 調整UIは無い。プレイヤーは幅を変えられない（運営だけが管理パネルから変える）
         assert!(!rendered.contains("type=\"range\""), "スライダーを出さない");
         assert!(!rendered.contains("down-range"), "{rendered}");
-        assert!(rendered.contains("マッチング範囲は上下 ±50 固定です"));
+        assert!(rendered.contains("マッチング範囲は上 +50 / 下 -50 です"));
         assert!(rendered.contains("現在この範囲内でキュー中"));
         assert!(rendered.contains("document.hidden"));
         assert!(rendered.contains("setInterval(preview, 10000)"));

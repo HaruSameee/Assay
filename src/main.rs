@@ -28,7 +28,7 @@ use unite_matchsystem::matchmaker::{
 use unite_matchsystem::persistence::{FormationRepository, VcAssignment};
 use unite_matchsystem::profiles::{ProfileRepository, ProfileState, router as profile_router};
 use unite_matchsystem::queue::{
-    DOWN_RANGE, QueueRepository, QueueState, UP_RANGE, router as queue_router,
+    DEFAULT_DOWN_RANGE, DEFAULT_UP_RANGE, QueueRepository, QueueState, router as queue_router,
 };
 use unite_matchsystem::quiet::{QuietReportConfig, QuietReportRepository};
 use unite_matchsystem::ranking::{
@@ -99,8 +99,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         default_rating_params_version = RATING_PARAMS_VERSION,
         default_base_delta = BASE_DELTA,
         matchmaking_params_version = MATCHMAKING_PARAMS_VERSION,
-        down_range = DOWN_RANGE,
-        up_range = UP_RANGE,
+        default_down_range = DEFAULT_DOWN_RANGE,
+        default_up_range = DEFAULT_UP_RANGE,
         "compiled-in params defaults"
     );
 
@@ -131,6 +131,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
         Err(error) => {
             warn!(%error, "could not read the rating params in effect");
+        }
+    }
+    // **いま実際に効いているマッチング範囲。**こちらも管理パネルの最新行から導出する
+    match admin_store.matching_ranges().await {
+        Ok(ranges) => info!(
+            up_range = ranges.up,
+            down_range = ranges.down,
+            source = if ranges == unite_matchsystem::queue::MatchingRanges::default() {
+                "compiled-in default"
+            } else {
+                "matching_range_changes (admin panel)"
+            },
+            "matching ranges in effect"
+        ),
+        Err(error) => {
+            warn!(%error, "could not read the matching ranges in effect");
         }
     }
     // 聞き専報告。閾値は環境変数が正だが、レートの合算は player_current_ratings 1 か所に

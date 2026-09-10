@@ -35,8 +35,7 @@ use crate::registration::{
 };
 
 use super::model::{
-    QueueEntry, QueueRequestError, RolePreference, StaffRemoval, UP_RANGE, VoiceDestination,
-    validate_request,
+    QueueEntry, QueueRequestError, RolePreference, StaffRemoval, VoiceDestination, validate_request,
 };
 use super::repository::{QueueError, QueueRepository};
 
@@ -206,7 +205,7 @@ impl From<QueueEntry> for EntryView {
             enqueued_at: entry.enqueued_at.to_rfc3339(),
             updated_at: entry.updated_at.to_rfc3339(),
             down_range: entry.down_range,
-            up_range: UP_RANGE,
+            up_range: entry.up_range,
             roles: entry.roles,
         }
     }
@@ -217,11 +216,17 @@ impl From<QueueEntry> for EntryView {
 pub(super) struct StatusView {
     /// キュー中か。
     pub(super) queued: bool,
+    /// 現在の上方向のマッチング範囲。**運営が変えられる**（本人は変えられない）。
+    ///
+    /// キューに入る前の画面にも出すので、`entry` とは別に持つ。
+    pub(super) up_range: i32,
+    /// 現在の下方向のマッチング範囲。
+    pub(super) down_range: i32,
     /// 自分のエントリ。キュー中でなければ `null`。
     pub(super) entry: Option<EntryView>,
     /// 自分の範囲内でキュー中の人数（相互条件、07 §3-1）。
     ///
-    /// 範囲は上下 50 固定なので、キューに入る前でも決まる（読み取りに失敗したときだけ `null`）。
+    /// 範囲は本人が変えられないので、キューに入る前でも決まる（読み取りに失敗したときだけ `null`）。
     pub(super) in_range: Option<usize>,
     /// その内訳。**第1希望がそのロールの人の数**で、15 分サマリと同じ定義。
     /// 5 ロールすべてを返す（0 人でも 0。出ないと「集計されていない」と読まれる）。
@@ -518,8 +523,16 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
                 .collect()
         })
         .unwrap_or_default();
+    let ranges = app
+        .queue
+        .ranges()
+        .await
+        .inspect_err(|error| error!(%error, "could not read the matching ranges"))
+        .ok()?;
     Some(StatusView {
         queued: entry.is_some(),
+        up_range: ranges.up,
+        down_range: ranges.down,
         entry: entry.map(EntryView::from),
         in_range: in_range.map(|summary| summary.total),
         in_range_by_first_choice,

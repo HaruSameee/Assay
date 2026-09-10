@@ -14,8 +14,6 @@
 use crate::lifecycle::PlayerId;
 use crate::matchmaker::FirstChoiceRoleCounts;
 
-use super::model::UP_RANGE;
-
 /// 範囲判定に必要な、キュー中プレイヤー1人分の値。
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedPlayer {
@@ -23,7 +21,12 @@ pub struct QueuedPlayer {
     pub player_id: PlayerId,
     /// 表示スケールのレート（導出値）。
     pub rating: f64,
-    /// 下方向の幅。いまは 50 固定（`clamp_down_range` を通した値が入る）。
+    /// 上方向の幅。運営が変えられる（`current_matching_ranges.up_range`）。
+    ///
+    /// 全員に同じ値が入る。それでも 1 人ずつ持たせているのは、**片方向の判定を
+    /// 残してある**のと同じ理由で、上下が非対称になったときにここだけで直せるため。
+    pub up_range: i32,
+    /// 下方向の幅（[`crate::queue::MatchingRanges::clamp_down`] を通した値が入る）。
     pub down_range: i32,
     /// 第1希望のロール（`roles.id`）。希望が 1 つも無ければ `None`。
     ///
@@ -40,7 +43,7 @@ pub struct QueuedPlayer {
 /// **境界を含む。**`other.rating` が `viewer.rating ± 50` ちょうどでも範囲内
 /// （比較は `>=` / `<=`）。
 pub fn accepts(viewer: &QueuedPlayer, other: &QueuedPlayer) -> bool {
-    let upper = viewer.rating + f64::from(UP_RANGE);
+    let upper = viewer.rating + f64::from(viewer.up_range);
     let lower = viewer.rating - f64::from(viewer.down_range);
     other.rating >= lower && other.rating <= upper
 }
@@ -88,13 +91,14 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::queue::model::DOWN_RANGE;
+    use crate::queue::model::{DEFAULT_DOWN_RANGE, DEFAULT_UP_RANGE};
 
     fn player(n: u128, rating: f64) -> QueuedPlayer {
         QueuedPlayer {
             player_id: PlayerId(Uuid::from_u128(n)),
             rating,
-            down_range: DOWN_RANGE,
+            up_range: DEFAULT_UP_RANGE,
+            down_range: DEFAULT_DOWN_RANGE,
             first_choice: None,
         }
     }
@@ -176,6 +180,7 @@ mod tests {
     fn an_unclamped_wide_value_still_cannot_widen_the_pair() {
         let wide = QueuedPlayer {
             player_id: PlayerId(Uuid::from_u128(1)),
+            up_range: DEFAULT_UP_RANGE,
             rating: 1600.0,
             down_range: 200,
             first_choice: None,

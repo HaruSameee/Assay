@@ -17,9 +17,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::matching_range::{MatchingRangeChange, MatchingRangeOutcome, MatchingRangePreview};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
-use crate::queue::model::clamp_down_range;
+use crate::queue::MatchingRanges;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
 use super::rating_params::{
@@ -472,6 +473,9 @@ impl AdminRepository {
         )
         .fetch_all(&self.pool)
         .await?;
+        // 幅は**この一覧につき 1 回だけ**読む。行ごとに読み直すと、運営が
+        // 途中で変えたときに同じ表の中で丸め先が食い違う
+        let ranges = self.matching_ranges().await?;
         let mut by_entry: HashMap<Uuid, Vec<QueuedRole>> = HashMap::new();
         for wish in wishes {
             by_entry.entry(wish.entry_id).or_default().push(QueuedRole {
@@ -487,7 +491,7 @@ impl AdminRepository {
                 discord_user_id: row.discord_user_id,
                 trainer_name: row.trainer_name,
                 enqueued_at: row.enqueued_at,
-                down_range: clamp_down_range(row.down_range),
+                down_range: ranges.clamp_down(row.down_range),
                 rating: row.rating,
                 roles: by_entry.remove(&row.entry_id).unwrap_or_default(),
             })
@@ -810,6 +814,130 @@ impl AdminRepository {
         Ok(counts)
     }
 }
+// ----------------------------------------------------------------------
+// マッチング範囲の変更
+// ----------------------------------------------------------------------
+//
+// **現在値のテーブルは作らない。**幅は `matching_range_changes` の最新行から
+// 導出する（`current_matching_ranges`）。
+//
+// 増減幅（`rating_param_changes`）と違い、**過去の試合は 1 件も変わらない。**
+// 幅が効くのは次のスキャン以降の選抜だけなので、「進行中の formation があれば
+// 拒否する」ガードは置いていない。代わりにスキャンと同じ advisory lock を取り、
+// 1 回の選抜の途中で幅が入れ替わらないようにする。
+
+/// 追記する変更 1 件。
+#[derive(Debug, Clone)]
+pub struct NewMatchingRange {
+    /// 新しい幅。**検証済みの値を渡すこと**（`admin::parse_ranges`）。
+    pub ranges: MatchingRanges,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// いま効いている幅。**最新行から導出する**（保存された現在値ではない）。
+    pub async fn matching_ranges(&self) -> Result<MatchingRanges, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        crate::persistence::repository::matching_ranges(&mut conn).await
+    }
+
+    /// 変更画面に出す値。**毎回数え直す**（保存しない）。
+    pub async fn matching_range_preview(&self) -> Result<MatchingRangePreview, sqlx::Error> {
+        let current = self.matching_ranges().await?;
+        let queued = sqlx::query_scalar!("select count(*) as \"count!\" from queue_entries")
+            .fetch_one(&self.pool)
+            .await?;
+        let history = sqlx::query!(
+            "select id, up_range as \"up_range!\", down_range as \"down_range!\", \
+                    reason, created_by, created_at \
+             from matching_range_changes order by id desc limit 20"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(MatchingRangePreview {
+            current,
+            queued: usize::try_from(queued).unwrap_or(0),
+            history: history
+                .into_iter()
+                .map(|row| MatchingRangeChange {
+                    id: row.id,
+                    up_range: row.up_range,
+                    down_range: row.down_range,
+                    reason: row.reason,
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                })
+                .collect(),
+        })
+    }
+
+    /// 幅の変更を追記する。
+    ///
+    /// **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+    /// 先頭で同じ advisory lock を取り、その中で幅を 1 回だけ読む（07 §4-1）。
+    /// ここでも同じロックを取るので、走っているスキャンは**古い幅で最後まで走りきる**か、
+    /// **新しい幅で始まる**かのどちらかになる。途中で入れ替わることはない。
+    pub async fn change_matching_range(
+        &self,
+        input: &NewMatchingRange,
+    ) -> Result<MatchingRangeOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        // ロックを取ってから読む。ここまで来た時点で、走っていたスキャンは commit 済み
+        let previous = crate::persistence::repository::matching_ranges(&mut tx).await?;
+
+        let inserted = sqlx::query_scalar!(
+            "insert into matching_range_changes \
+             (up_range, down_range, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.ranges.up,
+            input.ranges.down,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(MatchingRangeOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::MatchingRangeChanged,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "matching_range_change_id": id,
+                    "previous_up_range": previous.up,
+                    "previous_down_range": previous.down,
+                    "up_range": input.ranges.up,
+                    "down_range": input.ranges.down,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("matching_range:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(MatchingRangeOutcome::Changed { id })
+    }
+}
+
 // ----------------------------------------------------------------------
 // レート増減幅の変更
 // ----------------------------------------------------------------------

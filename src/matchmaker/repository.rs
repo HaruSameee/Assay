@@ -30,12 +30,12 @@ use crate::persistence::{
     Team, VcAssignment,
 };
 use crate::queue::flex::{RoleAssignment, flex_compensation_owed};
-use crate::queue::model::clamp_down_range;
+use crate::queue::model::MatchingRanges;
 use crate::rating::DISPLAY_SCALE;
 
 use super::select::{
     Candidate, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch, RoleWish,
-    select_matches_with_ally_blocks,
+    select_matches_within,
 };
 
 /// 1 回の実行の結果。
@@ -273,7 +273,13 @@ impl MatchmakerRepository {
         // 07 §4-1: 同時に複数のインスタンスが走らないこと。プール全体で 1 本
         crate::persistence::repository::lock_vc_pool(&mut tx).await?;
 
-        let candidates = load_candidates(&mut tx).await?;
+        // 07 §3: マッチング範囲は運営が変えられる（`current_matching_ranges`）。
+        // **このスキャンで読むのはここ 1 回だけ。**advisory lock を取った同じ
+        // トランザクションで読むので、運営の変更と選抜が同時に起きても、
+        // ロックがどちらか一方に決める。ループの中で読み直すと 1 回の選抜の
+        // 途中で基準がずれる。
+        let ranges = crate::persistence::repository::matching_ranges(&mut tx).await?;
+        let candidates = load_candidates(&mut tx, ranges).await?;
         let ally_blocks = load_active_ally_blocks(&mut tx, &candidates).await?;
         let mut outcome = RunOutcome {
             candidates: candidates.len(),
@@ -300,7 +306,7 @@ impl MatchmakerRepository {
             return Ok(outcome);
         }
 
-        let proposals = select_matches_with_ally_blocks(&candidates, &ally_blocks, now);
+        let proposals = select_matches_within(&candidates, &ally_blocks, now, ranges);
         if proposals.is_empty() {
             tx.commit().await?;
             return Ok(outcome);
@@ -678,7 +684,10 @@ fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -
 ///
 /// フレックス補償は `formation_players.role_was_flexed` から導出する
 /// （[`crate::queue::flex`]）。プレイヤーの可変列には持たない。
-async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, RepositoryError> {
+async fn load_candidates(
+    conn: &mut PgConnection,
+    ranges: MatchingRanges,
+) -> Result<Vec<Candidate>, RepositoryError> {
     let rows = sqlx::query!(
         "select q.id, q.player_id, q.down_range, q.enqueued_at, \
                 v.rating as \"rating!\", v.sigma as \"sigma!\", \
@@ -736,7 +745,7 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
                 player_id: PlayerId(row.player_id),
                 rating: row.rating,
                 sigma: row.sigma,
-                down_range: clamp_down_range(row.down_range),
+                down_range: ranges.clamp_down(row.down_range),
                 enqueued_at: row.enqueued_at,
                 roles: by_entry.remove(&row.id).unwrap_or_default(),
                 flex_compensation: flex_compensation_owed(&history),
@@ -787,7 +796,7 @@ mod tests {
 
     use super::*;
     use crate::matchmaker::select::{Candidate, MATCH_SIZE, ROLES, RoleWish, select_matches};
-    use crate::queue::model::DOWN_RANGE;
+    use crate::queue::model::DEFAULT_DOWN_RANGE;
 
     fn now() -> Timestamp {
         Utc.with_ymd_and_hms(2026, 9, 12, 21, 30, 0).unwrap()
@@ -821,7 +830,7 @@ mod tests {
                     )),
                     rating: 1500.0 + offset,
                     sigma: 500.0,
-                    down_range: DOWN_RANGE,
+                    down_range: DEFAULT_DOWN_RANGE,
                     enqueued_at: now() - TimeDelta::seconds(600),
                     roles: vec![RoleWish {
                         role: ROLES[index % ROLES.len()].to_owned(),

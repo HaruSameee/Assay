@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select up_range as \"up_range!\", down_range as \"down_range!\" from current_matching_ranges",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "up_range!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_matching_ranges",
+            "name": "up_range"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "down_range!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_matching_ranges",
+            "name": "down_range"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "661f7f025286a932251f2f1e1386ef52453c3674997d7e4dbd89799c3efe6cc3"
+}

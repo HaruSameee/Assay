@@ -13,30 +13,58 @@ use uuid::Uuid;
 
 use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 
-/// 上方向のマッチング範囲。**固定**。ユーザーは変更できない（07 §3）。
+/// 上方向のマッチング範囲の**既定値**（07 §3）。
 ///
-/// 高レート側が低レートだけを狙う設定を防ぐため、狭められない。列にしないのは、
-/// 保存すると「保存値と定数のどちらが正か」が後から分からなくなるため。
-pub const UP_RANGE: i32 = 50;
-/// 下方向のマッチング範囲。**固定**。上方向と同じ幅で、ユーザーは変更できない。
+/// ユーザーは変更できない。運営だけが管理パネルから変えられる
+/// （`matching_range_changes` の最新行が正。1 行も無ければこの値）。
+/// 高レート側が低レートだけを狙う設定を防ぐため、本人には触らせない。
+pub const DEFAULT_UP_RANGE: i32 = 50;
+/// 下方向のマッチング範囲の**既定値**。上方向と同じ幅。
 ///
-/// `queue_entries.down_range` の列は残してあるが、新しい行には必ずこの値を書く。
-/// 判定はこの定数を通した値（[`clamp_down_range`]）だけを使う。
-pub const DOWN_RANGE: i32 = 50;
+/// `queue_entries.down_range` には投入時点の現在値を書く。判定は
+/// [`MatchingRanges::clamp_down`] を通した値だけを使う。
+pub const DEFAULT_DOWN_RANGE: i32 = 50;
+/// マッチング範囲として受け付ける下限。これより狭いと 10 人が集まらない。
+pub const MIN_RANGE: i32 = 10;
+/// マッチング範囲として受け付ける上限。これより広いと事実上の無制限になる。
+pub const MAX_RANGE: i32 = 500;
 /// 希望ロールの最大数（07 §4-5）。
 pub const MAX_ROLE_PREFERENCES: usize = 3;
 
-/// 保存済みの下方向範囲を、現在の設定に丸める。**読み出し側で必ず通すこと。**
+/// 現在のマッチング範囲。**`current_matching_ranges` の 1 行に対応する。**
 ///
-/// 旧仕様（95〜200、のちに 30〜100）で入った行が `queue_entries` に残りうる。既存行を
-/// 一括 UPDATE すると、本人が設定した覚えのない値に書き換わるうえ、追記でない書き込みが
-/// 増える。DB の CHECK も `not valid` で足してあるので、**古い行は古い値のまま残る**のが
-/// 正しい状態で、丸めるのは読み出し側の責任。
-///
-/// いまは上下 50 固定なので、下限と上限が同じ値になる。範囲がまた可変になったときに
-/// ここだけ直せば済むよう、[`i32::clamp`] の形は保つ。
-pub fn clamp_down_range(stored: i32) -> i32 {
-    stored.clamp(DOWN_RANGE, DOWN_RANGE)
+/// マッチメイカは 1 スキャンにつき 1 回だけ読み、その 1 個をスキャン全体で使い回す。
+/// 途中で読み直さないので、運営が同時に幅を変えても 1 回の選抜の中では変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchingRanges {
+    /// 上方向の幅。アンカー（ウィンドウの下端）から上に何点までを同じ試合に入れるか。
+    pub up: i32,
+    /// 下方向の幅。投入時に `queue_entries.down_range` へ書く値でもある。
+    pub down: i32,
+}
+
+impl Default for MatchingRanges {
+    fn default() -> Self {
+        Self {
+            up: DEFAULT_UP_RANGE,
+            down: DEFAULT_DOWN_RANGE,
+        }
+    }
+}
+
+impl MatchingRanges {
+    /// 保存済みの下方向範囲を、現在の幅に丸める。**読み出し側で必ず通すこと。**
+    ///
+    /// 旧仕様（95〜200、のちに 30〜100、のちに 50 固定）で入った行が
+    /// `queue_entries` に残りうる。既存行を一括 UPDATE すると、本人が設定した覚えの
+    /// ない値に書き換わるうえ、追記でない書き込みが増える。DB の CHECK も
+    /// `not valid` で足してあるので、**古い行は古い値のまま残る**のが正しい状態で、
+    /// 丸めるのは読み出し側の責任。
+    ///
+    /// 上下は同じ幅とは限らないので、丸め先は `down` だけを見る。
+    pub fn clamp_down(&self, stored: i32) -> i32 {
+        stored.clamp(self.down, self.down)
+    }
 }
 
 /// `queue_entries.id`。
@@ -69,7 +97,9 @@ pub struct QueueEntry {
     pub enqueued_at: Timestamp,
     /// 設定を最後に変えた時刻。
     pub updated_at: Timestamp,
-    /// 下方向のマッチング範囲。
+    /// 上方向のマッチング範囲。**運営が変えられる**（本人は変えられない）。
+    pub up_range: i32,
+    /// 下方向のマッチング範囲。運営が変えた後は、読み出し時に現在の幅へ丸めた値。
     pub down_range: i32,
     /// 希望ロール。`priority` の昇順。
     pub roles: Vec<RolePreference>,
@@ -77,8 +107,9 @@ pub struct QueueEntry {
 
 /// 検証済みの投入リクエスト。DB へ渡せるのはこの型だけ。
 ///
-/// **マッチング範囲は持たない。**上下とも 50 固定で、ユーザーが送る値は無い
-/// （[`UP_RANGE`] / [`DOWN_RANGE`]）。
+/// **マッチング範囲は持たない。**ユーザーが送る値は無く、投入時点の
+/// `current_matching_ranges` を DB 側で書く（既定は [`DEFAULT_UP_RANGE`] /
+/// [`DEFAULT_DOWN_RANGE`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueRequest {
     /// 希望ロール。`priority` の昇順で 1..=n が詰まっている。
@@ -203,22 +234,41 @@ mod tests {
         }
     }
 
-    /// マッチング範囲は上下とも 50 固定。**ユーザーが送る値は無い。**
+    /// 既定は上下とも 50。**ユーザーが送る値は無い**（運営だけが変えられる）。
     #[test]
-    fn the_range_is_fixed_at_fifty_in_both_directions() {
-        assert_eq!((UP_RANGE, DOWN_RANGE), (50, 50), "07 §3");
+    fn the_user_never_sends_a_range() {
+        assert_eq!(
+            (DEFAULT_UP_RANGE, DEFAULT_DOWN_RANGE),
+            (50, 50),
+            "07 §3 の既定値"
+        );
+        assert_eq!(
+            MatchingRanges::default(),
+            MatchingRanges { up: 50, down: 50 }
+        );
         // 投入リクエストに範囲が無いこと（型がそれを保証する）
         let request = validate_request(&[wish("jungle", 1)]).expect("valid");
         assert_eq!(request.roles.len(), 1);
     }
 
-    /// 旧仕様（95〜200 / 30〜100）で入った行は一括 UPDATE せず、読み出し時に丸める。
+    /// 旧仕様（95〜200 / 30〜100 / 50 固定）で入った行は一括 UPDATE せず、読み出し時に丸める。
+    ///
+    /// **丸め先は現在の幅**なので、運営が変えれば既存のキュー行もその幅で判定される。
     #[test]
-    fn stored_values_from_the_old_ranges_are_clamped_on_read() {
+    fn stored_values_from_the_old_ranges_are_clamped_to_the_current_range() {
+        let defaults = MatchingRanges::default();
         for stored in [200, 101, 100, 95, 30, 0, -1] {
-            assert_eq!(clamp_down_range(stored), DOWN_RANGE, "{stored}");
+            assert_eq!(defaults.clamp_down(stored), DEFAULT_DOWN_RANGE, "{stored}");
         }
-        assert_eq!(clamp_down_range(DOWN_RANGE), DOWN_RANGE);
+        assert_eq!(defaults.clamp_down(DEFAULT_DOWN_RANGE), DEFAULT_DOWN_RANGE);
+
+        // 運営が広げた後は、同じ古い行が新しい幅に丸まる
+        let widened = MatchingRanges { up: 120, down: 120 };
+        for stored in [200, 50, 30, 0] {
+            assert_eq!(widened.clamp_down(stored), 120, "{stored}");
+        }
+        // 上方向は丸めに関係しない（列が無いので保存値も無い）
+        assert_eq!(MatchingRanges { up: 500, down: 25 }.clamp_down(200), 25);
     }
 
     #[test]

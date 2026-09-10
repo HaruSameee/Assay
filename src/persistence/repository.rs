@@ -1014,6 +1014,31 @@ pub(crate) async fn lock_vc_pool(conn: &mut PgConnection) -> Result<(), sqlx::Er
     Ok(())
 }
 
+/// 現在のマッチング範囲。`current_matching_ranges`（`matching_range_changes` の
+/// 最新行から導出）を読む。
+///
+/// **1 回のスキャンにつき 1 回だけ呼ぶこと。**マッチメイカは advisory lock を
+/// 取った同じトランザクションでこれを読み、返った 1 個をスキャン全体で使う。
+/// ループの中で読み直すと、運営が途中で幅を変えたときに 1 回の選抜の中で
+/// 基準がずれる。
+///
+/// コード上の [`crate::queue::DEFAULT_UP_RANGE`] / [`crate::queue::DEFAULT_DOWN_RANGE`]
+/// は、まだ一度も変更していないときに SQL 側の `coalesce` が返す既定値でしかない。
+pub(crate) async fn matching_ranges(
+    conn: &mut PgConnection,
+) -> Result<crate::queue::MatchingRanges, sqlx::Error> {
+    let row = sqlx::query!(
+        "select up_range as \"up_range!\", down_range as \"down_range!\" \
+         from current_matching_ranges"
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(crate::queue::MatchingRanges {
+        up: row.up_range,
+        down: row.down_range,
+    })
+}
+
 pub(crate) async fn occupied_vc_labels(
     conn: &mut PgConnection,
 ) -> Result<std::collections::HashSet<String>, sqlx::Error> {
