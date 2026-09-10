@@ -291,18 +291,30 @@ impl MatchmakerRepository {
         // 運営が止めていれば **formation を作らない**。ループ自体は回り続けるので、
         // キューの人数と最長待ち時間は数えたうえで戻る（止めている間も観測は続ける）。
         //
-        // 停止状態は `admin_actions` の最新行から導出する。**同じトランザクション**で読むので、
-        // 停止の追記とマッチ成立が同時に起きても、advisory lock がどちらか一方に決める。
+        // 止まる理由は 2 つあり、**手動の停止が常に勝つ**（`matchmaker_stop_on`）。
+        // どちらも `admin_actions` / `matchmaker_schedule_changes` の最新行から導出する。
+        // **同じトランザクション**で読むので、停止の追記とマッチ成立が同時に起きても
+        // advisory lock がどちらか一方に決める。
         // プロセス内のフラグにしないのは、再起動で勝手に再開してしまうため。
-        if let Some(pause) = crate::admin::repository::matchmaker_pause_on(&mut tx).await? {
+        if let Some(stop) = crate::admin::repository::matchmaker_stop_on(&mut tx, now).await? {
             outcome.paused = true;
             tx.commit().await?;
-            info!(
-                queued = outcome.candidates,
-                paused_by = pause.actor_discord_user_id,
-                paused_since = %pause.since,
-                "matchmaker is paused; forming no matches"
-            );
+            match stop {
+                crate::admin::MatchmakerStop::Manual {
+                    actor_discord_user_id,
+                    since,
+                    ..
+                } => info!(
+                    queued = outcome.candidates,
+                    paused_by = actor_discord_user_id,
+                    paused_since = %since,
+                    "matchmaker is paused; forming no matches"
+                ),
+                crate::admin::MatchmakerStop::Scheduled => info!(
+                    queued = outcome.candidates,
+                    "matchmaker is outside its schedule; forming no matches"
+                ),
+            }
             return Ok(outcome);
         }
 

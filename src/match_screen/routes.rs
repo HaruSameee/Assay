@@ -48,6 +48,7 @@ use crate::registration::{Audience, AuthConfig, CurrentSession, Viewer};
 use super::model::{
     AffordanceView, BLUE, MatchView, OpponentView, RED, StageView, TeammateView, VoiceView,
 };
+use crate::nullified::{NullifiedReportError, NullifiedReportOutcome, NullifiedReportRepository};
 use crate::quiet::{QuietReportError, QuietReportOutcome, QuietReportRepository};
 
 use super::repository::{
@@ -72,6 +73,7 @@ pub struct MatchState {
     pub matches: MatchRepository,
     /// 聞き専報告。**読むのは「自分が出したか」だけ**（票数は読まない）。
     pub quiet: QuietReportRepository,
+    pub nullified: NullifiedReportRepository,
     /// 期限と候補上限（画面の説明文に使う）。
     pub lifecycle: LifecycleConfig,
     /// 部屋設定のチェックリスト（先頭にマップを差し込んだもの）。
@@ -80,11 +82,16 @@ pub struct MatchState {
 
 impl MatchState {
     /// 組み立てる。`room_map` はチェックリストの先頭に入る（Discord 側と同じ形）。
+    /// **引数が多いのは承知のうえ。**リポジトリを 1 つの箱にまとめると、
+    /// どの画面がどの表を読むかが型から消える（マッチ画面が運営用の集計を
+    /// 読めてしまう経路ができる）。ここは並べたままにする。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AuthConfig,
         formations: FormationRepository,
         matches: MatchRepository,
         quiet: QuietReportRepository,
+        nullified: NullifiedReportRepository,
         lifecycle: LifecycleConfig,
         room_map: &str,
         room_checklist: &[String],
@@ -99,6 +106,7 @@ impl MatchState {
             formations,
             matches,
             quiet,
+            nullified,
             lifecycle,
             room_checklist: Arc::new(checklist),
         }
@@ -140,6 +148,10 @@ pub fn router(state: MatchState) -> Router {
         .route(
             "/match/{formation_id}/quiet-report",
             post(submit_quiet_report),
+        )
+        .route(
+            "/match/{formation_id}/nullified-report",
+            post(submit_nullified_report),
         )
         .with_state(state)
 }
@@ -340,6 +352,80 @@ async fn submit_room_code(
             error!(%error, "could not record the room code");
             conflict("rejected", "いまはルーム ID を受け付けていません。")
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NullifiedReportRequest {
+    /// 原因として選んだ人。**`None` / 空文字は「誰も通報しない」**という 1 票。
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// 無効試合の通報。**無効試合を報告した人だけが、10 人の誰でも選べる。**
+///
+/// 聞き専報告と違って相手チームも対象にできる（部屋を壊すのは味方とは限らない）。
+/// 返すのは「受け付けた」か「もう出している」かだけで、**票数も閾値も返さない**。
+/// 表示しなくても JSON に入っていれば読めるので、そもそも入れない（docs/09）。
+async fn submit_nullified_report(
+    State(app): State<MatchState>,
+    session: Option<CurrentSession>,
+    Path(formation_id): Path<String>,
+    body: Option<Json<NullifiedReportRequest>>,
+) -> Response {
+    let Some(player_id) = player(session) else {
+        return unauthenticated(false);
+    };
+    let Some(formation) = parse_formation_id(&formation_id) else {
+        return not_found(false);
+    };
+    // 参加者以外には formation の存在も教えない
+    if !is_participant(&app, formation, player_id).await {
+        return not_found(false);
+    }
+    let Some(Json(request)) = body else {
+        return bad_request("invalid_request", "リクエストの形式が正しくありません。");
+    };
+    // **空は「誰も通報しない」。**未回答と区別するために 1 票として記録する
+    let target = match request
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        None => None,
+        Some(raw) => match parse_player_id(raw) {
+            Some(target) => Some(target),
+            None => return bad_request("invalid_target", "対象の指定が正しくありません。"),
+        },
+    };
+
+    // 検証（無効試合を報告したか・参加者か・自分自身でないか）はすべてリポジトリ側。
+    // **1 人 1 票**なので冪等キーは要らない（(formation, reporter) の一意制約が持つ）
+    match app
+        .nullified
+        .report(formation, player_id, target, Utc::now())
+        .await
+    {
+        Ok(NullifiedReportOutcome::Recorded) => {
+            // **対象も票数もログに残さない。**運営が見るのは DB の履歴だけ
+            info!(formation = %formation, "nullified report recorded");
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "nullified_reported": true })),
+            )
+                .into_response()
+        }
+        Ok(NullifiedReportOutcome::AlreadyReported) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "nullified_reported": true })),
+        )
+            .into_response(),
+        Err(NullifiedReportError::Database) => {
+            error!(formation = %formation, "could not record the nullified report");
+            internal_error(false)
+        }
+        Err(error) => conflict(error.code(), error.message()),
     }
 }
 
@@ -579,6 +665,17 @@ async fn build_view(
     let i_reported = app.matches.has_reported(formation, me).await?;
     // **自分が出したかどうかだけ。**誰を報告したかも票数も読まない
     let quiet_reported = app.quiet.has_reported(formation, me).await?;
+    // 無効試合の通報。**入口を出すかどうかを決めるためだけ**に 2 つ読む
+    let i_reported_nullified = app
+        .nullified
+        .reported_nullified(formation, me)
+        .await
+        .unwrap_or(false);
+    let nullified_reported = app
+        .nullified
+        .has_reported(formation, me)
+        .await
+        .unwrap_or(false);
 
     let host = host_of(&state);
     let name_of = |player: PlayerId| -> String {
@@ -653,6 +750,10 @@ async fn build_view(
         // 勝敗で閾値が変わるため。票数も閾値もここには入らない
         quiet_report: matches!(stage, StageView::Confirmed { .. }),
         quiet_reported,
+        // **無効試合を報告した人にだけ出す。**確定は待たない（報告直後に
+        // 推移させるのが目的で、票は先に記録して nullified になったときに効く）
+        nullified_report: i_reported_nullified && !nullified_reported,
+        nullified_reported,
     };
 
     Ok(Some(MatchView {

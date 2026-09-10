@@ -36,6 +36,7 @@ use unite_matchsystem::lifecycle::{
 use unite_matchsystem::matchmaker::{
     Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
 };
+use unite_matchsystem::nullified::NullifiedReportRepository;
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
     VcAssignment,
@@ -146,6 +147,7 @@ impl AppDb {
             self.admin.clone(),
             self.blocks.clone(),
             QuietReportRepository::new(self.pool.clone()),
+            NullifiedReportRepository::new(self.pool.clone()),
         )))
     }
 
@@ -1878,6 +1880,370 @@ async fn a_match_that_is_no_longer_disputed_is_refused(owner: PgPool) {
     .unwrap();
     assert_eq!(logged, 0, "断ったのに操作ログを積んだ");
     println!("係争中でない試合への裁定: 拒否・イベントも操作ログも増えない");
+
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 登録者一覧
+// ----------------------------------------------------------------------
+//
+// 検索（/admin）は名前か Discord ID を知っている前提の入口だった。
+// 「誰が居るのか」を端から見る場所として別に置く。
+
+/// **一覧は全員を出す。**検索と違って、何も入力しなくても並ぶ。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_roster_lists_everyone_without_a_query(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    // 管理者 1 人 + 参加者 12 人
+    seed_cast(&db, 12).await;
+    let app = db.router();
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/players").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = page.matches("/admin/player?player=").count();
+    assert_eq!(rows, 13, "全員が出ていない: {rows}");
+    assert!(page.contains("13人"), "総人数が出ていない: {page}");
+    println!("一覧に出た人数: {rows}");
+
+    // レート・試合数・登録日・Discord ID の列がある
+    for header in ["プレイヤー", "レート", "試合", "登録", "Discord ID"] {
+        assert!(page.contains(header), "{header}: {page}");
+    }
+
+    db.done().await;
+}
+
+/// **名前でも Discord ID でも絞り込める。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_roster_can_be_filtered(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 12).await;
+
+    // Discord ID は完全一致（参加者 n の ID は 1000 + n）
+    let by_id = db.admin.roster("1011", 1).await.unwrap();
+    assert_eq!(by_id.total, 1, "Discord ID で 1 人に絞れていない");
+    assert_eq!(by_id.players[0].discord_user_id, 1011);
+
+    // 名前は部分一致。全員が「トレーナーN」なので 13 人に当たる
+    let by_name = db.admin.roster("トレーナー", 1).await.unwrap();
+    assert_eq!(by_name.total, 13, "名前の部分一致が効いていない");
+
+    // 当たらない文字列なら 0 件で、その旨が画面に出る
+    let app = db.router();
+    let (status, empty) = get_html(&app, player(ADMIN), "/admin/players?q=zzzznotfound").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(empty.contains("該当する登録者がいません"), "{empty}");
+    println!(
+        "絞り込み: ID 1 件 / 名前 {} 件 / 該当なし 0 件",
+        by_name.total
+    );
+
+    db.done().await;
+}
+
+/// **未登録の人を名前で埋めない。**登録が済んでいないことが一覧から読める。
+///
+/// `seed_cast` は管理者を `register` しないので、管理者がその 1 人になる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_player_who_never_registered_is_marked_as_such(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 2).await;
+    let app = db.router();
+
+    let roster = db.admin.roster("", 1).await.unwrap();
+    let unregistered = roster
+        .players
+        .iter()
+        .filter(|entry| entry.registered_at.is_none())
+        .count();
+    assert_eq!(unregistered, 1, "未登録が 1 人のはず");
+    assert_eq!(roster.total, 3);
+
+    // 未登録でも players 行は残っているので、一覧からは消えない
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/players").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.matches("/admin/player?player=").count(), 3);
+    // 登録済みの人はトレーナー名で出る
+    assert!(page.contains("トレーナー2"), "{page}");
+    println!("未登録: {unregistered} 人 / 全体: {} 人", roster.total);
+
+    db.done().await;
+}
+
+/// **キュー中の人には印が付く。**運営が「いま誰が待っているか」を一覧から読める。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_roster_marks_who_is_queued(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 12).await;
+    let app = db.router();
+
+    let before = db.admin.roster("", 1).await.unwrap();
+    assert_eq!(
+        before.players.iter().filter(|entry| entry.queued).count(),
+        0,
+        "誰もキューに入っていないはず"
+    );
+
+    enqueue(&db, player(2), "jungle", at(0)).await;
+    enqueue(&db, player(3), "top_carry", at(0)).await;
+
+    let after = db.admin.roster("", 1).await.unwrap();
+    let queued = after.players.iter().filter(|entry| entry.queued).count();
+    assert_eq!(queued, 2, "キュー中の印が合わない");
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/players").await;
+    assert_eq!(page.matches("キュー中").count(), 2, "{page}");
+    println!("キュー中の印: {queued} 人");
+
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 稼働スケジュール
+// ----------------------------------------------------------------------
+//
+// **手動の停止が常に勝つ。**障害で緊急停止したのに、稼働時間になったら
+// スケジュールが勝手に再開する事故を防ぐ。
+
+/// スケジュールを 1 件保存する（画面のフォームと同じ経路）。
+async fn save_schedule(app: &Router, body: &str) -> (StatusCode, String) {
+    let (_, page) = get_html(app, player(ADMIN), "/admin/queue").await;
+    let key = form_key(&page, "/admin/matchmaker/schedule");
+    post_form(
+        app,
+        player(ADMIN),
+        "/admin/matchmaker/schedule",
+        &format!("{body}&key={key}"),
+    )
+    .await
+}
+
+/// JST の日時を UTC にして返す。
+fn jst(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Timestamp {
+    chrono::FixedOffset::east_opt(9 * 3600)
+        .unwrap()
+        .with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// **「水金土日 21-2 時」を画面から設定できる。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_schedule_can_be_set_from_the_panel(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    // 既定はスケジュールなし = いつでも稼働
+    let before = db.admin.matchmaker_schedule().await.unwrap();
+    assert!(!before.enabled);
+    assert!(
+        before.is_open(jst(2026, 9, 14, 3, 0)),
+        "既定は常に開いている"
+    );
+
+    let (status, page) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&day_fri=on&day_sat=on&day_sun=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("スケジュールを保存しました"), "{page}");
+    assert!(page.contains("水金土日"), "{page}");
+
+    let saved = db.admin.matchmaker_schedule().await.unwrap();
+    assert!(saved.enabled);
+    assert_eq!(saved.day_labels(), vec!["水", "金", "土", "日"]);
+    assert_eq!(saved.start_text(), "21:00");
+    assert_eq!(saved.end_text(), "02:00");
+    // 2026-09-16 は水曜
+    assert!(saved.is_open(jst(2026, 9, 16, 21, 0)));
+    assert!(saved.is_open(jst(2026, 9, 17, 1, 59)), "日をまたぐ");
+    assert!(!saved.is_open(jst(2026, 9, 17, 2, 0)));
+    assert!(!saved.is_open(jst(2026, 9, 14, 21, 0)), "月曜は開かない");
+    println!(
+        "保存: {} {} 〜 {}",
+        saved.day_labels().join(""),
+        saved.start_text(),
+        saved.end_text()
+    );
+
+    // 運営操作ログに残る
+    let logged = sqlx::query!(
+        "select reason, payload from admin_actions where kind = 'matchmaker_scheduled'"
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].payload["enabled"], json!(true));
+    assert_eq!(logged[0].payload["start_minute"], json!(1260));
+
+    db.done().await;
+}
+
+/// **手動の停止が常に勝つ。**稼働時間内でも、手で止めていれば止まったまま。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_manual_pause_beats_the_schedule(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    // 月〜日すべて 0:00〜23:59 = 常に稼働時間内
+    let (status, _) = save_schedule(
+        &app,
+        "enabled=on&day_mon=on&day_tue=on&day_wed=on&day_thu=on&day_fri=on&day_sat=on&day_sun=on\
+         &start=00%3A00&end=23%3A59&reason=always",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let now = jst(2026, 9, 16, 12, 0);
+    assert!(db.admin.matchmaker_stop(now).await.unwrap().is_none());
+
+    // 手で止める
+    pause_from_the_panel(&app, "障害対応").await;
+    let stop = db.admin.matchmaker_stop(now).await.unwrap();
+    assert!(
+        matches!(
+            stop,
+            Some(unite_matchsystem::admin::MatchmakerStop::Manual { .. })
+        ),
+        "稼働時間内でも手動停止が勝つ: {stop:?}"
+    );
+    println!("稼働時間内 + 手動停止 → {stop:?}");
+
+    db.done().await;
+}
+
+/// **稼働時間外はスケジュールが止める。**手動で再開しても、枠の外なら動かない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_schedule_stops_the_matchmaker_outside_its_window(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, _) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 水曜の昼は枠の外
+    let outside = jst(2026, 9, 16, 12, 0);
+    let stop = db.admin.matchmaker_stop(outside).await.unwrap();
+    assert_eq!(
+        stop,
+        Some(unite_matchsystem::admin::MatchmakerStop::Scheduled)
+    );
+    // 水曜の 21 時は枠の中
+    let inside = jst(2026, 9, 16, 21, 30);
+    assert!(db.admin.matchmaker_stop(inside).await.unwrap().is_none());
+    println!("枠の外 → {stop:?} / 枠の中 → 稼働");
+
+    db.done().await;
+}
+
+/// **手動の再開は「手動停止の解除」であって「スケジュール無視」ではない。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn resuming_by_hand_does_not_override_the_schedule(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, _) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    pause_from_the_panel(&app, "障害対応").await;
+
+    // 枠の外で手動再開する
+    let outside = jst(2026, 9, 16, 12, 0);
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/queue").await;
+    let key = form_key(&page, "/admin/matchmaker");
+    let (status, _) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/matchmaker",
+        &format!("action=resume&reason=復旧&key={key}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 手動停止は解除された。**でも枠の外なので止まったまま**
+    let stop = db.admin.matchmaker_stop(outside).await.unwrap();
+    assert_eq!(
+        stop,
+        Some(unite_matchsystem::admin::MatchmakerStop::Scheduled),
+        "手動再開でスケジュールを無視している"
+    );
+    // 枠の中に入れば動く
+    assert!(
+        db.admin
+            .matchmaker_stop(jst(2026, 9, 16, 21, 30))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    println!("枠の外で手動再開 → {stop:?}（枠が勝つ）");
+
+    db.done().await;
+}
+
+/// 曜日が 1 つも選ばれていなければ断る。**動かない設定を黙って保存しない。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_schedule_with_no_days_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, page) =
+        save_schedule(&app, "enabled=on&start=21%3A00&end=02%3A00&reason=oops").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("曜日が 1 つも選ばれていません"), "{page}");
+    // 開始と終了が同じでも断る
+    let (_, same) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=21%3A00&reason=oops",
+    )
+    .await;
+    assert!(same.contains("開始と終了が同じ時刻です"), "{same}");
+    // 何も保存されていない
+    assert_eq!(count(&db, "matchmaker_schedule_changes").await, 0);
+    println!("曜日なし・同時刻: どちらも拒否、0 行");
+
+    db.done().await;
+}
+
+/// **スケジュールを外せば手動だけに戻る。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn clearing_the_schedule_returns_to_manual_only(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    let outside = jst(2026, 9, 16, 12, 0);
+    assert!(db.admin.matchmaker_stop(outside).await.unwrap().is_some());
+
+    // enabled を外す（チェックボックスなのでキーごと送らない）
+    let (status, page) =
+        save_schedule(&app, "day_wed=on&start=21%3A00&end=02%3A00&reason=stop").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("スケジュールを外しました"), "{page}");
+    assert!(
+        db.admin.matchmaker_stop(outside).await.unwrap().is_none(),
+        "外したのに止まっている"
+    );
+    // **履歴は 2 行残る**（追記専用）
+    assert_eq!(count(&db, "matchmaker_schedule_changes").await, 2);
+    println!("外した後: 稼働 / 履歴 2 行");
 
     db.done().await;
 }

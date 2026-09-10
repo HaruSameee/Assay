@@ -1,0 +1,73 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select r.formation_id, r.target_id as \"target_id!\", p.trainer_name, count(*) as \"votes!\", exists (select 1 from nullified_report_penalties n where n.formation_id = r.formation_id and n.player_id = r.target_id) as \"penalised!\", exists (select 1 from formation_events e where e.formation_id = r.formation_id and e.kind = 'nullified') as \"match_nullified!\" from nullified_reports r join players p on p.id = r.target_id where r.target_id is not null group by r.formation_id, r.target_id, p.trainer_name order by count(*) desc, r.formation_id limit $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "formation_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "formation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "target_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "votes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "penalised!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "match_nullified!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "dca314e0e95f50144d87adf275ffc5ee4981168aba6797547881d2eabdb6a7d5"
+}

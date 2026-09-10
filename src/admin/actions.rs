@@ -41,15 +41,17 @@ pub enum AdminActionKind {
     /// 運営の報告入力を断った（係争中・確定済みの試合）。
     ReportRejected,
     /// マッチング範囲を変えた（次のスキャン以降の選抜だけが変わる）。
+    MatchingRangeChanged,
     /// 係争を裁定して終端イベントを積んだ。
     DisputeResolved,
-    MatchingRangeChanged,
+    /// マッチメイカの稼働スケジュールを変えた。**手動の停止が常に勝つ。**
+    MatchmakerScheduled,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
@@ -62,6 +64,7 @@ impl AdminActionKind {
         Self::ReportRejected,
         Self::MatchingRangeChanged,
         Self::DisputeResolved,
+        Self::MatchmakerScheduled,
     ];
 
     /// DB に入る文字列。
@@ -76,6 +79,7 @@ impl AdminActionKind {
             Self::RatingParamsRejected => "rating_params_rejected",
             Self::MatchingRangeChanged => "matching_range_changed",
             Self::DisputeResolved => "dispute_resolved",
+            Self::MatchmakerScheduled => "matchmaker_scheduled",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -94,6 +98,7 @@ impl AdminActionKind {
             "rating_params_rejected" => Some(Self::RatingParamsRejected),
             "matching_range_changed" => Some(Self::MatchingRangeChanged),
             "dispute_resolved" => Some(Self::DisputeResolved),
+            "matchmaker_scheduled" => Some(Self::MatchmakerScheduled),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -113,6 +118,7 @@ impl AdminActionKind {
             Self::RatingParamsRejected => "レート増減幅の変更を拒否（進行中の試合あり）",
             Self::MatchingRangeChanged => "マッチング範囲を変更",
             Self::DisputeResolved => "係争を裁定",
+            Self::MatchmakerScheduled => "稼働スケジュールを変更",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",

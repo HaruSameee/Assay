@@ -17,10 +17,13 @@ use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
 use super::disputes::DisputeDecision;
 use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
+use super::repository::RosterPage;
 use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
 };
+use super::schedule::MatchmakerSchedule;
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
+use crate::nullified::{NullifiedReportRow, NullifiedTally};
 use crate::quiet::{QuietReportRow, QuietReporterTally};
 
 /// 検索画面に渡すデータ。
@@ -99,6 +102,14 @@ table.log td.num { text-align: right; font-variant-numeric: tabular-nums;
 .tag { display: inline-block; border-radius: 999px; padding: 1px 10px;
        font-size: 0.78rem; font-weight: 700; border: 1px solid var(--border);
        color: var(--muted); white-space: nowrap; }
+.tag-danger { border-color: var(--danger); color: var(--danger); }
+/* 登録者一覧: 名前の下に Discord 表示名を小さく重ねる */
+td.who { overflow-wrap: anywhere; }
+td.who .trainer { display: block; color: var(--muted); font-size: 0.82rem; }
+td.who .tag { margin-left: 6px; }
+.pager { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 20px; }
+.pager .position { color: var(--muted); font-size: 0.85rem; }
+form.search { margin: 0 0 20px; }
 form.inline { display: inline; }
 button.revert { background: none; border: 1px solid var(--border); color: var(--text);
                 border-radius: 999px; padding: 2px 12px; font: inherit; font-size: 0.8rem;
@@ -450,9 +461,19 @@ pub struct MatchmakerView<'a> {
 
 /// キュー中の一覧画面（`/admin/queue`）に渡すデータ。
 #[derive(Debug, Clone)]
+/// 稼働スケジュールの現在値と、いま枠の内側かどうか。
+pub struct ScheduleView<'a> {
+    pub schedule: &'a MatchmakerSchedule,
+    /// いま稼働時間内か。**手動停止とは別**（画面で取り違えさせない）。
+    pub open: bool,
+    pub form_key: &'a str,
+}
+
 pub struct QueueView<'a> {
     /// 同じ画面からマッチメイカも止められるようにする（事故対応で画面を跨がせない）。
     pub matchmaker: MatchmakerView<'a>,
+    /// 稼働スケジュール。手動の停止と同じ画面に置く。
+    pub schedule: ScheduleView<'a>,
     /// キュー中の一覧（待ち時間の長い順）。
     pub entries: &'a [QueuedEntry],
     /// 直近の運営操作。誰がいつ何をしたかをこの画面で読めるようにする。
@@ -474,14 +495,108 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
+        link("/admin/players", "登録者一覧"),
         link("/admin/queue", "キューと運用"),
         link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
         link("/admin/rating-params", "レート増減幅"),
         link("/admin/matching-range", "マッチング範囲"),
         link("/admin/quiet-reports", "聞き専報告"),
+    )
+}
+
+/// マッチメイカの稼働スケジュール。**手動の停止が常に勝つ**ことを画面で言い切る。
+///
+/// 「21 時になったら勝手に再開する」と思われると、障害対応中に緊急停止した人が
+/// 画面から離れられなくなる。効き方をそのまま書く。
+fn schedule_section(view: &ScheduleView<'_>) -> String {
+    const DAYS: [(&str, &str); 7] = [
+        ("mon", "月"),
+        ("tue", "火"),
+        ("wed", "水"),
+        ("thu", "木"),
+        ("fri", "金"),
+        ("sat", "土"),
+        ("sun", "日"),
+    ];
+    let schedule = view.schedule;
+    let checkboxes = DAYS
+        .iter()
+        .enumerate()
+        .map(|(index, (key, label))| {
+            let checked = if schedule.days_mask & (1 << index) != 0 {
+                " checked"
+            } else {
+                ""
+            };
+            format!(
+                "<label class=\"day\"><input type=\"checkbox\" name=\"day_{key}\" \
+                 value=\"on\"{checked}> {label}</label>"
+            )
+        })
+        .collect::<String>();
+
+    // いまの状態を 1 行で。**手動とスケジュールを取り違えさせない**
+    let state = if schedule.enabled {
+        let days = schedule.day_labels().join("");
+        let wraps = if schedule.crosses_midnight() {
+            "（翌日）"
+        } else {
+            ""
+        };
+        format!(
+            "<p class=\"fine-print\">現在の枠: <strong>{days}</strong> の \
+             <strong>{start}</strong> 〜 <strong>{wraps}{end}</strong>（JST）。\
+             いまは<strong>{open}</strong>です。</p>\n",
+            days = escape(&if days.is_empty() {
+                String::from("（曜日なし）")
+            } else {
+                days
+            }),
+            start = escape(&schedule.start_text()),
+            end = escape(&schedule.end_text()),
+            open = if view.open {
+                "稼働時間内"
+            } else {
+                "稼働時間外"
+            },
+        )
+    } else {
+        String::from(
+            "<p class=\"fine-print\">スケジュールは<strong>使っていません</strong>。\
+             手動の停止・再開だけが効きます。</p>\n",
+        )
+    };
+
+    format!(
+        "<section class=\"ops\" aria-labelledby=\"schedule-title\">\n\
+         <h2 id=\"schedule-title\">稼働スケジュール</h2>\n\
+         {state}\
+         <p class=\"fine-print\"><strong>手動の停止が常に勝ちます。</strong>\
+         手で止めているあいだは、稼働時間になっても再開しません\
+         （障害対応中に勝手に動き出さないため）。手動の再開は「手動停止の解除」で、\
+         稼働時間外ならそのまま止まったままです。</p>\n\
+         <form method=\"post\" action=\"/admin/matchmaker/schedule\">\
+         <input type=\"hidden\" name=\"key\" value=\"schedule:{key}\">\
+         <label class=\"day\"><input type=\"checkbox\" name=\"enabled\" value=\"on\"{enabled}> \
+         スケジュールを使う</label>\
+         <div class=\"field\"><span class=\"metric-label\">稼働する曜日</span>\
+         <div class=\"days\">{checkboxes}</div></div>\
+         <div class=\"field\"><label for=\"start\">開始（JST）</label>\
+         <input id=\"start\" name=\"start\" type=\"time\" value=\"{start}\" required></div>\
+         <div class=\"field\"><label for=\"end\">終了（JST。開始より早ければ翌日）</label>\
+         <input id=\"end\" name=\"end\" type=\"time\" value=\"{end}\" required></div>\
+         <label for=\"schedule-reason\">理由（記録に残ります）</label>\
+         <input id=\"schedule-reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">スケジュールを保存</button>\
+         </div></form>\n</section>\n",
+        key = escape(view.form_key),
+        enabled = if schedule.enabled { " checked" } else { "" },
+        start = escape(&schedule.start_text()),
+        end = escape(&schedule.end_text()),
     )
 }
 
@@ -657,6 +772,7 @@ pub fn queue_page(view: &QueueView<'_>) -> String {
              {nav}\
              {notice}\
              {matchmaker}\
+             {schedule}\
              <h2>キュー中（{count}人）</h2>\n\
              <p class=\"fine-print\">キューから外すと、本人のキュー画面に「運営によってキューから\
              外されました」と表示されます。理由を書けば、それも本人に表示されます。\
@@ -668,6 +784,7 @@ pub fn queue_page(view: &QueueView<'_>) -> String {
             nav = admin_nav("/admin/queue"),
             notice = notice_html(view.notice.as_ref()),
             matchmaker = matchmaker_section(view.matchmaker),
+            schedule = schedule_section(&view.schedule),
             count = view.entries.len(),
             queue = queue_table(view),
             actions = actions_table(view.actions),
@@ -1153,6 +1270,155 @@ pub fn matching_range_page(view: &MatchingRangeView<'_>) -> String {
 }
 
 // ----------------------------------------------------------------------
+// 登録者の一覧
+// ----------------------------------------------------------------------
+//
+// 検索（`/admin`）は名前か Discord ID を知っている前提の入口だった。
+// 「誰が居るのか」を端から見る場所として別に置く。
+
+pub struct RosterView<'a> {
+    pub page: &'a RosterPage,
+}
+
+/// 停止処分のタグ。**通常の人には何も出さない**（全員に緑のタグを付けると、
+/// 目で拾いたい停止処分が埋もれる）。
+fn status_tag(status: &str) -> &'static str {
+    match status {
+        "suspended" => "<span class=\"tag tag-danger\">停止</span>",
+        _ => "",
+    }
+}
+
+fn roster_rows(page: &RosterPage) -> String {
+    page.players
+        .iter()
+        .map(|entry| {
+            let trainer = entry
+                .trainer_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty());
+            // **登録が済んでいない人を見落とさない。**名前が無いのは未登録の印なので、
+            // Discord 表示名で埋めずに「未登録」と出す
+            let name = trainer.map_or_else(
+                || String::from("<span class=\"muted\">（未登録）</span>"),
+                escape,
+            );
+            let discord = entry
+                .display_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(String::new, |name| {
+                    format!("<span class=\"trainer\">{}</span>", escape(name))
+                });
+            let registered = entry
+                .registered_at
+                .map_or_else(|| String::from("—"), |at| escape(&display_time(at)));
+            format!(
+                "<tr><td class=\"who\"><a href=\"/admin/player?player={id}\">{name}</a>\
+                 {status}{queued}{discord}</td>\
+                 <td class=\"num\">{rating}</td><td class=\"num\">{matches}</td>\
+                 <td>{registered}</td><td class=\"num\">{discord_id}</td></tr>\n",
+                id = escape(&entry.player_id.to_string()),
+                status = status_tag(&entry.status),
+                queued = if entry.queued {
+                    "<span class=\"tag\">キュー中</span>"
+                } else {
+                    ""
+                },
+                rating = entry.rating.round() as i64,
+                matches = entry.matches,
+                discord_id = entry.discord_user_id,
+            )
+        })
+        .collect::<String>()
+}
+
+fn roster_pager(page: &RosterPage) -> String {
+    let link = |target: i64, label: &str| {
+        // 絞り込みを持ち回る。**クエリ文字列なので percent エンコードしてから escape する**
+        // （どちらか片方だけだと、空白や & を含む名前でリンクが壊れる）
+        format!(
+            "<a class=\"button button-secondary\" href=\"/admin/players?page={target}&q={q}\">{label}</a>",
+            q = escape(&percent_encode(&page.query))
+        )
+    };
+    let previous = if page.page > 1 {
+        link(page.page - 1, "前へ")
+    } else {
+        String::from("<span></span>")
+    };
+    let next = if page.page < page.pages {
+        link(page.page + 1, "次へ")
+    } else {
+        String::from("<span></span>")
+    };
+    format!(
+        "<div class=\"pager\">{previous}\
+         <span class=\"position\">{page} / {pages} ページ（{total}人）</span>\
+         {next}</div>\n",
+        page = page.page,
+        pages = page.pages,
+        total = page.total,
+    )
+}
+
+pub fn roster_page(view: &RosterView<'_>) -> String {
+    let body = if view.page.total == 0 {
+        String::from("<p class=\"muted\">該当する登録者がいません。</p>\n")
+    } else {
+        format!(
+            "<div class=\"table-wrap\"><table class=\"log\">\n\
+             <thead><tr><th>プレイヤー</th><th>レート</th><th>試合</th>\
+             <th>登録</th><th>Discord ID</th></tr></thead>\n\
+             <tbody>\n{rows}</tbody></table></div>\n{pager}",
+            rows = roster_rows(view.page),
+            pager = roster_pager(view.page),
+        )
+    };
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / 登録者一覧",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-roster-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-roster-title\">登録者一覧</h1>\n\
+             {nav}\
+             <p class=\"lead\">登録の新しい順です。レート・試合数・キュー在席はすべて\
+             追記ログからの導出値で、この画面では何も保存しません。</p>\n\
+             <form method=\"get\" action=\"/admin/players\" class=\"search\">\
+             <label for=\"roster-q\">名前 / Discord 表示名 / Discord ID で絞り込む</label>\
+             <input id=\"roster-q\" name=\"q\" type=\"text\" autocomplete=\"off\" value=\"{q}\">\
+             <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">絞り込む</button>\
+             <a class=\"button button-secondary\" href=\"/admin/players\">解除</a></div></form>\n\
+             {body}",
+            nav = admin_nav("/admin/players"),
+            q = escape(&view.page.query),
+        ),
+    )
+}
+
+/// クエリ文字列に載せるための percent エンコード。
+///
+/// 依存を増やさないための最小実装。**通すのは RFC 3986 の unreserved だけ**で、
+/// それ以外は UTF-8 のバイト列として `%XX` にする。日本語のトレーナー名が
+/// そのまま来るので、ASCII だけを見る実装にはしない。
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+// ----------------------------------------------------------------------
 // 聞き専報告（運営だけが見る）
 // ----------------------------------------------------------------------
 //
@@ -1166,6 +1432,13 @@ pub struct QuietReportsView<'a> {
     /// いま効いている閾値。**運営にだけ出す。**
     pub winner_threshold: i32,
     pub loser_threshold: i32,
+    /// 無効試合の通報の集計（票の多い順）。
+    pub nullified_tallies: &'a [NullifiedTally],
+    /// 無効試合の通報の履歴（新しい順）。「誰も通報しない」も含む。
+    pub nullified_history: &'a [NullifiedReportRow],
+    /// 無効試合の通報の閾値とペナルティ幅。**運営にだけ出す。**
+    pub nullified_threshold: i32,
+    pub nullified_penalty: f64,
     pub notice: Option<Notice>,
 }
 
@@ -1176,6 +1449,82 @@ fn reporter_side(won: Option<bool>) -> &'static str {
         Some(false) => "<strong>負け</strong>",
         None => "—",
     }
+}
+
+/// 無効試合の通報の集計。**票数が見えるのはここだけ。**
+///
+/// 「まだ無効試合になっていない試合の票」も出す。通報は報告直後に受け付けるので、
+/// 結局勝敗がついた試合の票も残る——それが**レートに効いていない**ことが
+/// 運営から見えないと、「票が入っているのに下がっていない」が事故に見える。
+fn nullified_tallies(tallies: &[NullifiedTally]) -> String {
+    if tallies.is_empty() {
+        return String::from("<p class=\"muted\">まだ無効試合の通報はありません。</p>\n");
+    }
+    let rows = tallies
+        .iter()
+        .map(|row| {
+            let state = if row.penalised {
+                "<span class=\"tag tag-danger\">成立</span>"
+            } else if row.match_nullified {
+                "<span class=\"tag\">未達</span>"
+            } else {
+                "<span class=\"tag\">無効試合でない</span>"
+            };
+            format!(
+                "<tr><td>{name}</td><td class=\"num\">{votes}</td><td>{state}</td>\
+                 <td class=\"num\">{formation}</td></tr>\n",
+                name = escape(row.trainer_name.as_deref().unwrap_or("（未設定）")),
+                votes = row.votes,
+                formation = escape(&format!(
+                    "match-{}",
+                    &row.formation_id.simple().to_string()[..8]
+                )),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>通報された人</th><th>票</th><th>状態</th><th>試合</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+/// 無効試合の通報の履歴。**「誰も通報しない」も 1 行として出す。**
+fn nullified_history(history: &[NullifiedReportRow]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let rows = history
+        .iter()
+        .map(|row| {
+            let target = row.target_name.as_deref().map_or_else(
+                || String::from("<span class=\"muted\">誰も通報しない</span>"),
+                escape,
+            );
+            let side = match row.cross_team {
+                Some(true) => "<span class=\"tag\">相手チーム</span>",
+                Some(false) => "<span class=\"tag\">自チーム</span>",
+                None => "",
+            };
+            format!(
+                "<tr><td>{at}</td><td>{reporter}</td><td>{target} {side}</td>\
+                 <td class=\"num\">{formation}</td></tr>\n",
+                at = escape(&display_time(row.reported_at)),
+                reporter = escape(row.reporter_name.as_deref().unwrap_or("（未設定）")),
+                formation = escape(&format!(
+                    "match-{}",
+                    &row.formation_id.simple().to_string()[..8]
+                )),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<h2>無効試合の通報（履歴）</h2>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>通報した人</th><th>通報された人</th>\
+         <th>試合</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
 }
 
 pub fn quiet_reports_page(view: &QuietReportsView<'_>) -> String {
@@ -1249,19 +1598,30 @@ pub fn quiet_reports_page(view: &QuietReportsView<'_>) -> String {
              プレイヤー側の画面にも API にも、票数・閾値・報告の内容は出ません。</p>\n\
              <p class=\"notice\">現在の閾値: 勝ちチームからの報告 <strong>{winner}</strong> 票 / \
              負けチームからの報告 <strong>{loser}</strong> 票。\
-             負けチームは対象者を除くと 4 人しか報告できないため、\
-             {loser} 票は満場一致にあたります。閾値は環境変数で変えられ、\
-             変更すると過去の試合も新しい閾値で再判定されます。</p>\n\
+             報告できるのは対象者を除いた同チームの 4 人なので、3 票は「4 人中 3 人」です。\
+             閾値は環境変数で変えられ、変更すると過去の試合も新しい閾値で再判定されます。</p>\n\
              <h2>プレイヤーごとの集計</h2>\n\
              <p class=\"field-help\"><strong>報告した数の多い順</strong>に並べています。\
              負け試合でしか報告していない人は「うち負け試合」が「報告した数」と同じになります。</p>\n\
              {tallies}\
              {history}\
+             <h2>無効試合の通報</h2>\n\
+             <p class=\"notice\">現在の閾値: <strong>{nullified_threshold}</strong> 票で\
+             <strong>−{nullified_penalty}</strong>。<strong>相手チームも通報できます。</strong>\
+             通報は「無効試合」を報告した直後に受け付けるので、\
+             <strong>結局勝敗がついた試合の票も残ります</strong>——その票はレートに効きません\
+             （状態が「無効試合でない」の行）。</p>\n\
+             {nullified_tallies}\
+             {nullified_history}\
              </section>\n",
             nav = admin_nav("/admin/quiet-reports"),
             notice = notice_html(view.notice.as_ref()),
             winner = view.winner_threshold,
             loser = view.loser_threshold,
+            nullified_threshold = view.nullified_threshold,
+            nullified_penalty = view.nullified_penalty.round() as i64,
+            nullified_tallies = nullified_tallies(view.nullified_tallies),
+            nullified_history = nullified_history(view.nullified_history),
         ),
     )
 }
@@ -1454,6 +1814,14 @@ mod tests {
         }
     }
 
+    /// テストのスケジュールは**使わない設定**。既存のテストは手動の停止だけを見ている。
+    const NO_SCHEDULE: MatchmakerSchedule = MatchmakerSchedule {
+        enabled: false,
+        days_mask: 0,
+        start_minute: 0,
+        end_minute: 1,
+    };
+
     fn queue_view<'a>(
         entries: &'a [QueuedEntry],
         actions: &'a [AdminActionRow],
@@ -1462,6 +1830,11 @@ mod tests {
         QueueView {
             matchmaker: MatchmakerView {
                 paused,
+                form_key: "form-key",
+            },
+            schedule: ScheduleView {
+                schedule: &NO_SCHEDULE,
+                open: true,
                 form_key: "form-key",
             },
             entries,

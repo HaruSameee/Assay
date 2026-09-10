@@ -27,6 +27,7 @@ use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, P
 use super::rating_params::{
     RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
 };
+use super::schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome};
 use super::season::{SeasonBoundary, SeasonOutcome, SeasonPreview};
 
 /// PostgreSQL の SQLSTATE。
@@ -620,6 +621,51 @@ pub(crate) async fn matchmaker_pause_on(
             since: row.occurred_at,
             reason: row.reason,
         }))
+}
+
+/// マッチメイカを止める理由を、**手動 → スケジュールの順**で見る。
+///
+/// 手動の停止が常に勝つ。障害で緊急停止したのに、稼働時間になったら
+/// スケジュールが勝手に再開する事故を防ぐ。手動の再開は「手動停止の解除」で
+/// あって「スケジュール無視」ではないので、稼働時間外ならそのまま止まっている。
+///
+/// **1 スキャンにつき 1 回だけ呼ぶこと。**マッチメイカは advisory lock を取った
+/// 同じトランザクションでこれを読む。
+pub(crate) async fn matchmaker_stop_on(
+    conn: &mut PgConnection,
+    now: DateTime<Utc>,
+) -> Result<Option<MatchmakerStop>, sqlx::Error> {
+    if let Some(pause) = matchmaker_pause_on(conn).await? {
+        return Ok(Some(MatchmakerStop::Manual {
+            actor_discord_user_id: pause.actor_discord_user_id,
+            since: pause.since,
+            reason: pause.reason,
+        }));
+    }
+    let schedule = matchmaker_schedule_on(conn).await?;
+    if schedule.is_open(now) {
+        return Ok(None);
+    }
+    Ok(Some(MatchmakerStop::Scheduled))
+}
+
+/// 現在のスケジュール。`current_matchmaker_schedule` の 1 行。
+pub(crate) async fn matchmaker_schedule_on(
+    conn: &mut PgConnection,
+) -> Result<MatchmakerSchedule, sqlx::Error> {
+    let row = sqlx::query!(
+        "select enabled as \"enabled!\", days_mask as \"days_mask!\", \
+                start_minute as \"start_minute!\", end_minute as \"end_minute!\" \
+         from current_matchmaker_schedule"
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(MatchmakerSchedule {
+        enabled: row.enabled,
+        days_mask: row.days_mask,
+        start_minute: row.start_minute,
+        end_minute: row.end_minute,
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -1564,5 +1610,224 @@ fn repository_error(error: crate::persistence::RepositoryError) -> AdminStoreErr
     match error {
         crate::persistence::RepositoryError::Database(error) => AdminStoreError::from(error),
         other => AdminStoreError::from(sqlx::Error::Protocol(other.to_string())),
+    }
+}
+
+// ----------------------------------------------------------------------
+// 登録者の一覧
+// ----------------------------------------------------------------------
+//
+// 検索（`/admin`）は名前か Discord ID を知っている前提の入口で、「誰が居るのか」を
+// 見る場所が無かった。運営が把握したいのは、登録済みか・停止されていないか・
+// どれくらい試合しているか、の 3 つ。**すべて導出値**で、ここでは保存しない。
+
+/// 1 ページあたりの人数。**運営画面なのでランキングより多く出す。**
+pub const ROSTER_PAGE_SIZE: i64 = 50;
+
+/// 一覧に出す 1 人。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterEntry {
+    pub player_id: Uuid,
+    pub discord_user_id: i64,
+    /// 登録フォームで申告したトレーナー名。未登録なら `None`。
+    pub trainer_name: Option<String>,
+    /// Discord の表示名（最新のスナップショット）。取れていなければ `None`。
+    pub display_name: Option<String>,
+    /// `players.status`（`active` / `suspended`）。停止処分がかかっているかを見る。
+    pub status: String,
+    /// 登録を済ませた時刻。まだなら `None`。
+    pub registered_at: Option<DateTime<Utc>>,
+    /// 表示スケールのレート（導出値）。
+    pub rating: f64,
+    /// 確定した試合数。
+    pub matches: i64,
+    /// **いまキューに入っているか。**運営が「誰が待っているか」を一覧から読めるようにする。
+    pub queued: bool,
+}
+
+/// 一覧 1 ページ分。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterPage {
+    pub players: Vec<RosterEntry>,
+    /// 1 始まりのページ番号。
+    pub page: i64,
+    /// 総ページ数（0 人でも 1）。
+    pub pages: i64,
+    /// 絞り込み後の総人数。
+    pub total: i64,
+    /// 絞り込みに使った文字列（空なら全員）。
+    pub query: String,
+}
+
+impl AdminRepository {
+    /// 登録者の一覧。**レートも試合数もキュー在席も導出値**で、保存しない。
+    ///
+    /// 並びは「登録の新しい順」。運営が見たいのは直近に入ってきた人なので、
+    /// レート順にはしない（レート順はランキングが担う）。
+    ///
+    /// `query` が空でなければ、トレーナー名・Discord 表示名・Discord ID で絞る
+    /// （`search_players` と同じ当たり方に、表示名ぶんを足したもの）。
+    pub async fn roster(&self, query: &str, page: i64) -> Result<RosterPage, sqlx::Error> {
+        let query = query.trim().to_owned();
+        let filter = if query.is_empty() {
+            None
+        } else {
+            Some(query.clone())
+        };
+        let total = sqlx::query_scalar!(
+            "select count(*) as \"count!\" \
+             from players p \
+             where $1::text is null \
+                or p.trainer_name ilike '%' || $1 || '%' \
+                or p.discord_user_id::text = $1 \
+                or exists ( \
+                    select 1 from player_discord_snapshots s \
+                    where s.player_id = p.id \
+                      and s.display_name ilike '%' || $1 || '%' \
+                )",
+            filter.as_deref(),
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let pages = ((total + ROSTER_PAGE_SIZE - 1) / ROSTER_PAGE_SIZE).max(1);
+        let page = page.clamp(1, pages);
+        let offset = (page - 1) * ROSTER_PAGE_SIZE;
+
+        let rows = sqlx::query!(
+            "select p.id, p.discord_user_id, p.trainer_name, p.status, p.registered_at, \
+                    v.rating as \"rating!\", v.matches as \"matches!\", \
+                    (select s.display_name from player_discord_snapshots s \
+                     where s.player_id = p.id order by s.id desc limit 1) as display_name, \
+                    exists (select 1 from queue_entries q where q.player_id = p.id) as \"queued!\" \
+             from players p \
+             join player_current_ratings v on v.player_id = p.id \
+             where $1::text is null \
+                or p.trainer_name ilike '%' || $1 || '%' \
+                or p.discord_user_id::text = $1 \
+                or exists ( \
+                    select 1 from player_discord_snapshots s \
+                    where s.player_id = p.id \
+                      and s.display_name ilike '%' || $1 || '%' \
+                ) \
+             order by p.registered_at desc nulls last, p.created_at desc, p.id \
+             limit $2 offset $3",
+            filter.as_deref(),
+            ROSTER_PAGE_SIZE,
+            offset,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(RosterPage {
+            players: rows
+                .into_iter()
+                .map(|row| RosterEntry {
+                    player_id: row.id,
+                    discord_user_id: row.discord_user_id,
+                    trainer_name: row.trainer_name,
+                    display_name: row.display_name,
+                    status: row.status,
+                    registered_at: row.registered_at,
+                    rating: row.rating,
+                    matches: row.matches,
+                    queued: row.queued,
+                })
+                .collect(),
+            page,
+            pages,
+            total,
+            query,
+        })
+    }
+}
+
+/// 追記するスケジュール 1 件。
+#[derive(Debug, Clone)]
+pub struct NewMatchmakerSchedule {
+    /// 新しいスケジュール。**検証済みの値を渡すこと**（`admin::parse_time` / `parse_days`）。
+    pub schedule: MatchmakerSchedule,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// いま効いているスケジュール。**最新行から導出する。**
+    pub async fn matchmaker_schedule(&self) -> Result<MatchmakerSchedule, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        matchmaker_schedule_on(&mut conn).await
+    }
+
+    /// いまマッチメイカが止まっているか、その理由。**手動が先。**
+    pub async fn matchmaker_stop(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<MatchmakerStop>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        matchmaker_stop_on(&mut conn, now).await
+    }
+
+    /// スケジュールの変更を追記する。
+    ///
+    /// **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+    /// 先頭で同じ advisory lock を取り、その中でスケジュールを 1 回だけ読む（07 §4-1）。
+    /// 走っているスキャンは古い枠で走りきるか、新しい枠で始まるかのどちらかになる。
+    pub async fn change_matchmaker_schedule(
+        &self,
+        input: &NewMatchmakerSchedule,
+    ) -> Result<ScheduleOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        let inserted = sqlx::query_scalar!(
+            "insert into matchmaker_schedule_changes \
+             (enabled, days_mask, start_minute, end_minute, reason, created_by, \
+              idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.schedule.enabled,
+            input.schedule.days_mask,
+            input.schedule.start_minute,
+            input.schedule.end_minute,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(ScheduleOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::MatchmakerScheduled,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "matchmaker_schedule_change_id": id,
+                    "enabled": input.schedule.enabled,
+                    "days_mask": input.schedule.days_mask,
+                    "start_minute": input.schedule.start_minute,
+                    "end_minute": input.schedule.end_minute,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("matchmaker_schedule:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ScheduleOutcome::Changed { id })
     }
 }

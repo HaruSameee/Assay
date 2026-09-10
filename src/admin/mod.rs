@@ -24,6 +24,7 @@ pub mod matching_range;
 pub mod rating_params;
 pub mod repository;
 pub mod routes;
+pub mod schedule;
 pub mod season;
 
 pub use actions::{
@@ -44,10 +45,11 @@ pub use rating_params::{
 };
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
-    NewAdjustment, NewAdminAction, NewMatchingRange, NewRatingParams, NewSeasonBoundary,
-    QueuedEntry, QueuedRole, RemovalOutcome,
+    NewAdjustment, NewAdminAction, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams,
+    NewSeasonBoundary, QueuedEntry, QueuedRole, RemovalOutcome,
 };
 pub use routes::{AdminState, router};
+pub use schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome, parse_days, parse_time};
 pub use season::{
     MAX_SEASON_LABEL_LENGTH, SeasonBoundary, SeasonOutcome, SeasonPreview, confirmation_matches,
     normalize_label,

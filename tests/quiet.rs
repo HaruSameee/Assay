@@ -30,6 +30,7 @@ use unite_matchsystem::lifecycle::{
     FormationEventKind as K, FormationId, LifecycleConfig, PlayerId, Timestamp,
 };
 use unite_matchsystem::match_screen::{MatchRepository, MatchState, router};
+use unite_matchsystem::nullified::NullifiedReportRepository;
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team,
 };
@@ -112,6 +113,7 @@ impl AppDb {
             self.formations.clone(),
             self.matches.clone(),
             self.quiet.clone(),
+            NullifiedReportRepository::new(self.pool.clone()),
             LifecycleConfig::default(),
             "kyogre",
             &["大会モード".to_owned()],
@@ -423,11 +425,13 @@ async fn three_votes_from_the_winning_team_cost_one_point(owner: PgPool) {
     db.done().await;
 }
 
-/// **4. 負けたチームは 4 票で −1。3 票では下がらない。**
+/// **4. 負けたチームも 3 票で −1。勝ち側と同じ。**
 ///
-/// 負けチームは 5 人で、対象者を除くと報告できるのは 4 人。**4 票は満場一致。**
+/// 以前は負け側だけ 4 票（対象者を除いた 4 人の満場一致）を要求していた。
+/// 負け直後の「戦犯選出」を防ぐ意図だったが、負け側でだけ 1 人の反対で
+/// 潰せる状態になっていたので、勝ち負けとも 3 に統一した。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn four_votes_from_the_losing_team_cost_one_point(owner: PgPool) {
+async fn three_votes_from_the_losing_team_cost_one_point(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 10).await;
     confirmed(&db, 1, "red").await; // red が勝ち → blue（6〜10）が負け
@@ -435,16 +439,21 @@ async fn four_votes_from_the_losing_team_cost_one_point(owner: PgPool) {
     let lost = 1500.0 - 7.0;
     assert_eq!(rating(&db, 6).await, lost);
 
-    // 3 票では下がらない
-    for reporter in [7u128, 8, 9] {
+    // 2 票では下がらない（2 人の口裏合わせで成立させない）
+    for reporter in [7u128, 8] {
         quiet(&db, 1, reporter, 6).await.unwrap();
     }
-    assert_eq!(rating(&db, 6).await, lost, "3 票で下がっている");
-    println!("負けチーム 3 票: {} （変化なし）", rating(&db, 6).await);
+    assert_eq!(rating(&db, 6).await, lost, "2 票で下がっている");
+    println!("負けチーム 2 票: {} （変化なし）", rating(&db, 6).await);
 
-    // 4 票目（＝報告できる 4 人すべて）で下がる
+    // 3 票目で下がる。**勝ち側と同じ票数**
+    quiet(&db, 1, 9, 6).await.unwrap();
+    assert_eq!(rating(&db, 6).await, lost - 1.0, "3 票で下がっていない");
+    println!("負けチーム 3 票: {}", rating(&db, 6).await);
+
+    // 4 票目（＝報告できる 4 人すべて）でも −1 のまま
     quiet(&db, 1, 10, 6).await.unwrap();
-    assert_eq!(rating(&db, 6).await, lost - 1.0, "4 票で下がっていない");
+    assert_eq!(rating(&db, 6).await, lost - 1.0, "票数で増えている");
     println!("負けチーム 4 票（満場一致）: {}", rating(&db, 6).await);
 
     // 対象を除く同チームは 4 人しかいない＝これ以上票は増やせない
@@ -576,8 +585,8 @@ async fn the_penalty_is_rebuilt_from_the_log(owner: PgPool) {
     db.quiet
         .sync_thresholds(
             QuietReportConfig {
-                winner_threshold: 2,
-                loser_threshold: 4,
+                winner_threshold: 3,
+                loser_threshold: 3,
             },
             at(300),
         )
@@ -590,7 +599,7 @@ async fn the_penalty_is_rebuilt_from_the_log(owner: PgPool) {
         .unwrap();
     assert_eq!(rows, 3, "報告のログが動いている");
     println!(
-        "閾値 4 → 2: {} / 報告のログ {rows} 行（変化なし）",
+        "閾値 4 → 3: {} / 報告のログ {rows} 行（変化なし）",
         rating(&db, 1).await
     );
 

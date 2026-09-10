@@ -38,18 +38,22 @@ use super::actions::{
 };
 use super::config::AdminIds;
 use super::disputes::{DisputeOutcome, NewDisputeResolution, parse_decision};
+use crate::nullified::NullifiedReportRepository;
+
 use super::html::{
     MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView,
-    RatingParamsView, ReportsView, SearchView, SeasonView, matching_range_page, player_page,
-    queue_page, quiet_reports_page, rating_params_page, reports_page, search_page, season_page,
+    RatingParamsView, ReportsView, RosterView, ScheduleView, SearchView, SeasonView,
+    matching_range_page, player_page, queue_page, quiet_reports_page, rating_params_page,
+    reports_page, roster_page, search_page, season_page,
 };
 use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewMatchingRange, NewRatingParams, NewSeasonBoundary, NewStaffReport, RemovalOutcome,
-    StaffReportOutcome,
+    NewMatchingRange, NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary, NewStaffReport,
+    RemovalOutcome, StaffReportOutcome,
 };
+use super::schedule::{MatchmakerSchedule, ScheduleOutcome, parse_days, parse_time};
 use super::season::{
     MAX_SEASON_LABEL_LENGTH, SeasonOutcome, confirmation_matches, normalize_label,
 };
@@ -69,6 +73,8 @@ pub struct AdminState {
     pub blocks: BlockRepository,
     /// 聞き専報告。**運営パネルだけがこれを読む**（票数と閾値を見られる唯一の経路）。
     pub quiet: QuietReportRepository,
+    /// 無効試合の通報。**運営パネルだけがこれを読む**（票数と閾値を見られる唯一の経路）。
+    pub nullified: NullifiedReportRepository,
 }
 
 impl AdminState {
@@ -78,6 +84,7 @@ impl AdminState {
         store: AdminRepository,
         blocks: BlockRepository,
         quiet: QuietReportRepository,
+        nullified: NullifiedReportRepository,
     ) -> Self {
         let key = config.cookie_key();
         Self {
@@ -87,6 +94,7 @@ impl AdminState {
             store,
             blocks,
             quiet,
+            nullified,
         }
     }
 }
@@ -108,12 +116,15 @@ impl FromRef<AdminState> for AuthConfig {
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(show_search))
+        .route("/admin/players", get(show_roster))
         .route("/admin/player", get(show_player))
         .route("/admin/adjustments", post(create_adjustment))
         .route("/admin/revert", post(create_revert))
         // 当日の運用。どれも `admin_actions` への追記で表す
         .route("/admin/queue", get(show_queue))
         .route("/admin/matchmaker", post(control_matchmaker))
+        // 稼働スケジュール。**手動の停止には触らない**（枠を書くだけ）
+        .route("/admin/matchmaker/schedule", post(set_matchmaker_schedule))
         .route("/admin/queue/remove", post(remove_from_queue))
         .route("/admin/blocks", post(set_block_allowance))
         .route("/admin/blocks/override", post(override_block))
@@ -217,6 +228,33 @@ fn fail(message: String) -> Notice {
         kind: NoticeKind::Error,
         message,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RosterQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    page: Option<i64>,
+}
+
+/// 登録者の一覧。**検索と違って、何も入力しなくても全員が出る。**
+async fn show_roster(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Query(params): Query<RosterQuery>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    let page = match app.store.roster(&params.q, params.page.unwrap_or(1)).await {
+        Ok(page) => page,
+        Err(err) => {
+            error!(%err, "could not list the registered players");
+            return internal_error();
+        }
+    };
+    Html(roster_page(&RosterView { page: &page })).into_response()
 }
 
 /// 追記結果を運用の言葉に翻訳する。打ち消しの制約違反は DB が正（回避しない）。
@@ -639,19 +677,157 @@ async fn render_queue(app: &AdminState, notice: Option<Notice>) -> Response {
             return internal_error();
         }
     };
+    let now = Utc::now();
+    // **スケジュールも同じ画面に出す。**手動の停止と取り違えさせないため、
+    // 「いま枠の内側か」を別に持って画面に書く
+    let schedule = match app.store.matchmaker_schedule().await {
+        Ok(schedule) => schedule,
+        Err(err) => {
+            error!(%err, "could not read the matchmaker schedule");
+            return internal_error();
+        }
+    };
     let key = form_key();
     Html(queue_page(&QueueView {
         matchmaker: MatchmakerView {
             paused: paused.as_ref(),
             form_key: &key,
         },
+        schedule: ScheduleView {
+            schedule: &schedule,
+            open: schedule.is_open(now),
+            form_key: &key,
+        },
         entries: &entries,
         actions: &actions,
         form_key: &key,
-        now: Utc::now(),
+        now,
         notice,
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleForm {
+    /// チェックボックスなので、外れていればキーごと来ない。
+    #[serde(default)]
+    enabled: Option<String>,
+    // **曜日は 7 つの独立したチェックボックス。**同名キーを 1 つの Vec にまとめる形は
+    // `serde_urlencoded`（axum の `Form`）が扱えず 422 になる。依存を増やすより、
+    // 名前を分けて `Option` を 7 つ受ける方が素直。
+    #[serde(default)]
+    day_mon: Option<String>,
+    #[serde(default)]
+    day_tue: Option<String>,
+    #[serde(default)]
+    day_wed: Option<String>,
+    #[serde(default)]
+    day_thu: Option<String>,
+    #[serde(default)]
+    day_fri: Option<String>,
+    #[serde(default)]
+    day_sat: Option<String>,
+    #[serde(default)]
+    day_sun: Option<String>,
+    #[serde(default)]
+    start: String,
+    #[serde(default)]
+    end: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+impl ScheduleForm {
+    /// チェックの付いた曜日のキーを並べる（`parse_days` に渡す形）。
+    fn days(&self) -> Vec<String> {
+        [
+            ("mon", &self.day_mon),
+            ("tue", &self.day_tue),
+            ("wed", &self.day_wed),
+            ("thu", &self.day_thu),
+            ("fri", &self.day_fri),
+            ("sat", &self.day_sat),
+            ("sun", &self.day_sun),
+        ]
+        .into_iter()
+        .filter(|(_, checked)| checked.is_some())
+        .map(|(key, _)| key.to_owned())
+        .collect()
+    }
+}
+/// 稼働スケジュールを保存する。**手動の停止には触らない。**
+///
+/// ここで書くのは枠だけで、いま止まっているかどうかは変えない。
+/// 手動で止めているあいだは、枠を変えても止まったままである。
+async fn set_matchmaker_schedule(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<ScheduleForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let Some(start_minute) = parse_time(&form.start) else {
+        return render_queue(&app, Some(fail("開始時刻が不正です。".to_owned()))).await;
+    };
+    let Some(end_minute) = parse_time(&form.end) else {
+        return render_queue(&app, Some(fail("終了時刻が不正です。".to_owned()))).await;
+    };
+    if start_minute == end_minute {
+        let notice = fail(
+            "開始と終了が同じ時刻です。24 時間動かしたい場合はスケジュールを外してください。"
+                .to_owned(),
+        );
+        return render_queue(&app, Some(notice)).await;
+    }
+    let enabled = form.enabled.is_some();
+    let days_mask = parse_days(&form.days());
+    if enabled && days_mask == 0 {
+        let notice = fail(
+            "曜日が 1 つも選ばれていません。この設定だとマッチメイカは動きません。".to_owned(),
+        );
+        return render_queue(&app, Some(notice)).await;
+    }
+    let Some(reason) = normalize_reason(&form.reason) else {
+        return render_queue(&app, Some(fail("理由を入力してください。".to_owned()))).await;
+    };
+
+    let schedule = MatchmakerSchedule {
+        enabled,
+        days_mask,
+        start_minute,
+        end_minute,
+    };
+    let input = NewMatchmakerSchedule {
+        schedule,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.change_matchmaker_schedule(&input).await {
+        Ok(ScheduleOutcome::Changed { id }) if enabled => info(format!(
+            "スケジュールを保存しました（#{id}）。{days} の {start} 〜 {end}（JST）。\
+             手動で停止しているあいだは、稼働時間になっても再開しません。",
+            days = schedule.day_labels().join(""),
+            start = schedule.start_text(),
+            end = schedule.end_text(),
+        )),
+        Ok(ScheduleOutcome::Changed { id }) => info(format!(
+            "スケジュールを外しました（#{id}）。手動の停止・再開だけが効きます。"
+        )),
+        Ok(ScheduleOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not change the matchmaker schedule");
+            return internal_error();
+        }
+    };
+    render_queue(&app, Some(notice)).await
 }
 
 async fn show_queue(State(app): State<AdminState>, session: Option<CurrentSession>) -> Response {
@@ -1480,9 +1656,34 @@ async fn show_quiet_reports(
             return internal_error();
         }
     };
+    let nullified_tallies = match app.nullified.admin_tallies(QUIET_TALLY_LIMIT).await {
+        Ok(tallies) => tallies,
+        Err(err) => {
+            error!(%err, "could not read the nullified report tallies");
+            return internal_error();
+        }
+    };
+    let nullified_history = match app.nullified.admin_history(QUIET_HISTORY_LIMIT).await {
+        Ok(history) => history,
+        Err(err) => {
+            error!(%err, "could not read the nullified report history");
+            return internal_error();
+        }
+    };
+    let (nullified_threshold, nullified_penalty) = match app.nullified.nullified_params().await {
+        Ok(params) => params,
+        Err(err) => {
+            error!(%err, "could not read the nullified report params");
+            return internal_error();
+        }
+    };
     Html(quiet_reports_page(&QuietReportsView {
         tallies: &tallies,
         history: &history,
+        nullified_tallies: &nullified_tallies,
+        nullified_history: &nullified_history,
+        nullified_threshold,
+        nullified_penalty,
         winner_threshold: thresholds.winner_threshold,
         loser_threshold: thresholds.loser_threshold,
         notice: None,

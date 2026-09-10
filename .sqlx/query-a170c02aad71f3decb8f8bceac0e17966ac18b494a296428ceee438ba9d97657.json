@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select threshold as \"threshold!\", penalty as \"penalty!\" from current_nullified_report_params",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "threshold!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_nullified_report_params",
+            "name": "threshold"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "penalty!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "current_nullified_report_params",
+            "name": "penalty"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "a170c02aad71f3decb8f8bceac0e17966ac18b494a296428ceee438ba9d97657"
+}

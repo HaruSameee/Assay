@@ -152,6 +152,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // 聞き専報告。閾値は環境変数が正だが、レートの合算は player_current_ratings 1 か所に
     // 集約してあるので、判定に使う閾値も SQL から見えるよう起動時に同期する
     let quiet_repo = QuietReportRepository::new(pool.clone());
+    // 無効試合の通報。閾値もペナルティ幅も DB（current_nullified_report_params）が正なので、
+    // 起動時に同期するものは無い
+    let nullified_repo = unite_matchsystem::nullified::NullifiedReportRepository::new(pool.clone());
     let quiet_config = QuietReportConfig::from_env()?;
     match quiet_repo.sync_thresholds(quiet_config, Utc::now()).await {
         Ok(changed) => info!(
@@ -271,6 +274,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             repo,
             MatchRepository::new(match_pool),
             quiet_repo.clone(),
+            nullified_repo.clone(),
             lifecycle.clone(),
             &room_map,
             &room_checklist,
@@ -310,6 +314,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 admin_store,
                 block_repo,
                 quiet_repo,
+                nullified_repo,
             )))
         }
         None => {

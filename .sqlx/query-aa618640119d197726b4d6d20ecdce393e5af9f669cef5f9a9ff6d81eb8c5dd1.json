@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select r.outcome from match_reports r where r.formation_id = $1 and r.player_id = $2 order by r.id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "match_reports",
+            "name": "outcome"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "aa618640119d197726b4d6d20ecdce393e5af9f669cef5f9a9ff6d81eb8c5dd1"
+}

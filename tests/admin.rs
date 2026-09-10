@@ -32,6 +32,7 @@ use unite_matchsystem::admin::{
 use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::lifecycle::PlayerId;
 use unite_matchsystem::matchmaker::ROLES;
+use unite_matchsystem::nullified::NullifiedReportRepository;
 use unite_matchsystem::queue::QueueRepository;
 use unite_matchsystem::queue::model::{QueueRequest, RolePreference};
 use unite_matchsystem::quiet::QuietReportRepository;
@@ -63,6 +64,7 @@ fn app_with_admin(db: &AppDb, oauth: Arc<FakeOAuth>, ids: Option<AdminIds>) -> R
             db.store.clone(),
             db.blocks.clone(),
             QuietReportRepository::new(db.pool.clone()),
+            NullifiedReportRepository::new(db.pool.clone()),
         ))),
         None => base,
     }
