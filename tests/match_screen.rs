@@ -1275,18 +1275,20 @@ async fn report_rows(db: &AppDb, n: u128, who: PlayerId) -> i64 {
 }
 
 // ----------------------------------------------------------------------
-// 報告完了 → キュー画面（行き先はサーバが返す）
+// 報告完了 → マッチ画面に留まる（行き先はサーバが返す）
 // ----------------------------------------------------------------------
 
-/// **本人の報告が追記された時点で**キュー画面へ戻す。確定は待たない。
+/// **報告してもマッチ画面から離さない。**確定後に出る聞き専報告の入口が
+/// この画面にしか無いためで、確定を待たせるためではない。
 ///
 /// 行き先はサーバの応答（`next`）で返す。クライアントに遷移条件もタイマーも持たせない。
-/// 戻した後も結果を追えるよう、`reported` を付けてマッチ画面への導線を残す。
+/// 拘束もしていない：画面には「確定を待たずにキューへ戻る」が出ており、
+/// 報告ゲートはプレイヤー単位なので 10 人目を待たずに入り直せる。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
-async fn a_report_sends_the_player_back_to_the_queue(owner: PgPool) {
+async fn a_report_keeps_the_player_on_the_match_screen(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
@@ -1296,7 +1298,7 @@ async fn a_report_sends_the_player_back_to_the_queue(owner: PgPool) {
     assert_eq!(payload["ok"], json!(true));
     assert_eq!(
         payload["next"],
-        json!(format!("/queue?reported={}", fid(1).0)),
+        json!(format!("/match/{}", fid(1).0)),
         "行き先をサーバが返していない: {payload}"
     );
     println!("報告の応答: {payload}");
@@ -1304,6 +1306,15 @@ async fn a_report_sends_the_player_back_to_the_queue(owner: PgPool) {
     // この時点で試合はまだ未確定（他の9人が未報告）
     assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
 
+    // 戻った先の画面。**キューへ戻る導線が出ている**（拘束していない）
+    let (status, html) = get_html(&app, 1, player(1)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("受け付けました"), "{html}");
+    assert!(
+        html.contains("確定を待たずにキューへ戻る"),
+        "キューへ戻る導線が無い: {html}"
+    );
+    assert!(html.contains("href=\"/queue\""), "{html}");
     // **戻った後もマッチ画面は開ける。**確定・disputed・裁定はここで確認する
     let (status, view) = get_json(&app, 1, player(1)).await;
     assert_eq!(status, StatusCode::OK, "{view}");

@@ -306,10 +306,28 @@ fn blocked_page(viewer: Viewer, status: &StatusView, reported: Option<FormationI
         ));
     }
     if !status.eligibility.pending_reports.is_empty() {
+        // **マッチ画面への導線を必ず出す。**報告は Discord のボタンでもできるが、
+        // 押し忘れたまま VC を出た人には、この画面から辿れる経路しか残らない。
+        // 未報告のあいだキューへは入れないので、ここで行き止まりにしない
+        let links = status
+            .eligibility
+            .pending_reports
+            .iter()
+            .map(|formation| {
+                format!(
+                    "<a class=\"button button-primary\" href=\"/match/{formation}\">\
+                     マッチ画面で報告する</a>",
+                    formation = escape(&formation.to_string()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
         gates.push_str(&format!(
             "<section class=\"gate-block\" data-gate=\"pending_reports\"><h2>未報告の試合</h2>\n\
-             <p>未報告の試合が {} 件あります。DiscordのVCテキストチャットにある報告ボタンを押してください。</p></section>\n",
-            status.eligibility.pending_reports.len()
+             <p>未報告の試合が {count} 件あります。下のボタンからマッチ画面を開いて報告してください\
+             （DiscordのVCテキストチャットにある報告ボタンからでも同じです）。</p>\n\
+             <div class=\"actions\">{links}</div></section>\n",
+            count = status.eligibility.pending_reports.len(),
         ));
     }
 
@@ -654,6 +672,13 @@ mod tests {
         assert!(rendered.contains("vc3-red"));
         assert!(rendered.contains("登録画面へ"));
         assert!(rendered.contains("報告ボタン"));
+        // **未報告のゲートで行き止まりにしない。**Discord のボタンを押し忘れたまま
+        // VC を出た人には、この画面から辿れる経路しか残らない
+        assert!(rendered.contains("マッチ画面で報告する"), "{rendered}");
+        assert!(
+            rendered.contains("href=\"/match/00000000-0000-0000-0000-000000000009\""),
+            "未報告の試合へのリンクが無い: {rendered}"
+        );
     }
 
     /// 成立は**朗報として見せる**。ゲートの判定も `data-view` も変えず、見た目だけ分ける。

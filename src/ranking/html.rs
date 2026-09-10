@@ -17,11 +17,26 @@ table.ranking th { color: var(--muted); font-size: 0.82rem; font-weight: 700; }
 table.ranking td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.ranking tr:hover td { background: var(--surface); }
 .who { overflow-wrap: anywhere; }
-.who .trainer { display: block; color: var(--muted); font-size: 0.82rem; }
+/* アイコンと名前は同じ行に並べる。名前が折り返してもアイコンは縮まない */
+.who { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.who .card-avatar { flex: 0 0 auto; width: 28px; height: 28px; border-radius: 50%; background: var(--surface); }
+.who .trainer { flex-basis: 100%; color: var(--muted); font-size: 0.82rem; }
 .pager { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 20px; }
 .pager .position { color: var(--muted); font-size: 0.85rem; }
 .empty { padding: 28px 0; color: var(--muted); }
 "#;
+
+/// アイコン。**装飾なので `alt` は空**（名前は隣に出ている）。
+///
+/// `referrerpolicy` を付けて、どのページから読んだかを CDN に渡さない
+/// （`match_screen::html::avatar` と同じ扱い）。
+fn avatar(url: &str) -> String {
+    format!(
+        "<img class=\"card-avatar\" src=\"{}\" alt=\"\" width=\"28\" height=\"28\" \
+         loading=\"lazy\" referrerpolicy=\"no-referrer\">",
+        escape(url)
+    )
+}
 
 /// ランキングの 1 ページ。
 pub fn ranking_page(viewer: Viewer, page: &RankingPage) -> String {
@@ -43,9 +58,10 @@ pub fn ranking_page(viewer: Viewer, page: &RankingPage) -> String {
                 });
             format!(
                 "<tr><td class=\"num\">{rank}</td>\
-                 <td class=\"who\"><a href=\"/players/{id}\">{name}</a>{trainer}</td>\
+                 <td class=\"who\">{avatar}<a href=\"/players/{id}\">{name}</a>{trainer}</td>\
                  <td class=\"num\">{rating}</td><td class=\"num\">{matches}</td></tr>\n",
                 rank = player.rank,
+                avatar = avatar(&player.avatar_url),
                 id = escape(&player.player_id.to_string()),
                 name = escape(name),
                 rating = player.rating.round() as i64,
@@ -122,6 +138,7 @@ mod tests {
             rank,
             player_id: Uuid::from_u128(rank as u128),
             display_name: Some(name.to_owned()),
+            avatar_url: "https://cdn.discordapp.com/embed/avatars/1.png".to_owned(),
             trainer_name: Some("トレーナー".to_owned()),
             rating,
             matches: 7,
@@ -159,6 +176,31 @@ mod tests {
                 "{rendered}"
             );
         }
+    }
+
+    /// **行にアイコンが出る。**Discord のアバターが取れていない人も既定アバターの
+    /// URL が入るので、行ごとに穴が空いて崩れることはない。
+    #[test]
+    fn every_row_shows_an_icon() {
+        let rendered = ranking_page(Viewer::MEMBER, &page());
+        for row in &page().players {
+            assert!(
+                rendered.contains(&format!("src=\"{}\"", row.avatar_url)),
+                "{rendered}"
+            );
+        }
+        assert_eq!(
+            rendered.matches("class=\"card-avatar\"").count(),
+            page().players.len(),
+            "1 行に 1 つ: {rendered}"
+        );
+        // 装飾なので alt は空。名前は隣に出ている
+        assert!(rendered.contains("alt=\"\""), "{rendered}");
+        // 参照元を CDN に渡さない
+        assert!(
+            rendered.contains("referrerpolicy=\"no-referrer\""),
+            "{rendered}"
+        );
     }
 
     /// 掲載条件を画面に書く。

@@ -516,16 +516,18 @@ async fn submit_report(
         Err(error) => error!(%error, "report evaluation failed after a web report"),
     }
     info!(formation = %formation, player = %player_id, "report accepted from the site");
-    // **本人の報告が追記された時点で**キュー画面へ戻す。試合の確定は待たない
-    // （報告ゲートはプレイヤー単位なので、確定を待つと10人目が報告するまで拘束される）。
+    // **マッチ画面に留まる。**確定を待たせるためではなく、確定後に出る
+    // 聞き専報告の入口がこの画面にしか無いため。キューへ戻ると、確定した頃には
+    // 戻る導線が無くなって二度と辿り着けない。
+    //
+    // 拘束はしていない：この画面には「キューへ戻る」が出ており、報告ゲートは
+    // プレイヤー単位なので、10 人目を待たずにキューへ入り直せる。
     // 行き先はサーバが決める。クライアントに遷移条件もタイマーも持たせない。
-    // `reported` を付けて、戻った先から結果を追える導線を残す（/status には
-    // 確定した試合しか出ないので、disputed と未確定はここからしか辿れない）
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "next": format!("/queue?reported={formation}"),
+            "next": format!("/match/{formation}"),
         })),
     )
         .into_response()

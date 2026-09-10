@@ -435,13 +435,15 @@ pub fn registration_form(
              <div class=\"field\">\n\
              <label for=\"rank\">本家ランク</label>\n\
              <select id=\"rank\" name=\"rank\" required{rank_attributes}>\n{options}</select>\n\
-             <p id=\"rank-help\" class=\"field-help\">現在の本家ランクを選択してください。参加資格はレジェンド以上です。</p>\n\
+             <p id=\"rank-help\" class=\"field-help\">現在の本家ランクを選択してください。参加資格はレジェンド以上です。\
+             <strong>今期まだレジェンドに到達していない場合は、1シーズン前の結果で申告してください。</strong></p>\n\
              {rank_error}</div>\n\
              <div class=\"field\">\n\
              <label for=\"rating\">本家レート</label>\n\
              <input id=\"rating\" name=\"rating\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"例: 2600\"\
              value=\"{rating}\"{rating_attributes}>\n\
              <p id=\"rating-help\" class=\"field-help\">マスターまたはレジェンドの場合に、現在の数値を入力してください。\
+             <strong>今期まだレジェンドに到達していない場合は、1シーズン前の結果を入力してください。</strong>\
              参加資格の確認と、運営による初期レート調整の参考にします。\
              Assay のレートには自動反映されず、初期値は一律1500です。</p>\n\
              {rating_error}</div>\n\

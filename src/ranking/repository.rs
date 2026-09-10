@@ -26,6 +26,10 @@ pub struct RankedPlayer {
     pub player_id: Uuid,
     /// Discord の表示名（最新のスナップショット）。無ければ `None`。
     pub display_name: Option<String>,
+    /// アイコンの URL。**スナップショットが無くても既定アバターの URL が入る**
+    /// (`Option` にすると「アイコンが無い人」と「まだ取れていない人」が画面上で
+    /// 同じ穴になり、行ごとに高さが変わって崩れて見える)。
+    pub avatar_url: String,
     /// トレーナー名（登録フォームの申告）。
     pub trainer_name: Option<String>,
     /// 表示スケールのレート（導出値）。
@@ -82,9 +86,11 @@ impl RankingRepository {
 
         let rows = sqlx::query!(
             "select v.player_id as \"player_id!\", v.matches as \"matches!\", 
-                    v.rating as \"rating!\", p.trainer_name, 
+                    v.rating as \"rating!\", p.trainer_name, p.discord_user_id, 
                     (select s.display_name from player_discord_snapshots s 
-                     where s.player_id = v.player_id order by s.id desc limit 1) as display_name 
+                     where s.player_id = v.player_id order by s.id desc limit 1) as display_name, 
+                    (select s.avatar_hash from player_discord_snapshots s 
+                     where s.player_id = v.player_id order by s.id desc limit 1) as avatar_hash 
              from player_current_ratings v 
              join players p on p.id = v.player_id 
              where v.matches >= $1 
@@ -104,6 +110,10 @@ impl RankingRepository {
                 rank: offset + index as i64 + 1,
                 player_id: row.player_id,
                 display_name: row.display_name,
+                avatar_url: crate::profiles::avatar_url(
+                    row.discord_user_id,
+                    row.avatar_hash.as_deref(),
+                ),
                 trainer_name: row.trainer_name,
                 rating: row.rating,
                 matches: row.matches,
