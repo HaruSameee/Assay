@@ -1997,3 +1997,253 @@ async fn the_roster_marks_who_is_queued(owner: PgPool) {
 
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// 稼働スケジュール
+// ----------------------------------------------------------------------
+//
+// **手動の停止が常に勝つ。**障害で緊急停止したのに、稼働時間になったら
+// スケジュールが勝手に再開する事故を防ぐ。
+
+/// スケジュールを 1 件保存する（画面のフォームと同じ経路）。
+async fn save_schedule(app: &Router, body: &str) -> (StatusCode, String) {
+    let (_, page) = get_html(app, player(ADMIN), "/admin/queue").await;
+    let key = form_key(&page, "/admin/matchmaker/schedule");
+    post_form(
+        app,
+        player(ADMIN),
+        "/admin/matchmaker/schedule",
+        &format!("{body}&key={key}"),
+    )
+    .await
+}
+
+/// JST の日時を UTC にして返す。
+fn jst(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Timestamp {
+    chrono::FixedOffset::east_opt(9 * 3600)
+        .unwrap()
+        .with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// **「水金土日 21-2 時」を画面から設定できる。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_schedule_can_be_set_from_the_panel(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    // 既定はスケジュールなし = いつでも稼働
+    let before = db.admin.matchmaker_schedule().await.unwrap();
+    assert!(!before.enabled);
+    assert!(
+        before.is_open(jst(2026, 9, 14, 3, 0)),
+        "既定は常に開いている"
+    );
+
+    let (status, page) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&day_fri=on&day_sat=on&day_sun=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("スケジュールを保存しました"), "{page}");
+    assert!(page.contains("水金土日"), "{page}");
+
+    let saved = db.admin.matchmaker_schedule().await.unwrap();
+    assert!(saved.enabled);
+    assert_eq!(saved.day_labels(), vec!["水", "金", "土", "日"]);
+    assert_eq!(saved.start_text(), "21:00");
+    assert_eq!(saved.end_text(), "02:00");
+    // 2026-09-16 は水曜
+    assert!(saved.is_open(jst(2026, 9, 16, 21, 0)));
+    assert!(saved.is_open(jst(2026, 9, 17, 1, 59)), "日をまたぐ");
+    assert!(!saved.is_open(jst(2026, 9, 17, 2, 0)));
+    assert!(!saved.is_open(jst(2026, 9, 14, 21, 0)), "月曜は開かない");
+    println!(
+        "保存: {} {} 〜 {}",
+        saved.day_labels().join(""),
+        saved.start_text(),
+        saved.end_text()
+    );
+
+    // 運営操作ログに残る
+    let logged = sqlx::query!(
+        "select reason, payload from admin_actions where kind = 'matchmaker_scheduled'"
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].payload["enabled"], json!(true));
+    assert_eq!(logged[0].payload["start_minute"], json!(1260));
+
+    db.done().await;
+}
+
+/// **手動の停止が常に勝つ。**稼働時間内でも、手で止めていれば止まったまま。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_manual_pause_beats_the_schedule(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    // 月〜日すべて 0:00〜23:59 = 常に稼働時間内
+    let (status, _) = save_schedule(
+        &app,
+        "enabled=on&day_mon=on&day_tue=on&day_wed=on&day_thu=on&day_fri=on&day_sat=on&day_sun=on\
+         &start=00%3A00&end=23%3A59&reason=always",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let now = jst(2026, 9, 16, 12, 0);
+    assert!(db.admin.matchmaker_stop(now).await.unwrap().is_none());
+
+    // 手で止める
+    pause_from_the_panel(&app, "障害対応").await;
+    let stop = db.admin.matchmaker_stop(now).await.unwrap();
+    assert!(
+        matches!(
+            stop,
+            Some(unite_matchsystem::admin::MatchmakerStop::Manual { .. })
+        ),
+        "稼働時間内でも手動停止が勝つ: {stop:?}"
+    );
+    println!("稼働時間内 + 手動停止 → {stop:?}");
+
+    db.done().await;
+}
+
+/// **稼働時間外はスケジュールが止める。**手動で再開しても、枠の外なら動かない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_schedule_stops_the_matchmaker_outside_its_window(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, _) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 水曜の昼は枠の外
+    let outside = jst(2026, 9, 16, 12, 0);
+    let stop = db.admin.matchmaker_stop(outside).await.unwrap();
+    assert_eq!(
+        stop,
+        Some(unite_matchsystem::admin::MatchmakerStop::Scheduled)
+    );
+    // 水曜の 21 時は枠の中
+    let inside = jst(2026, 9, 16, 21, 30);
+    assert!(db.admin.matchmaker_stop(inside).await.unwrap().is_none());
+    println!("枠の外 → {stop:?} / 枠の中 → 稼働");
+
+    db.done().await;
+}
+
+/// **手動の再開は「手動停止の解除」であって「スケジュール無視」ではない。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn resuming_by_hand_does_not_override_the_schedule(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, _) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    pause_from_the_panel(&app, "障害対応").await;
+
+    // 枠の外で手動再開する
+    let outside = jst(2026, 9, 16, 12, 0);
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/queue").await;
+    let key = form_key(&page, "/admin/matchmaker");
+    let (status, _) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/matchmaker",
+        &format!("action=resume&reason=復旧&key={key}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 手動停止は解除された。**でも枠の外なので止まったまま**
+    let stop = db.admin.matchmaker_stop(outside).await.unwrap();
+    assert_eq!(
+        stop,
+        Some(unite_matchsystem::admin::MatchmakerStop::Scheduled),
+        "手動再開でスケジュールを無視している"
+    );
+    // 枠の中に入れば動く
+    assert!(
+        db.admin
+            .matchmaker_stop(jst(2026, 9, 16, 21, 30))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    println!("枠の外で手動再開 → {stop:?}（枠が勝つ）");
+
+    db.done().await;
+}
+
+/// 曜日が 1 つも選ばれていなければ断る。**動かない設定を黙って保存しない。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_schedule_with_no_days_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, page) =
+        save_schedule(&app, "enabled=on&start=21%3A00&end=02%3A00&reason=oops").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("曜日が 1 つも選ばれていません"), "{page}");
+    // 開始と終了が同じでも断る
+    let (_, same) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=21%3A00&reason=oops",
+    )
+    .await;
+    assert!(same.contains("開始と終了が同じ時刻です"), "{same}");
+    // 何も保存されていない
+    assert_eq!(count(&db, "matchmaker_schedule_changes").await, 0);
+    println!("曜日なし・同時刻: どちらも拒否、0 行");
+
+    db.done().await;
+}
+
+/// **スケジュールを外せば手動だけに戻る。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn clearing_the_schedule_returns_to_manual_only(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&reason=weekly",
+    )
+    .await;
+    let outside = jst(2026, 9, 16, 12, 0);
+    assert!(db.admin.matchmaker_stop(outside).await.unwrap().is_some());
+
+    // enabled を外す（チェックボックスなのでキーごと送らない）
+    let (status, page) =
+        save_schedule(&app, "day_wed=on&start=21%3A00&end=02%3A00&reason=stop").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("スケジュールを外しました"), "{page}");
+    assert!(
+        db.admin.matchmaker_stop(outside).await.unwrap().is_none(),
+        "外したのに止まっている"
+    );
+    // **履歴は 2 行残る**（追記専用）
+    assert_eq!(count(&db, "matchmaker_schedule_changes").await, 2);
+    println!("外した後: 稼働 / 履歴 2 行");
+
+    db.done().await;
+}

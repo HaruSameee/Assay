@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select reason, payload from admin_actions where kind = 'matchmaker_scheduled'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "a5e26c4eb7f5564b43d00f46ee810a8db7a5f56e127d80824d4c5dafedc27ca5"
+}

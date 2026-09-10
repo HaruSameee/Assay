@@ -21,6 +21,7 @@ use super::repository::RosterPage;
 use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
 };
+use super::schedule::MatchmakerSchedule;
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
 use crate::nullified::{NullifiedReportRow, NullifiedTally};
 use crate::quiet::{QuietReportRow, QuietReporterTally};
@@ -460,9 +461,19 @@ pub struct MatchmakerView<'a> {
 
 /// キュー中の一覧画面（`/admin/queue`）に渡すデータ。
 #[derive(Debug, Clone)]
+/// 稼働スケジュールの現在値と、いま枠の内側かどうか。
+pub struct ScheduleView<'a> {
+    pub schedule: &'a MatchmakerSchedule,
+    /// いま稼働時間内か。**手動停止とは別**（画面で取り違えさせない）。
+    pub open: bool,
+    pub form_key: &'a str,
+}
+
 pub struct QueueView<'a> {
     /// 同じ画面からマッチメイカも止められるようにする（事故対応で画面を跨がせない）。
     pub matchmaker: MatchmakerView<'a>,
+    /// 稼働スケジュール。手動の停止と同じ画面に置く。
+    pub schedule: ScheduleView<'a>,
     /// キュー中の一覧（待ち時間の長い順）。
     pub entries: &'a [QueuedEntry],
     /// 直近の運営操作。誰がいつ何をしたかをこの画面で読めるようにする。
@@ -493,6 +504,99 @@ fn admin_nav(current: &str) -> String {
         link("/admin/rating-params", "レート増減幅"),
         link("/admin/matching-range", "マッチング範囲"),
         link("/admin/quiet-reports", "聞き専報告"),
+    )
+}
+
+/// マッチメイカの稼働スケジュール。**手動の停止が常に勝つ**ことを画面で言い切る。
+///
+/// 「21 時になったら勝手に再開する」と思われると、障害対応中に緊急停止した人が
+/// 画面から離れられなくなる。効き方をそのまま書く。
+fn schedule_section(view: &ScheduleView<'_>) -> String {
+    const DAYS: [(&str, &str); 7] = [
+        ("mon", "月"),
+        ("tue", "火"),
+        ("wed", "水"),
+        ("thu", "木"),
+        ("fri", "金"),
+        ("sat", "土"),
+        ("sun", "日"),
+    ];
+    let schedule = view.schedule;
+    let checkboxes = DAYS
+        .iter()
+        .enumerate()
+        .map(|(index, (key, label))| {
+            let checked = if schedule.days_mask & (1 << index) != 0 {
+                " checked"
+            } else {
+                ""
+            };
+            format!(
+                "<label class=\"day\"><input type=\"checkbox\" name=\"day_{key}\" \
+                 value=\"on\"{checked}> {label}</label>"
+            )
+        })
+        .collect::<String>();
+
+    // いまの状態を 1 行で。**手動とスケジュールを取り違えさせない**
+    let state = if schedule.enabled {
+        let days = schedule.day_labels().join("");
+        let wraps = if schedule.crosses_midnight() {
+            "（翌日）"
+        } else {
+            ""
+        };
+        format!(
+            "<p class=\"fine-print\">現在の枠: <strong>{days}</strong> の \
+             <strong>{start}</strong> 〜 <strong>{wraps}{end}</strong>（JST）。\
+             いまは<strong>{open}</strong>です。</p>\n",
+            days = escape(&if days.is_empty() {
+                String::from("（曜日なし）")
+            } else {
+                days
+            }),
+            start = escape(&schedule.start_text()),
+            end = escape(&schedule.end_text()),
+            open = if view.open {
+                "稼働時間内"
+            } else {
+                "稼働時間外"
+            },
+        )
+    } else {
+        String::from(
+            "<p class=\"fine-print\">スケジュールは<strong>使っていません</strong>。\
+             手動の停止・再開だけが効きます。</p>\n",
+        )
+    };
+
+    format!(
+        "<section class=\"ops\" aria-labelledby=\"schedule-title\">\n\
+         <h2 id=\"schedule-title\">稼働スケジュール</h2>\n\
+         {state}\
+         <p class=\"fine-print\"><strong>手動の停止が常に勝ちます。</strong>\
+         手で止めているあいだは、稼働時間になっても再開しません\
+         （障害対応中に勝手に動き出さないため）。手動の再開は「手動停止の解除」で、\
+         稼働時間外ならそのまま止まったままです。</p>\n\
+         <form method=\"post\" action=\"/admin/matchmaker/schedule\">\
+         <input type=\"hidden\" name=\"key\" value=\"schedule:{key}\">\
+         <label class=\"day\"><input type=\"checkbox\" name=\"enabled\" value=\"on\"{enabled}> \
+         スケジュールを使う</label>\
+         <div class=\"field\"><span class=\"metric-label\">稼働する曜日</span>\
+         <div class=\"days\">{checkboxes}</div></div>\
+         <div class=\"field\"><label for=\"start\">開始（JST）</label>\
+         <input id=\"start\" name=\"start\" type=\"time\" value=\"{start}\" required></div>\
+         <div class=\"field\"><label for=\"end\">終了（JST。開始より早ければ翌日）</label>\
+         <input id=\"end\" name=\"end\" type=\"time\" value=\"{end}\" required></div>\
+         <label for=\"schedule-reason\">理由（記録に残ります）</label>\
+         <input id=\"schedule-reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">スケジュールを保存</button>\
+         </div></form>\n</section>\n",
+        key = escape(view.form_key),
+        enabled = if schedule.enabled { " checked" } else { "" },
+        start = escape(&schedule.start_text()),
+        end = escape(&schedule.end_text()),
     )
 }
 
@@ -668,6 +772,7 @@ pub fn queue_page(view: &QueueView<'_>) -> String {
              {nav}\
              {notice}\
              {matchmaker}\
+             {schedule}\
              <h2>キュー中（{count}人）</h2>\n\
              <p class=\"fine-print\">キューから外すと、本人のキュー画面に「運営によってキューから\
              外されました」と表示されます。理由を書けば、それも本人に表示されます。\
@@ -679,6 +784,7 @@ pub fn queue_page(view: &QueueView<'_>) -> String {
             nav = admin_nav("/admin/queue"),
             notice = notice_html(view.notice.as_ref()),
             matchmaker = matchmaker_section(view.matchmaker),
+            schedule = schedule_section(&view.schedule),
             count = view.entries.len(),
             queue = queue_table(view),
             actions = actions_table(view.actions),
@@ -1708,6 +1814,14 @@ mod tests {
         }
     }
 
+    /// テストのスケジュールは**使わない設定**。既存のテストは手動の停止だけを見ている。
+    const NO_SCHEDULE: MatchmakerSchedule = MatchmakerSchedule {
+        enabled: false,
+        days_mask: 0,
+        start_minute: 0,
+        end_minute: 1,
+    };
+
     fn queue_view<'a>(
         entries: &'a [QueuedEntry],
         actions: &'a [AdminActionRow],
@@ -1716,6 +1830,11 @@ mod tests {
         QueueView {
             matchmaker: MatchmakerView {
                 paused,
+                form_key: "form-key",
+            },
+            schedule: ScheduleView {
+                schedule: &NO_SCHEDULE,
+                open: true,
                 form_key: "form-key",
             },
             entries,

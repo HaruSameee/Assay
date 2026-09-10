@@ -27,6 +27,7 @@ use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, P
 use super::rating_params::{
     RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
 };
+use super::schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome};
 use super::season::{SeasonBoundary, SeasonOutcome, SeasonPreview};
 
 /// PostgreSQL の SQLSTATE。
@@ -620,6 +621,51 @@ pub(crate) async fn matchmaker_pause_on(
             since: row.occurred_at,
             reason: row.reason,
         }))
+}
+
+/// マッチメイカを止める理由を、**手動 → スケジュールの順**で見る。
+///
+/// 手動の停止が常に勝つ。障害で緊急停止したのに、稼働時間になったら
+/// スケジュールが勝手に再開する事故を防ぐ。手動の再開は「手動停止の解除」で
+/// あって「スケジュール無視」ではないので、稼働時間外ならそのまま止まっている。
+///
+/// **1 スキャンにつき 1 回だけ呼ぶこと。**マッチメイカは advisory lock を取った
+/// 同じトランザクションでこれを読む。
+pub(crate) async fn matchmaker_stop_on(
+    conn: &mut PgConnection,
+    now: DateTime<Utc>,
+) -> Result<Option<MatchmakerStop>, sqlx::Error> {
+    if let Some(pause) = matchmaker_pause_on(conn).await? {
+        return Ok(Some(MatchmakerStop::Manual {
+            actor_discord_user_id: pause.actor_discord_user_id,
+            since: pause.since,
+            reason: pause.reason,
+        }));
+    }
+    let schedule = matchmaker_schedule_on(conn).await?;
+    if schedule.is_open(now) {
+        return Ok(None);
+    }
+    Ok(Some(MatchmakerStop::Scheduled))
+}
+
+/// 現在のスケジュール。`current_matchmaker_schedule` の 1 行。
+pub(crate) async fn matchmaker_schedule_on(
+    conn: &mut PgConnection,
+) -> Result<MatchmakerSchedule, sqlx::Error> {
+    let row = sqlx::query!(
+        "select enabled as \"enabled!\", days_mask as \"days_mask!\", \
+                start_minute as \"start_minute!\", end_minute as \"end_minute!\" \
+         from current_matchmaker_schedule"
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(MatchmakerSchedule {
+        enabled: row.enabled,
+        days_mask: row.days_mask,
+        start_minute: row.start_minute,
+        end_minute: row.end_minute,
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -1693,5 +1739,95 @@ impl AdminRepository {
             total,
             query,
         })
+    }
+}
+
+/// 追記するスケジュール 1 件。
+#[derive(Debug, Clone)]
+pub struct NewMatchmakerSchedule {
+    /// 新しいスケジュール。**検証済みの値を渡すこと**（`admin::parse_time` / `parse_days`）。
+    pub schedule: MatchmakerSchedule,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// いま効いているスケジュール。**最新行から導出する。**
+    pub async fn matchmaker_schedule(&self) -> Result<MatchmakerSchedule, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        matchmaker_schedule_on(&mut conn).await
+    }
+
+    /// いまマッチメイカが止まっているか、その理由。**手動が先。**
+    pub async fn matchmaker_stop(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<MatchmakerStop>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        matchmaker_stop_on(&mut conn, now).await
+    }
+
+    /// スケジュールの変更を追記する。
+    ///
+    /// **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+    /// 先頭で同じ advisory lock を取り、その中でスケジュールを 1 回だけ読む（07 §4-1）。
+    /// 走っているスキャンは古い枠で走りきるか、新しい枠で始まるかのどちらかになる。
+    pub async fn change_matchmaker_schedule(
+        &self,
+        input: &NewMatchmakerSchedule,
+    ) -> Result<ScheduleOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        let inserted = sqlx::query_scalar!(
+            "insert into matchmaker_schedule_changes \
+             (enabled, days_mask, start_minute, end_minute, reason, created_by, \
+              idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.schedule.enabled,
+            input.schedule.days_mask,
+            input.schedule.start_minute,
+            input.schedule.end_minute,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(ScheduleOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::MatchmakerScheduled,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "matchmaker_schedule_change_id": id,
+                    "enabled": input.schedule.enabled,
+                    "days_mask": input.schedule.days_mask,
+                    "start_minute": input.schedule.start_minute,
+                    "end_minute": input.schedule.end_minute,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("matchmaker_schedule:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ScheduleOutcome::Changed { id })
     }
 }
