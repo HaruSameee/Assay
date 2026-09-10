@@ -8,11 +8,13 @@ use chrono::{DateTime, Utc};
 
 use crate::blocks::{CurrentBlock, IncomingBlock, ReceivedBlockCount};
 use crate::queue::html::role_label;
+use crate::queue::{MAX_RANGE, MIN_RANGE};
 use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
+use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
@@ -471,12 +473,13 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/queue", "キューと運用"),
         link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
         link("/admin/rating-params", "レート増減幅"),
+        link("/admin/matching-range", "マッチング範囲"),
         link("/admin/quiet-reports", "聞き専報告"),
     )
 }
@@ -1040,6 +1043,109 @@ pub fn rating_params_page(view: &RatingParamsView<'_>) -> String {
              {body}\
              </section>\n",
             nav = admin_nav("/admin/rating-params"),
+            notice = notice_html(view.notice.as_ref()),
+        ),
+    )
+}
+
+// ----------------------------------------------------------------------
+// マッチング範囲
+// ----------------------------------------------------------------------
+//
+// **この操作は過去を 1 件も変えない。**増減幅（上）と対になる画面なので、
+// そこだけは取り違えないように画面でも言い切る。効くのは次のスキャン以降の選抜だけ。
+
+pub struct MatchingRangeView<'a> {
+    /// 現在値・キュー人数・履歴。すべて導出値。
+    pub preview: &'a MatchingRangePreview,
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    pub notice: Option<Notice>,
+}
+
+fn matching_range_history(preview: &MatchingRangePreview) -> String {
+    if preview.history.is_empty() {
+        return "<p class=\"muted\">まだ一度も変更していません（既定値のまま）。</p>\n".to_owned();
+    }
+    let rows = preview
+        .history
+        .iter()
+        .map(|change| {
+            format!(
+                "<tr><td>{at}</td><td class=\"num\">+{up}</td><td class=\"num\">-{down}</td>\
+                 <td>{reason}</td><td>{by}</td></tr>\n",
+                at = escape(&display_time(change.created_at)),
+                up = change.up_range,
+                down = change.down_range,
+                reason = escape(&change.reason),
+                by = escape(&change.created_by),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>上</th><th>下</th><th>理由</th><th>操作者</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+pub fn matching_range_page(view: &MatchingRangeView<'_>) -> String {
+    let current = view.preview.current;
+    let body = format!(
+        "<p class=\"lead\">同じ試合に入れるレート差の幅です。ウィンドウの下端から\
+         <strong>上に +{up}</strong>、そこから<strong>下に -{down}</strong> までを 1 つの\
+         組み合わせとして探します。プレイヤーは変更できません。</p>\n\
+         <p class=\"notice\"><strong>過去の試合は 1 件も変わりません。</strong>\
+         幅が効くのは<strong>次のスキャン以降の選抜だけ</strong>です。確定済みの試合の\
+         レートも、いま進行中の formation も、この操作では動きません\
+         （レートの増減幅を変えたいときは<a href=\"/admin/rating-params\">レート増減幅</a>）。</p>\n\
+         <p class=\"notice\">追記専用です。間違えたら<strong>元の値をもう 1 行追記すれば戻ります</strong>。\
+         走っているスキャンとは同じロックで直列化されるので、1 回の選抜の途中で\
+         幅が入れ替わることはありません。</p>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>項目</th><th>値</th></tr></thead>\n<tbody>\n\
+         <tr><td><strong>現在の上方向の幅</strong></td><td class=\"num\">+{up}</td></tr>\n\
+         <tr><td><strong>現在の下方向の幅</strong></td><td class=\"num\">-{down}</td></tr>\n\
+         <tr><td>いまキューにいる人数（次のポーリングで「範囲内で N 人」が変わります）</td>\
+         <td class=\"num\">{queued}</td></tr>\n\
+         </tbody>\n</table></div>\n\
+         <form method=\"post\" action=\"/admin/matching-range\">\
+         <input type=\"hidden\" name=\"key\" value=\"matching-range:{key}\">\
+         <label for=\"up_range\">上方向の幅（{min}〜{max}）</label>\
+         <input id=\"up_range\" name=\"up_range\" type=\"text\" inputmode=\"numeric\" \
+         autocomplete=\"off\" value=\"{up}\" required>\
+         <label for=\"down_range\">下方向の幅（{min}〜{max}）</label>\
+         <input id=\"down_range\" name=\"down_range\" type=\"text\" inputmode=\"numeric\" \
+         autocomplete=\"off\" value=\"{down}\" required>\
+         <label for=\"reason\">理由（記録に残ります）</label>\
+         <input id=\"reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">マッチング範囲を変更する</button>\
+         </div></form>\n\
+         <h2>変更履歴</h2>\n{history}",
+        up = current.up,
+        down = current.down,
+        queued = view.preview.queued,
+        key = escape(view.form_key),
+        min = MIN_RANGE,
+        max = MAX_RANGE,
+        history = matching_range_history(view.preview),
+    );
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / マッチング範囲",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-matching-range-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-matching-range-title\">マッチング範囲を変える</h1>\n\
+             {nav}\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/matching-range"),
             notice = notice_html(view.notice.as_ref()),
         ),
     )

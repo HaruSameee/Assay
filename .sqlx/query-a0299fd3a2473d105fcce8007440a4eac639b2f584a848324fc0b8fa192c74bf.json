@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, $3, $3, $4) on conflict (player_id) do update set down_range = excluded.down_range, updated_at = excluded.updated_at returning id, enqueued_at, updated_at, down_range",
+  "query": "insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, $3, $3, (select down_range from current_matching_ranges)) on conflict (player_id) do update set down_range = excluded.down_range, updated_at = excluded.updated_at returning id, enqueued_at, updated_at, down_range, (select up_range from current_matching_ranges) as \"up_range!\"",
   "describe": {
     "columns": [
       {
@@ -46,22 +46,28 @@
             "name": "down_range"
           }
         }
+      },
+      {
+        "ordinal": 4,
+        "name": "up_range!",
+        "type_info": "Int4",
+        "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
         "Uuid",
-        "Timestamptz",
-        "Int4"
+        "Timestamptz"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "a34bff6535b4cdaf7476fc17c761932a675ee6b2a557e0805adad103dd36f6be"
+  "hash": "a0299fd3a2473d105fcce8007440a4eac639b2f584a848324fc0b8fa192c74bf"
 }

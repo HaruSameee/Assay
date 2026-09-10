@@ -38,14 +38,16 @@ use super::actions::{
 };
 use super::config::AdminIds;
 use super::html::{
-    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView, RatingParamsView,
-    ReportsView, SearchView, SeasonView, player_page, queue_page, quiet_reports_page,
-    rating_params_page, reports_page, search_page, season_page,
+    MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView,
+    RatingParamsView, ReportsView, SearchView, SeasonView, matching_range_page, player_page,
+    queue_page, quiet_reports_page, rating_params_page, reports_page, search_page, season_page,
 };
+use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewRatingParams, NewSeasonBoundary, NewStaffReport, RemovalOutcome, StaffReportOutcome,
+    NewMatchingRange, NewRatingParams, NewSeasonBoundary, NewStaffReport, RemovalOutcome,
+    StaffReportOutcome,
 };
 use super::season::{
     MAX_SEASON_LABEL_LENGTH, SeasonOutcome, confirmation_matches, normalize_label,
@@ -123,6 +125,11 @@ pub fn router(state: AdminState) -> Router {
             get(show_rating_params).post(change_rating_params),
         )
         .route("/admin/rating-params/confirm", post(confirm_rating_params))
+        // マッチング範囲。**1 段階**（過去を変えない・追記で戻せる操作なので）
+        .route(
+            "/admin/matching-range",
+            get(show_matching_range).post(change_matching_range),
+        )
         // 聞き専報告。**閲覧だけ**（運営が代理で入れる経路は作らない）
         .route("/admin/quiet-reports", get(show_quiet_reports))
         .route("/admin/season/confirm", post(confirm_season))
@@ -1258,6 +1265,106 @@ async fn change_rating_params(
         }
     };
     render_rating_params(&app, None, Some(notice), None).await
+}
+
+// ----------------------------------------------------------------------
+// マッチング範囲
+// ----------------------------------------------------------------------
+//
+// **1 段階で書く。**増減幅（`/admin/rating-params`）が 2 段階なのは、1 行積むと
+// 過去の全試合が引き直されて取り返しの説明が難しくなるためだった。幅は過去を
+// 1 件も変えず、元の値を追記すればそのまま戻る。当日の校正で何度も触る操作に
+// 確認を挟むと、かえって「とりあえず広げる」を誘発する。
+//
+// そのかわり、**理由は必須**で、現在値と履歴を同じ画面に出す。
+
+async fn render_matching_range(
+    app: &AdminState,
+    notice: Option<Notice>,
+    key: Option<&str>,
+) -> Response {
+    let preview = match app.store.matching_range_preview().await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not read the matching range preview");
+            return internal_error();
+        }
+    };
+    let generated = form_key();
+    Html(matching_range_page(&MatchingRangeView {
+        preview: &preview,
+        form_key: key.unwrap_or(&generated),
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_matching_range(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_matching_range(&app, None, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct MatchingRangeForm {
+    #[serde(default)]
+    up_range: String,
+    #[serde(default)]
+    down_range: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn change_matching_range(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<MatchingRangeForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let ranges = match parse_ranges(&form.up_range, &form.down_range) {
+        Ok(ranges) => ranges,
+        Err(error) => {
+            let notice = fail(error.to_string());
+            return render_matching_range(&app, Some(notice), Some(&form.key)).await;
+        }
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        let notice = fail("理由を入力してください。".to_owned());
+        return render_matching_range(&app, Some(notice), Some(&form.key)).await;
+    };
+
+    let input = NewMatchingRange {
+        ranges,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.change_matching_range(&input).await {
+        Ok(MatchingRangeOutcome::Changed { id }) => info(format!(
+            "マッチング範囲を 上 +{up} / 下 -{down} に変更しました（#{id}）。\
+             次のスキャンから効きます。確定済みの試合も進行中の formation も変わっていません。",
+            up = ranges.up,
+            down = ranges.down,
+        )),
+        Ok(MatchingRangeOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not change the matching range");
+            return internal_error();
+        }
+    };
+    render_matching_range(&app, Some(notice), None).await
 }
 
 // ----------------------------------------------------------------------

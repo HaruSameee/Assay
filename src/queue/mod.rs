@@ -6,7 +6,8 @@
 //! - **キューは可変**。エントリと離脱が頻繁に起き、残すべき履歴は formation 側にある。
 //!   追記専用の4テーブルとは扱いが違う（[`repository`] の冒頭を読むこと）。
 //! - **1プレイヤー1エントリ**。`queue_entries.player_id` の unique で二重キューを拒否する。
-//! - **上方向の範囲 +95 は固定**（[`model::UP_RANGE`]）。列にしない。
+//! - **上方向の範囲はユーザーが変えられない**（既定 50 = [`model::DEFAULT_UP_RANGE`]、
+//!   運営だけが管理パネルから変更できる）。キューの列にはしない。
 //! - **「範囲内で N 人」は相互条件で数える**（[`range`]）。片方向で数えると、
 //!   実際には組めない人数を画面に出すことになる。
 //! - **フレックス補償は導出値**（[`flex`]）。プレイヤーの可変列に持たない。
@@ -21,9 +22,9 @@ pub mod routes;
 
 pub use flex::{RoleAssignment, flex_compensation_owed, latest_assignment};
 pub use model::{
-    DOWN_RANGE, MAX_ROLE_PREFERENCES, QueueEntry, QueueEntryId, QueueRequest, QueueRequestError,
-    REMOVAL_NOTICE_WINDOW_HOURS, RolePreference, StaffRemoval, UP_RANGE, VoiceDestination,
-    clamp_down_range, validate_request,
+    DEFAULT_DOWN_RANGE, DEFAULT_UP_RANGE, MAX_RANGE, MAX_ROLE_PREFERENCES, MIN_RANGE,
+    MatchingRanges, QueueEntry, QueueEntryId, QueueRequest, QueueRequestError,
+    REMOVAL_NOTICE_WINDOW_HOURS, RolePreference, StaffRemoval, VoiceDestination, validate_request,
 };
 pub use range::{QueuedPlayer, accepts, count_in_range, mutually_in_range};
 pub use repository::{QueueError, QueueRepository};

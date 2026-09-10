@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::lifecycle::{PlayerId, Timestamp};
 use crate::persistence::Team;
-use crate::queue::model::UP_RANGE;
+use crate::queue::model::MatchingRanges;
 
 use super::flow::MinCostFlow;
 
@@ -232,7 +232,13 @@ impl ProposedMatch {
 /// 返る順序は決定的（レート降順・同点は `player_id` 昇順で走査した結果）。
 pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedMatch> {
     let mut observer = NoopSelectionObserver;
-    select_matches_inner(candidates, &AllyBlocks::new(), now, &mut observer)
+    select_matches_inner(
+        candidates,
+        &AllyBlocks::new(),
+        now,
+        MatchingRanges::default(),
+        &mut observer,
+    )
 }
 
 /// Select matches with hard ally-only incompatibilities.
@@ -240,19 +246,40 @@ pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedM
 /// Role allocation is deliberately unchanged. If the allocated ten players
 /// have no legal team split, [`find_one`] continues with the next existing
 /// rating-window anchor rather than searching another role assignment.
+///
+/// 幅は既定値（50/50）。**運営が変えた幅で組むのは
+/// [`select_matches_within`] の方**で、本番のスキャンはそちらを通る。
 pub fn select_matches_with_ally_blocks(
     candidates: &[Candidate],
     ally_blocks: &AllyBlocks,
     now: Timestamp,
 ) -> Vec<ProposedMatch> {
+    select_matches_within(candidates, ally_blocks, now, MatchingRanges::default())
+}
+
+/// 幅を明示して組む。**本番のスキャンはこれを通る。**
+///
+/// `ranges` はマッチメイカが 1 スキャンにつき 1 回だけ DB から読んだもの
+/// （`current_matching_ranges`）。ここで読み直さないのは、1 回の選抜の途中で
+/// 基準がずれないようにするため。
+///
+/// 下方向は候補ごとの `down_range` に丸め込み済みなので、ここで見るのは
+/// `ranges.up` だけである。
+pub fn select_matches_within(
+    candidates: &[Candidate],
+    ally_blocks: &AllyBlocks,
+    now: Timestamp,
+    ranges: MatchingRanges,
+) -> Vec<ProposedMatch> {
     let mut observer = NoopSelectionObserver;
-    select_matches_inner(candidates, ally_blocks, now, &mut observer)
+    select_matches_inner(candidates, ally_blocks, now, ranges, &mut observer)
 }
 
 fn select_matches_inner<O: SelectionObserver>(
     candidates: &[Candidate],
     ally_blocks: &AllyBlocks,
     now: Timestamp,
+    ranges: MatchingRanges,
     observer: &mut O,
 ) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
@@ -266,7 +293,7 @@ fn select_matches_inner<O: SelectionObserver>(
 
     let mut matches = Vec::new();
     while pool.len() >= MATCH_SIZE {
-        let Some((taken, proposal)) = find_one(&pool, ally_blocks, now, observer) else {
+        let Some((taken, proposal)) = find_one(&pool, ally_blocks, now, ranges, observer) else {
             break;
         };
         // 成立した 10 人を候補から外す（添字の大きい方から消す）
@@ -290,9 +317,10 @@ fn find_one<O: SelectionObserver>(
     pool: &[&Candidate],
     ally_blocks: &AllyBlocks,
     now: Timestamp,
+    ranges: MatchingRanges,
     observer: &mut O,
 ) -> Option<(Vec<usize>, ProposedMatch)> {
-    let span = f64::from(UP_RANGE);
+    let span = f64::from(ranges.up);
     for anchor in 0..pool.len() {
         observer.record_anchor();
         // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
@@ -544,7 +572,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::queue::model::DOWN_RANGE;
+    use crate::queue::model::{DEFAULT_DOWN_RANGE, DEFAULT_UP_RANGE};
 
     #[derive(Debug, Default)]
     struct SelectionDiagnostics {
@@ -635,7 +663,7 @@ mod tests {
                 who(
                     first_id + index as u128,
                     rating,
-                    DOWN_RANGE,
+                    DEFAULT_DOWN_RANGE,
                     600,
                     &[ROLES[index % ROLES.len()]],
                 )
@@ -648,7 +676,13 @@ mod tests {
         blocks: &AllyBlocks,
     ) -> (Vec<ProposedMatch>, SelectionDiagnostics) {
         let mut diagnostics = SelectionDiagnostics::default();
-        let matches = select_matches_inner(roster, blocks, now(), &mut diagnostics);
+        let matches = select_matches_inner(
+            roster,
+            blocks,
+            now(),
+            MatchingRanges::default(),
+            &mut diagnostics,
+        );
         (matches, diagnostics)
     }
 
@@ -691,7 +725,7 @@ mod tests {
             );
         }
         assert!(
-            proposal.rating_span() <= f64::from(UP_RANGE),
+            proposal.rating_span() <= f64::from(DEFAULT_UP_RANGE),
             "span {} exceeds the fixed +95 window",
             proposal.rating_span()
         );
@@ -847,7 +881,7 @@ mod tests {
                 who(
                     id,
                     1500.0,
-                    DOWN_RANGE,
+                    DEFAULT_DOWN_RANGE,
                     600,
                     &[ROLES[(id as usize - 1) % ROLES.len()]],
                 )
@@ -936,7 +970,7 @@ mod tests {
     fn the_least_patient_eleventh_player_is_left_out() {
         let mut roster = full_roster(1, 1500.0);
         // jungle 希望で 10 秒しか待っていない 11 人目。既存の jungle 2 人は 600 秒待っている
-        roster.push(who(11, 1500.0, DOWN_RANGE, 10, &["jungle"]));
+        roster.push(who(11, 1500.0, DEFAULT_DOWN_RANGE, 10, &["jungle"]));
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         assert_well_formed(&matches[0]);
@@ -952,8 +986,8 @@ mod tests {
     fn a_long_waiting_newcomer_displaces_a_fresh_player() {
         let mut roster = full_roster(1, 1500.0);
         // full_roster は index % 5 でロールを配るので、3 番は jungle
-        roster[2] = who(3, 1500.0, DOWN_RANGE, 5, &["jungle"]);
-        roster.push(who(11, 1500.0, DOWN_RANGE, 3600, &["jungle"]));
+        roster[2] = who(3, 1500.0, DEFAULT_DOWN_RANGE, 5, &["jungle"]);
+        roster.push(who(11, 1500.0, DEFAULT_DOWN_RANGE, 3600, &["jungle"]));
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         let chosen = ids(&matches[0]);
@@ -993,7 +1027,7 @@ mod tests {
     fn a_player_is_never_matched_fifty_one_below() {
         let mut roster = full_roster(1, 1549.0);
         // 1 番だけ 51 上
-        roster[0] = who(1, 1600.0, DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0] = who(1, 1600.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
         assert!(select_matches(&roster, now()).is_empty());
 
         // 50 下なら組める
@@ -1047,14 +1081,14 @@ mod tests {
     fn a_lopsided_role_distribution_produces_nothing() {
         // 全員 jungle だけ。jungle は 2 枠しかない
         let all_jungle: Vec<Candidate> = (1..=12)
-            .map(|n| who(n, 1500.0, DOWN_RANGE, 600, &["jungle"]))
+            .map(|n| who(n, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]))
             .collect();
         assert!(select_matches(&all_jungle, now()).is_empty());
 
         // 1 ロールだけ供給が消えても成立しない
         let mut roster = full_roster(1, 1500.0);
-        roster[4] = who(5, 1500.0, DOWN_RANGE, 600, &["jungle"]);
-        roster[9] = who(10, 1500.0, DOWN_RANGE, 600, &["jungle"]);
+        roster[4] = who(5, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]);
+        roster[9] = who(10, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]);
         assert!(select_matches(&roster, now()).is_empty());
     }
 
@@ -1062,7 +1096,7 @@ mod tests {
     #[test]
     fn a_second_choice_fills_the_gap_and_is_recorded_as_flexed() {
         let mut roster = full_roster(1, 1500.0);
-        roster[9] = who(10, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]);
+        roster[9] = who(10, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle", "bot_tank"]);
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         assert_well_formed(&matches[0]);
@@ -1080,16 +1114,16 @@ mod tests {
     fn a_flex_compensated_player_wins_the_contested_first_choice() {
         let contested = |flex_target: u128| -> Vec<Candidate> {
             let mut roster = vec![
-                who(1, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]),
-                who(2, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]),
-                who(3, 1500.0, DOWN_RANGE, 600, &["jungle", "bot_tank"]),
-                who(4, 1500.0, DOWN_RANGE, 600, &["bot_tank"]),
-                who(5, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
-                who(6, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
-                who(7, 1500.0, DOWN_RANGE, 600, &["top_support"]),
-                who(8, 1500.0, DOWN_RANGE, 600, &["top_support"]),
-                who(9, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
-                who(10, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
+                who(1, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle", "bot_tank"]),
+                who(2, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle", "bot_tank"]),
+                who(3, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle", "bot_tank"]),
+                who(4, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_tank"]),
+                who(5, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_carry"]),
+                who(6, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_carry"]),
+                who(7, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_support"]),
+                who(8, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_support"]),
+                who(9, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_carry"]),
+                who(10, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_carry"]),
             ];
             for candidate in roster.iter_mut() {
                 candidate.flex_compensation = candidate.player_id.0 == Uuid::from_u128(flex_target);
@@ -1123,16 +1157,22 @@ mod tests {
     #[test]
     fn flex_compensation_never_blocks_a_match() {
         let mut roster = vec![
-            who(1, 1500.0, DOWN_RANGE, 600, &["jungle"]),
-            who(2, 1500.0, DOWN_RANGE, 600, &["jungle"]),
-            who(3, 1500.0, DOWN_RANGE, 600, &["top_carry", "bot_tank"]),
-            who(4, 1500.0, DOWN_RANGE, 600, &["bot_tank"]),
-            who(5, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
-            who(6, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
-            who(7, 1500.0, DOWN_RANGE, 600, &["top_support"]),
-            who(8, 1500.0, DOWN_RANGE, 600, &["top_support"]),
-            who(9, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
-            who(10, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
+            who(1, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]),
+            who(2, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]),
+            who(
+                3,
+                1500.0,
+                DEFAULT_DOWN_RANGE,
+                600,
+                &["top_carry", "bot_tank"],
+            ),
+            who(4, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_tank"]),
+            who(5, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_carry"]),
+            who(6, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_carry"]),
+            who(7, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_support"]),
+            who(8, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_support"]),
+            who(9, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_carry"]),
+            who(10, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_carry"]),
         ];
         // 3 番は補償対象だが、第 1 希望の top_carry は 5・6 番で埋まっている
         roster[2].flex_compensation = true;
@@ -1179,16 +1219,16 @@ mod tests {
     #[test]
     fn teams_are_split_to_minimise_the_average_rating_gap() {
         let roster = vec![
-            who(1, 1500.0, DOWN_RANGE, 600, &["top_carry"]),
-            who(2, 1540.0, DOWN_RANGE, 600, &["top_carry"]),
-            who(3, 1540.0, DOWN_RANGE, 600, &["top_support"]),
-            who(4, 1500.0, DOWN_RANGE, 600, &["top_support"]),
-            who(5, 1500.0, DOWN_RANGE, 600, &["jungle"]),
-            who(6, 1540.0, DOWN_RANGE, 600, &["jungle"]),
-            who(7, 1540.0, DOWN_RANGE, 600, &["bot_carry"]),
-            who(8, 1500.0, DOWN_RANGE, 600, &["bot_carry"]),
-            who(9, 1520.0, DOWN_RANGE, 600, &["bot_tank"]),
-            who(10, 1520.0, DOWN_RANGE, 600, &["bot_tank"]),
+            who(1, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_carry"]),
+            who(2, 1540.0, DEFAULT_DOWN_RANGE, 600, &["top_carry"]),
+            who(3, 1540.0, DEFAULT_DOWN_RANGE, 600, &["top_support"]),
+            who(4, 1500.0, DEFAULT_DOWN_RANGE, 600, &["top_support"]),
+            who(5, 1500.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]),
+            who(6, 1540.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]),
+            who(7, 1540.0, DEFAULT_DOWN_RANGE, 600, &["bot_carry"]),
+            who(8, 1500.0, DEFAULT_DOWN_RANGE, 600, &["bot_carry"]),
+            who(9, 1520.0, DEFAULT_DOWN_RANGE, 600, &["bot_tank"]),
+            who(10, 1520.0, DEFAULT_DOWN_RANGE, 600, &["bot_tank"]),
         ];
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
@@ -1247,11 +1287,11 @@ mod tests {
         let mut pool: Vec<Candidate> = Vec::new();
         // 1600 が 6 人。全員 jungle しか希望しない（jungle は 2 枠）
         for n in 1..=6u128 {
-            pool.push(who(n, 1600.0, DOWN_RANGE, 600, &["jungle"]));
+            pool.push(who(n, 1600.0, DEFAULT_DOWN_RANGE, 600, &["jungle"]));
         }
         // 1550 が 6 人。全員 bot_tank だけ
         for n in 7..=12u128 {
-            pool.push(who(n, 1550.0, DOWN_RANGE, 600, &["bot_tank"]));
+            pool.push(who(n, 1550.0, DEFAULT_DOWN_RANGE, 600, &["bot_tank"]));
         }
         // 1500 が 10 人。bot_tank だけ供給が無い（top_carry が 4 人）
         let lower_roles = [
@@ -1267,7 +1307,13 @@ mod tests {
             "bot_carry",
         ];
         for (index, role) in lower_roles.iter().enumerate() {
-            pool.push(who(13 + index as u128, 1500.0, DOWN_RANGE, 600, &[role]));
+            pool.push(who(
+                13 + index as u128,
+                1500.0,
+                DEFAULT_DOWN_RANGE,
+                600,
+                &[role],
+            ));
         }
 
         let matches = select_matches(&pool, now());

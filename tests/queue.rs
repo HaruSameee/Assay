@@ -7,7 +7,7 @@
 //!
 //! 検証すること:
 //! - 二重キューを `queue_entries.player_id` の unique が拒否する
-//! - マッチング範囲は上下 50 固定。50 以外の down_range は CHECK が拒否する（旧仕様の値は読み出しで丸める）
+//! - マッチング範囲は運営だけが変えられる（既定 50/50）。CHECK は 10〜500 を通し、範囲外の down_range を拒否する（旧仕様の値は読み出しで現在の幅に丸める）
 //! - 登録ゲート・進行中ゲート・報告ゲートの拒否が**畳まれず別々に**返る
 //! - 成立済みでまだ始まっていない formation を持つ人はキューに入れない（二重割当を防ぐ）
 //! - 「範囲内で N 人」が差ちょうど 50 を含めて数えられる（境界は `<=`）
@@ -32,7 +32,7 @@ use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerI
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
 };
-use unite_matchsystem::queue::model::{DOWN_RANGE, QueueRequest, RolePreference};
+use unite_matchsystem::queue::model::{DEFAULT_DOWN_RANGE, QueueRequest, RolePreference};
 use unite_matchsystem::queue::{QueueError, QueueRepository, QueueState, router};
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
 use unite_matchsystem::registration::{AuthConfig, NewDeclaration, Rank, RegistrationRepository};
@@ -373,7 +373,11 @@ async fn a_player_cannot_hold_two_queue_entries(owner: PgPool) {
     db.done().await;
 }
 
-/// 下方向のマッチング範囲は 50 固定（07 §3）。CHECK で強制する。
+/// 下方向のマッチング範囲の CHECK（07 §3）。**運営が変えられる幅の内側だけを通す。**
+///
+/// 幅が 50 固定だった頃はこの CHECK が `= 50` だったが、運営が管理パネルから
+/// 変えられるようになったので `10〜500` に広げてある。境界の外は依然として
+/// DB が断る（狭すぎると 10 人が集まらず、広すぎると事実上の無制限になる）。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
@@ -381,7 +385,7 @@ async fn a_player_cannot_hold_two_queue_entries(owner: PgPool) {
 async fn the_downward_range_is_bounded_by_a_check_constraint(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
 
-    for (index, down_range) in [50].into_iter().enumerate() {
+    for (index, down_range) in [10, 30, 50, 100, 200, 500].into_iter().enumerate() {
         sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), $3)")
             .bind(Uuid::new_v4())
             .bind(player(index as u128 + 1).0)
@@ -391,7 +395,7 @@ async fn the_downward_range_is_bounded_by_a_check_constraint(owner: PgPool) {
             .unwrap_or_else(|error| panic!("{down_range} must be accepted: {error}"));
     }
 
-    for down_range in [30, 49, 51, 95, 100, 200, 0, -1] {
+    for down_range in [9, 501, 1000, 0, -1] {
         let error = sqlx::query("insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) values ($1, $2, now(), now(), $3)")
             .bind(Uuid::new_v4())
             .bind(player(9).0)
@@ -487,7 +491,7 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
     assert_eq!(status, StatusCode::OK);
     assert!(unqueued.contains("data-view=\"unqueued\""), "{unqueued}");
     assert!(
-        unqueued.contains("マッチング範囲は上下 ±50 固定です"),
+        unqueued.contains("マッチング範囲は上 +50 / 下 -50 です"),
         "{unqueued}"
     );
     assert!(unqueued.contains("top_carry"), "{unqueued}");
@@ -1256,10 +1260,10 @@ async fn a_legacy_entry_outside_the_new_range_is_clamped_on_read(owner: PgPool) 
 
     // 読み出しはどの経路でも丸まる
     let entry = db.queue.find(me).await.unwrap().expect("queued");
-    assert_eq!(entry.down_range, DOWN_RANGE, "自分のエントリ");
+    assert_eq!(entry.down_range, DEFAULT_DOWN_RANGE, "自分のエントリ");
     let queue = db.queue.queued_players().await.unwrap();
     assert_eq!(queue.len(), 1);
-    assert_eq!(queue[0].down_range, DOWN_RANGE, "範囲判定の入力");
+    assert_eq!(queue[0].down_range, DEFAULT_DOWN_RANGE, "範囲判定の入力");
 
     // 画面（JSON）にも丸めた値が出る
     let app = db.router();

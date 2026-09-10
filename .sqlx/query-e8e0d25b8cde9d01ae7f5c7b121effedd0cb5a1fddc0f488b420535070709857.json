@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, up_range as \"up_range!\", down_range as \"down_range!\", reason, created_by, created_at from matching_range_changes order by id desc limit 20",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "matching_range_changes",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "up_range!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "matching_range_changes",
+            "name": "up_range"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "down_range!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "matching_range_changes",
+            "name": "down_range"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "matching_range_changes",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "matching_range_changes",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "matching_range_changes",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e8e0d25b8cde9d01ae7f5c7b121effedd0cb5a1fddc0f488b420535070709857"
+}

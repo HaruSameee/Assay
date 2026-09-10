@@ -22,8 +22,8 @@ use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 use crate::matchmaker::FirstChoiceRoleCounts;
 
 use super::model::{
-    DOWN_RANGE, QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS,
-    RolePreference, StaffRemoval, VoiceDestination, clamp_down_range, validate_request,
+    MatchingRanges, QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS,
+    RolePreference, StaffRemoval, VoiceDestination, validate_request,
 };
 use super::range::QueuedPlayer;
 
@@ -92,14 +92,16 @@ impl QueueRepository {
 
         let entry = sqlx::query!(
             "insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) \
-             values ($1, $2, $3, $3, $4) \
+             values ($1, $2, $3, $3, \
+                     (select down_range from current_matching_ranges)) \
              on conflict (player_id) do update \
                  set down_range = excluded.down_range, updated_at = excluded.updated_at \
-             returning id, enqueued_at, updated_at, down_range",
+             returning id, enqueued_at, updated_at, down_range, \
+                       (select up_range from current_matching_ranges) \
+                           as \"up_range!\"",
             uuid::Uuid::new_v4(),
             player_id.0,
             now,
-            DOWN_RANGE,
         )
         .fetch_one(&mut *tx)
         .await
@@ -152,7 +154,9 @@ impl QueueRepository {
             player_id,
             enqueued_at: entry.enqueued_at,
             updated_at: entry.updated_at,
-            down_range: clamp_down_range(entry.down_range),
+            // 入れたばかりの行なので、`down_range` は投入時点の現在値そのもの
+            up_range: entry.up_range,
+            down_range: entry.down_range,
             roles: request.roles.clone(),
         })
     }
@@ -216,12 +220,14 @@ impl QueueRepository {
         )
         .fetch_all(&self.pool)
         .await?;
+        let ranges = self.ranges().await?;
         Ok(Some(QueueEntry {
             id: QueueEntryId(entry.id),
             player_id,
             enqueued_at: entry.enqueued_at,
             updated_at: entry.updated_at,
-            down_range: clamp_down_range(entry.down_range),
+            up_range: ranges.up,
+            down_range: ranges.clamp_down(entry.down_range),
             roles: roles
                 .into_iter()
                 .map(|row| RolePreference {
@@ -243,7 +249,26 @@ impl QueueRepository {
     /// キューの人数だけビュー全体を走査することになる。
     ///
     /// 規模はキュー100人程度（07 §6）なので、全件読んで Rust 側で数える。
+    /// 現在のマッチング範囲。`current_matching_ranges` の 1 行。
+    ///
+    /// **1 回の画面描画につき 1 回だけ呼ぶこと。**同じ描画の中で 2 回読むと、
+    /// 運営が間に幅を変えたときに「自分の幅」と「相手の幅」が食い違う。
+    pub async fn ranges(&self) -> Result<MatchingRanges, QueueError> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(crate::persistence::repository::matching_ranges(&mut conn).await?)
+    }
+
+    /// キュー中の全員を、現在の幅で読む。
     pub async fn queued_players(&self) -> Result<Vec<QueuedPlayer>, QueueError> {
+        let ranges = self.ranges().await?;
+        self.queued_players_within(ranges).await
+    }
+
+    /// 幅を明示して読む。**同じ描画の中で幅を 2 回読まないための入口。**
+    async fn queued_players_within(
+        &self,
+        ranges: MatchingRanges,
+    ) -> Result<Vec<QueuedPlayer>, QueueError> {
         // 第1希望のロールは**同じクエリに畳む**。範囲内の人数もロール別の内訳も
         // この1本の結果から数えるので、10秒ポーリングで往復が増えない
         let rows = sqlx::query!(
@@ -261,7 +286,8 @@ impl QueueRepository {
             .map(|row| QueuedPlayer {
                 player_id: PlayerId(row.player_id),
                 rating: row.rating,
-                down_range: clamp_down_range(row.down_range),
+                up_range: ranges.up,
+                down_range: ranges.clamp_down(row.down_range),
                 first_choice: row.first_choice,
             })
             .collect())
@@ -296,14 +322,18 @@ impl QueueRepository {
         &self,
         player_id: PlayerId,
     ) -> Result<InRangeSummary, QueueError> {
-        let queue = self.queued_players().await?;
+        // 幅の読み出しは**この 1 回だけ**。`queued_players_within` にも同じ 1 個を
+        // 渡すので、自分の幅と相手の幅が食い違わない
+        let ranges = self.ranges().await?;
+        let queue = self.queued_players_within(ranges).await?;
         let Some(rating) = self.player_rating(player_id).await? else {
             return Err(QueueError::PlayerNotFound(player_id));
         };
         let me = QueuedPlayer {
             player_id,
             rating,
-            down_range: DOWN_RANGE,
+            up_range: ranges.up,
+            down_range: ranges.down,
             // 未投入なので希望はまだ無い。内訳の分母には入らない
             first_choice: None,
         };
