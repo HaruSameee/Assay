@@ -712,13 +712,36 @@ fn season_counts(preview: &SeasonPreview) -> String {
          <tr><td>進行中の formation（matched / awaiting_host / awaiting_code / in_progress）</td>\
          <td class=\"num\">{active}</td></tr>\n\
          <tr><td>未報告の試合</td><td class=\"num\">{pending}</td></tr>\n\
+         <tr><td>係争中の試合</td><td class=\"num\">{disputed}</td></tr>\n\
          <tr><td>集計から外れる試合</td><td class=\"num\">{leaving}</td></tr>\n\
          <tr><td>影響を受けるプレイヤー</td><td class=\"num\">{players}</td></tr>\n\
          </tbody>\n</table></div>\n",
         active = preview.active_formations,
         pending = preview.pending_reports,
+        disputed = preview.disputed,
         leaving = preview.matches_leaving,
         players = preview.players_affected,
+    )
+}
+
+/// **係争中のまま境界を引くと、裁定しても新シーズンに入らない。**
+///
+/// 境界の判定は `formations.created_at` なので、境界より前に作られた試合は
+/// 境界より後に確定させても集計に入らない。裁定した運営には結果が見えないため、
+/// 件数だけでなく**何が起きるか**を書く。
+fn season_disputed_warning(preview: &SeasonPreview) -> String {
+    if preview.disputed == 0 {
+        return String::new();
+    }
+    format!(
+        "<p class=\"notice notice-error\">\
+         <strong>係争中の試合が {disputed} 件あります。先に裁定してください。</strong>\
+         これらの試合は、境界を引いた後に裁定して確定させても\
+         <strong>新しいシーズンのレートには反映されません</strong>。\
+         集計に入るかどうかは試合が<strong>作られた</strong>時刻で決まるためです\
+         （確定した時刻ではありません）。裁定した運営の画面にも「反映されなかった」ことは\
+         出ないので、境界を引く前に係争をゼロにしてください。</p>\n",
+        disputed = preview.disputed,
     )
 }
 
@@ -743,7 +766,7 @@ pub fn season_page(view: &SeasonView<'_>) -> String {
              <p>開始するシーズン: <strong>{label}</strong><br>\
              起点: <strong>{at}</strong>（この時刻より前に作られた試合と、この時刻より前に\
              追記された調整が集計から外れます）</p>\n\
-             {counts}\
+             {disputed}{counts}\
              <form method=\"post\" action=\"/admin/season\">\
              <input type=\"hidden\" name=\"label\" value=\"{label}\">\
              <input type=\"hidden\" name=\"key\" value=\"season:{key}\">\
@@ -755,6 +778,7 @@ pub fn season_page(view: &SeasonView<'_>) -> String {
              </div></form>\n",
             label = escape(label),
             at = escape(&display_time(view.effective_at)),
+            disputed = season_disputed_warning(view.preview),
             counts = season_counts(view.preview),
             key = escape(view.form_key),
         )
@@ -770,7 +794,7 @@ pub fn season_page(view: &SeasonView<'_>) -> String {
              境界そのものも追記されるので、後から完全に再構築できます。</p>\n\
              {current}\
              <h2>この操作で外れるもの</h2>\n\
-             {counts}\
+             {disputed}{counts}\
              <form method=\"post\" action=\"/admin/season/confirm\">\
              <input type=\"hidden\" name=\"key\" value=\"{key}\">\
              <label for=\"label\">新しいシーズンの名前（最大 {max} 文字）</label>\
@@ -778,6 +802,7 @@ pub fn season_page(view: &SeasonView<'_>) -> String {
              <div class=\"actions\">\
              <button class=\"button button-primary\" type=\"submit\">確認へ進む</button>\
              </div></form>\n",
+            disputed = season_disputed_warning(view.preview),
             current = current_season_line(view.preview),
             counts = season_counts(view.preview),
             key = escape(view.form_key),
@@ -878,7 +903,9 @@ fn rating_params_disputed_warning(preview: &RatingParamsPreview) -> String {
     format!(
         "<p class=\"notice\">係争中の試合が {disputed} 件あります。\
          裁定した時点で<strong>新しい</strong>増減幅が適用されるので、いま変えても\
-         「揉めていた試合だけ別の幅で計算される」ことはありません。\
+         「揉めていた試合だけ別の幅で計算される」ことはありません\
+         （現在のシーズンに入っている試合に限ります。シーズン境界より前に作られた試合は、\
+         裁定してもそもそも集計に入りません）。\
          ただし裁定の結果が変更後の値になることは把握しておいてください。</p>\n",
         disputed = preview.disputed,
     )
@@ -1456,6 +1483,69 @@ mod tests {
         ] {
             println!("===== {name}\n{html}");
         }
+    }
+
+    /// **係争中のまま境界を引こうとしたら、何が起きるかを書く。**
+    ///
+    /// 件数だけでは意味が伝わらない。境界の判定は `formations.created_at` なので、
+    /// 境界より後に裁定して確定させても新シーズンには入らない。
+    #[test]
+    fn the_season_page_explains_what_happens_to_disputed_matches() {
+        let with_disputes = SeasonPreview {
+            active_formations: 0,
+            pending_reports: 0,
+            disputed: 3,
+            matches_leaving: 12,
+            players_affected: 20,
+            current: None,
+        };
+        let rendered = season_page(&SeasonView {
+            preview: &with_disputes,
+            effective_at: Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap(),
+            form_key: "k",
+            confirming: None,
+            notice: None,
+        });
+        assert!(
+            rendered.contains("係争中の試合が 3 件あります"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("新しいシーズンのレートには反映されません"),
+            "何が起きるかが書かれていない: {rendered}"
+        );
+        assert!(
+            rendered.contains("作られた"),
+            "どの時刻で切るかが書かれていない: {rendered}"
+        );
+        // 2 段目にも同じ警告を出す（1 段目だけだと読み飛ばされる）
+        let confirming = season_page(&SeasonView {
+            preview: &with_disputes,
+            effective_at: Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap(),
+            form_key: "k",
+            confirming: Some("シーズン2"),
+            notice: None,
+        });
+        assert!(
+            confirming.contains("新しいシーズンのレートには反映されません"),
+            "{confirming}"
+        );
+
+        // 係争がゼロなら出さない
+        let clean = SeasonPreview {
+            disputed: 0,
+            ..with_disputes
+        };
+        let rendered = season_page(&SeasonView {
+            preview: &clean,
+            effective_at: Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap(),
+            form_key: "k",
+            confirming: None,
+            notice: None,
+        });
+        assert!(!rendered.contains("先に裁定してください"), "{rendered}");
+        // 件数の行そのものは常に出す（0 でも「集計されていない」と読まれないように）
+        assert!(rendered.contains("係争中の試合"), "{rendered}");
     }
 }
 

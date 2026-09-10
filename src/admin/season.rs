@@ -40,6 +40,12 @@ pub struct SeasonPreview {
     pub matches_leaving: usize,
     /// 影響を受けるプレイヤー数（外れる試合に参加していた人）。
     pub players_affected: usize,
+    /// 係争中の試合数。**拒否はしないが、境界を引くと取り返しがつかない。**
+    ///
+    /// 境界の判定は `formations.created_at` なので、境界より前に作られた試合は
+    /// **境界より後に裁定して確定させても新シーズンに入らない**。裁定した本人には
+    /// それが見えないため、実行前に件数と意味を必ず出す。
+    pub disputed: usize,
     /// いま効いている境界。まだ 1 本も無ければ `None`。
     pub current: Option<SeasonBoundary>,
 }

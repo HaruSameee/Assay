@@ -674,8 +674,11 @@ impl AdminRepository {
     ) -> Result<SeasonPreview, sqlx::Error> {
         let current = self.current_season().await?;
         let counts = self.unfinished_counts().await?;
-        let (active_formations, pending_reports) =
-            (counts.active_formations, counts.pending_reports);
+        let (active_formations, pending_reports, disputed) = (
+            counts.active_formations,
+            counts.pending_reports,
+            counts.disputed,
+        );
 
         // 集計から外れる試合と、その参加者。いま導出に入っているものだけを数える
         // （`player_match_rating_deltas` が現在の境界で既に絞られている）
@@ -695,6 +698,7 @@ impl AdminRepository {
             pending_reports,
             matches_leaving: usize::try_from(leaving.matches).unwrap_or(usize::MAX),
             players_affected: usize::try_from(leaving.players).unwrap_or(usize::MAX),
+            disputed,
             current,
         })
     }
