@@ -1371,7 +1371,7 @@ async fn what_happens_when_staff_reports_into_a_disputed_match(owner: PgPool) {
     db.done().await;
 }
 
-/// **係争中の試合は未報告者の一覧から外れ、閲覧専用の一覧に出る。**
+/// **係争中の試合は未報告者の一覧から外れ、裁定できる一覧に出る。**
 ///
 /// 件数が 15 分サマリの「係争対応待ち」と一致することも同時に測る。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
@@ -1415,26 +1415,46 @@ async fn a_disputed_match_leaves_the_entry_list_and_appears_read_only(owner: PgP
     );
     println!("入力欄が出る試合: 1 件（報告待ちのみ）");
 
-    // 係争中の試合は**閲覧専用の枠**に出る
-    assert!(page.contains("係争中の試合（1件・閲覧のみ）"), "{page}");
+    // 係争中の試合は**裁定できる枠**に出る
+    assert!(page.contains("係争中の試合（1件）"), "{page}");
     assert!(
-        page.contains("ここから結果を入れることはできません"),
+        page.contains("裁定しないと、その試合で未報告の人はキューに入れないままになります"),
         "{page}"
     );
     let disputed_section = page
         .split("id=\"disputed-title\"")
         .nth(1)
         .expect("the disputed section");
-    // **この枠には form も button も無い。**
+    // **裁定の 4 択がそろっている。**レートが動くかどうかも書いてある
+    for label in [
+        "赤の勝ちで確定",
+        "青の勝ちで確定",
+        "無効試合として確定",
+        "不成立（記録から外す）",
+    ] {
+        assert!(
+            disputed_section.contains(label),
+            "{label}: {disputed_section}"
+        );
+    }
     assert!(
-        !disputed_section.contains("<form"),
-        "係争の枠に入力欄がある"
+        disputed_section.contains("（レートが動きます）"),
+        "{disputed_section}"
     );
     assert!(
-        !disputed_section.contains("<button"),
-        "係争の枠にボタンがある"
+        disputed_section.contains("（レートは動きません）"),
+        "{disputed_section}"
     );
-    println!("係争中の枠: form も button も無い（閲覧のみ）");
+    assert!(
+        disputed_section.contains("action=\"/admin/reports/dispute\""),
+        "{disputed_section}"
+    );
+    // 理由は必須
+    assert!(
+        disputed_section.contains("name=\"reason\""),
+        "{disputed_section}"
+    );
+    println!("係争中の枠: 4 択の裁定フォームが出ている");
 
     // 誰が何を報告したかが読める
     assert!(disputed_section.contains("赤の勝ち"), "{disputed_section}");
@@ -1600,6 +1620,264 @@ async fn the_normal_entry_path_still_works(owner: PgPool) {
     println!(
         "通常の入力: HTTP 200 / match_reports {rows} 行 / report_entered {entered} 件 / report_rejected {rejected} 件"
     );
+
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 係争の裁定
+// ----------------------------------------------------------------------
+//
+// 係争にはこれまで解決経路が無く、運営チャンネルへ通知が飛ぶだけだった。
+// 残ったままだと、その試合で未報告のプレイヤーが**永久にキューへ入れない**。
+
+/// レートを読む（表示スケール）。裁定がレートに入ったかを実測する。
+async fn rating_of(db: &AppDb, who: PlayerId) -> f64 {
+    sqlx::query_scalar!(
+        "select rating as \"rating!\" from player_current_ratings where player_id = $1",
+        who.0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// 10 人ぶんのレートをまとめて読む。
+async fn ratings(db: &AppDb) -> Vec<f64> {
+    let mut all = Vec::new();
+    for who in 2..=11u128 {
+        all.push(rating_of(db, player(who)).await);
+    }
+    all
+}
+
+/// 係争中の試合を 1 件作る。8 人が red、1 人が blue、1 人が未報告。
+async fn disputed_formation(db: &AppDb, n: u128) {
+    playable_formation(db, n).await;
+    for who in 2..=9u128 {
+        player_report(db, n, who, "red").await;
+    }
+    player_report(db, n, 10, "blue").await;
+    db.formations
+        .append_event(
+            fid(n),
+            &NewEvent::new(K::Disputed, None, at(20), format!("disputed-{n}"))
+                .with_payload(json!({ "outcome": "disputed" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(db, n).await, S::Disputed);
+}
+
+/// **勝敗で裁定すると確定し、レートが動く。**報告は 1 行も書き換わらない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn adjudicating_a_win_confirms_the_match_and_moves_the_ratings(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    disputed_formation(&db, 1).await;
+    let app = db.router();
+
+    let reports_before = count(&db, "match_reports").await;
+    let before = ratings(&db).await;
+    println!("裁定前のレート: {before:?}");
+
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    let key = form_key(&page, "/admin/reports/dispute");
+    let (status, after_page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/dispute",
+        &format!(
+            "formation={}&decision=red&reason=recorded&key={key}",
+            fid(1).0
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after_page.contains("裁定を記録しました"), "{after_page}");
+    assert!(
+        after_page.contains("この試合の増減がレートに入りました"),
+        "{after_page}"
+    );
+
+    // 状態が confirmed になり、係争の一覧から消える
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+    assert!(db.admin.disputed_formations().await.unwrap().is_empty());
+
+    // **報告は 1 行も増えていないし、書き換わってもいない**
+    assert_eq!(
+        count(&db, "match_reports").await,
+        reports_before,
+        "報告の行数が変わった"
+    );
+
+    // レートが動いた。参加した 10 人全員
+    let after = ratings(&db).await;
+    println!("裁定後のレート: {after:?}");
+    let moved = before
+        .iter()
+        .zip(&after)
+        .filter(|(b, a)| (**b - **a).abs() > 0.5)
+        .count();
+    assert_eq!(moved, 10, "10 人全員のレートが動いていない");
+
+    // 運営操作ログに残る
+    let logged =
+        sqlx::query!("select reason, payload from admin_actions where kind = 'dispute_resolved'")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].reason.as_deref(), Some("recorded"));
+    assert_eq!(logged[0].payload["decision"], json!("red"));
+    assert_eq!(logged[0].payload["changes_ratings"], json!(true));
+    println!("admin_actions: {} 行", logged.len());
+
+    db.done().await;
+}
+
+/// **不成立で裁定するとレートは動かず、詰まっていた人のキューが開く。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn voiding_a_dispute_releases_the_player_who_never_reported(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    disputed_formation(&db, 1).await;
+    let app = db.router();
+
+    // player(11) だけが未報告。**disputed のあいだは報告ゲートで塞がれている**
+    let stuck = player(11);
+    let before = db.registration.queue_eligibility(stuck).await.unwrap();
+    assert!(
+        !before.pending_reports.is_empty(),
+        "塞がっていない: {before:?}"
+    );
+    println!(
+        "裁定前: pending_reports={} 件",
+        before.pending_reports.len()
+    );
+
+    let ratings_before = ratings(&db).await;
+
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    let key = form_key(&page, "/admin/reports/dispute");
+    let (status, after_page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/dispute",
+        &format!(
+            "formation={}&decision=voided&reason=no+room&key={key}",
+            fid(1).0
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        after_page.contains("レートは動いていません"),
+        "{after_page}"
+    );
+    assert_eq!(state_of(&db, 1).await, S::Voided);
+
+    // **キューが開いた**
+    let after = db.registration.queue_eligibility(stuck).await.unwrap();
+    assert!(
+        after.pending_reports.is_empty(),
+        "まだ塞がっている: {after:?}"
+    );
+    println!("裁定後: pending_reports={} 件", after.pending_reports.len());
+
+    // レートは 1 人も動いていない
+    assert_eq!(ratings_before, ratings(&db).await, "レートが動いた");
+
+    db.done().await;
+}
+
+/// **同じフォームを 2 回送っても 1 行しか積まない。**判定は冪等キーだけで行う。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn resolving_the_same_dispute_twice_records_one_row(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    disputed_formation(&db, 1).await;
+    let app = db.router();
+
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    let key = form_key(&page, "/admin/reports/dispute");
+    let body = format!(
+        "formation={}&decision=nullified&reason=double+submit&key={key}",
+        fid(1).0
+    );
+    let (_, first) = post_form(&app, player(ADMIN), "/admin/reports/dispute", &body).await;
+    assert!(first.contains("裁定を記録しました"), "{first}");
+    let (_, second) = post_form(&app, player(ADMIN), "/admin/reports/dispute", &body).await;
+    assert!(
+        second.contains("既に記録されています"),
+        "2 回目が no-op になっていない: {second}"
+    );
+
+    assert_eq!(state_of(&db, 1).await, S::Nullified);
+    let events = sqlx::query_scalar!(
+        "select count(*) as \"count!\" from formation_events \
+         where formation_id = $1 and kind = 'nullified'",
+        fid(1).0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1, "nullified が 2 行積まれた");
+    let logged = sqlx::query_scalar!(
+        "select count(*) as \"count!\" from admin_actions where kind = 'dispute_resolved'"
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged, 1, "操作ログが 2 行積まれた");
+    println!("nullified イベント: {events} 行 / dispute_resolved: {logged} 行");
+
+    db.done().await;
+}
+
+/// **既に裁定済みの試合には積まない。**別の運営が先に裁定していた場合。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_match_that_is_no_longer_disputed_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    disputed_formation(&db, 1).await;
+    let app = db.router();
+
+    // 画面を開いた後に、別の経路で裁定が済んでしまう
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    let key = form_key(&page, "/admin/reports/dispute");
+    db.formations
+        .append_event(
+            fid(1),
+            &NewEvent::new(K::Voided, None, at(30), "someone-else")
+                .with_payload(json!({ "decision_basis": "staff_adjudication" })),
+        )
+        .await
+        .unwrap();
+
+    let (status, after) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/dispute",
+        &format!("formation={}&decision=red&reason=late&key={key}", fid(1).0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after.contains("係争中ではありません"), "{after}");
+    assert!(
+        after.contains("voided"),
+        "現在の状態を書いていない: {after}"
+    );
+    // 状態は変わっていない
+    assert_eq!(state_of(&db, 1).await, S::Voided);
+    let logged = sqlx::query_scalar!(
+        "select count(*) as \"count!\" from admin_actions where kind = 'dispute_resolved'"
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged, 0, "断ったのに操作ログを積んだ");
+    println!("係争中でない試合への裁定: 拒否・イベントも操作ログも増えない");
 
     db.done().await;
 }

@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select reason, payload from admin_actions where kind = 'dispute_resolved'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "b0c9299d121685b1ee13cfc1c89550dae725b922a07ac93b51f983580ec7f6a4"
+}
