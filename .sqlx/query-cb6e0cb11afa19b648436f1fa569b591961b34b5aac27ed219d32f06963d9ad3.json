@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select v.rating as \"rating!\" from player_current_ratings v where v.player_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "rating"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "cb6e0cb11afa19b648436f1fa569b591961b34b5aac27ed219d32f06963d9ad3"
+}

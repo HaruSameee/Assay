@@ -101,9 +101,13 @@ jobs:
 
       # #[sqlx::test] は隔離 DB を作るので、この 1 ステップだけ管理用接続を使う。
       # テスト本体は assay_app に接続し直してリポジトリを操作する。
+      # **tests/ に増えた統合テストをここへ足し忘れないこと。**
+      # match_screen / ranking / season は長らく漏れており、CI が緑のまま
+      # 壊れたテストが main に入っていた。並びは tests/ のファイル名順にしてある。
       - name: Test (isolated databases; admin connection only bootstraps them)
         run: |
           DATABASE_URL="$TEST_ADMIN_DATABASE_URL" \
-            cargo test --test persistence --test discord --test schema --test registration \
-              --test queue --test matchmaker --test rating --test status --test admin \
-              --test admin_ops --test profiles --test blocks
+            cargo test --test admin --test admin_ops --test blocks --test discord \
+              --test match_screen --test matchmaker --test persistence --test profiles \
+              --test queue --test ranking --test rating --test registration \
+              --test schema --test season --test status

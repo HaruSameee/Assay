@@ -20,7 +20,6 @@ use uuid::Uuid;
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
 use crate::queue::model::clamp_down_range;
-use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
 use super::rating_params::{
@@ -456,16 +455,11 @@ impl AdminRepository {
         let rows = sqlx::query!(
             "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, \
                     p.discord_user_id, p.trainer_name, \
-                    $1::double precision \
-                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                    where a.player_id = q.player_id), 0::double precision) \
-                        + coalesce(m.delta, 0::double precision) \
-                        as \"rating!\" \
+                    v.rating as \"rating!\" \
              from queue_entries q \
              join players p on p.id = q.player_id \
-             left join player_match_ratings m on m.player_id = q.player_id \
+             join player_current_ratings v on v.player_id = q.player_id \
              order by q.enqueued_at, q.id",
-            DEFAULT_DISPLAY_MU,
         )
         .fetch_all(&self.pool)
         .await?;

@@ -754,8 +754,10 @@ async fn nobody_can_see_how_many_others_have_reported(owner: PgPool) {
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    // 9 人が報告して、10 人目（player 10）だけが未報告
-    for reporter in 1..=9u128 {
+    // **早期確定の閾値（7人）に届かない 6 人**が報告した状態で見る。
+    // 7 人に届くと確定して結果そのものが出るので、「他人の報告状況が漏れないこと」を
+    // 見るにはその手前で止める必要がある
+    for reporter in 1..=6u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
 
@@ -778,7 +780,7 @@ async fn nobody_can_see_how_many_others_have_reported(owner: PgPool) {
     assert_eq!(view["stage"], "in_progress");
 
     let (_, html) = get_html(&app, 1, player(10)).await;
-    for forbidden in ["9人", "9 人", "人が報告", "報告済み:", "件の報告"] {
+    for forbidden in ["6人", "6 人", "人が報告", "報告済み:", "件の報告"] {
         assert!(!html.contains(forbidden), "{forbidden}: {html}");
     }
     // 報告の入口は出る
@@ -913,16 +915,23 @@ async fn a_correction_moves_the_confirmation_but_not_the_agreement_metric(owner:
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    // player 1 が最初 blue と報告し、後から red に訂正する
-    assert_eq!(report(&app, 1, 1, "blue").await, StatusCode::OK);
-    assert_eq!(report(&app, 1, 1, "red").await, StatusCode::OK);
-    for reporter in 2..=10u128 {
+    // 10 人が報告するが、**閾値（7人）には届かない** 6 対 4 で止める
+    for reporter in 1..=6u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
-    // 最新の報告で全員一致 → confirmed
+    for reporter in 7..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
+    }
+    assert!(
+        matches!(state_of(&db, 1).await, S::InProgress { .. }),
+        "6 対 4 で確定してはいけない"
+    );
+
+    // **訂正が確定を動かす。**player 7 が blue → red に直すと red が 7 人になる
+    assert_eq!(report(&app, 1, 7, "red").await, StatusCode::OK);
     assert_eq!(state_of(&db, 1).await, S::Confirmed);
 
-    // 一致率は**最初の報告**で測る。player 1 の最初は blue なので 9/10
+    // 一致率は**最初の報告**で測る。player 7 の最初は blue なので、red と一致するのは 6/10
     let log = db.formations.load_events(fid(1)).await.unwrap();
     let confirmed = log
         .events
@@ -932,16 +941,16 @@ async fn a_correction_moves_the_confirmation_but_not_the_agreement_metric(owner:
         .expect("confirmed event");
     assert_eq!(
         confirmed.payload["first_report_agreement_matching"],
-        json!(9)
+        json!(6)
     );
     assert_eq!(confirmed.payload["first_report_agreement_total"], json!(10));
 
-    // 訂正で行が消えていない（追記のまま）
+    // 訂正で行が消えていない（追記のまま）。訂正したのは player 7
     let rows: i64 = sqlx::query_scalar!(
         "select count(*) as \"count!\" from match_reports \
          where formation_id = $1 and player_id = $2",
         fid(1).0,
-        player(1).0
+        player(7).0
     )
     .fetch_one(&db.pool)
     .await

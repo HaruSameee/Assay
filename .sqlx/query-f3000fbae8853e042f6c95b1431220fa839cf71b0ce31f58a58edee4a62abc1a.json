@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select fp.player_id, fp.team, p.trainer_name, p.discord_user_id, (select s.display_name from player_discord_snapshots s where s.player_id = fp.player_id order by s.id desc limit 1) as discord_name, (select s.avatar_hash from player_discord_snapshots s where s.player_id = fp.player_id order by s.id desc limit 1) as avatar_hash, r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", $2::double precision + coalesce((select sum(a.delta_mu) from season_rating_adjustments a where a.player_id = fp.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\" from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role left join player_match_ratings m on m.player_id = fp.player_id where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
+  "query": "select fp.player_id, fp.team, p.trainer_name, p.discord_user_id, (select s.display_name from player_discord_snapshots s where s.player_id = fp.player_id order by s.id desc limit 1) as discord_name, (select s.avatar_hash from player_discord_snapshots s where s.player_id = fp.player_id order by s.id desc limit 1) as avatar_hash, r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", v.rating as \"rating!\" from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role join player_current_ratings v on v.player_id = fp.player_id where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
   "describe": {
     "columns": [
       {
@@ -85,13 +85,17 @@
         "ordinal": 8,
         "name": "rating!",
         "type_info": "Float8",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "rating"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Float8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -103,8 +107,8 @@
       null,
       false,
       false,
-      null
+      true
     ]
   },
-  "hash": "f1b6199360e55f268f1cb73b315af980cfe650869123ea2979105517ca953af5"
+  "hash": "f3000fbae8853e042f6c95b1431220fa839cf71b0ce31f58a58edee4a62abc1a"
 }

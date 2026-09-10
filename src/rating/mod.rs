@@ -252,16 +252,21 @@ impl RatingAdjustmentRepository {
             .collect())
     }
 
-    /// 現在の表示レート。**1 プレイヤー分の正となる経路。**
+    /// 現在の表示レート。
     ///
-    /// キューとマッチメイカは人数ぶんまとめて読む必要があるので、同じ計算を
-    /// `player_match_ratings` ビューの側で行う。両者が一致することは `tests/rating.rs`
-    /// が検査する。
+    /// **合算は `player_current_ratings` に集約してある。**ここで式を組み立て直さない
+    /// ——キュー・マッチメイカ・マッチ画面・管理パネル・プロフィール・ランキングも
+    /// すべて同じビューを読む（導出の入口が増えたときに 1 か所だけ直せば済む）。
+    /// 純粋関数の [`display_rating`] は式そのものの単体テスト用に残してある。
     pub async fn display_rating(&self, player_id: PlayerId) -> Result<f64, sqlx::Error> {
-        let initial = self.initial_rating(player_id).await?;
-        let matches = self.played_matches(player_id).await?;
-        // 増減幅も導出値。**定数ではなく現行の値を読む**（管理パネルの最新行が正）
-        Ok(display_rating(initial, &matches, self.base_delta().await?))
+        // ビューは `players` を主にしているので、行が無いのは players に居ないときだけ
+        let rating = sqlx::query_scalar!(
+            "select rating as \"rating!\" from player_current_ratings where player_id = $1",
+            player_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(rating.unwrap_or(DEFAULT_DISPLAY_MU))
     }
 
     /// 現行の増減幅。`current_rating_params`（`rating_param_changes` の最新行）から導出する。

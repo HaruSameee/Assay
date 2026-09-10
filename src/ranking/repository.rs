@@ -7,8 +7,6 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::rating::DEFAULT_DISPLAY_MU;
-
 /// 掲載条件。**確定した試合が 5 試合以上。**
 ///
 /// `player_match_rating_deltas` は `confirmed` イベントのある試合しか返さないので、
@@ -64,10 +62,7 @@ impl RankingRepository {
     /// 掲載条件を満たす人数。
     pub async fn total(&self) -> Result<i64, sqlx::Error> {
         let total = sqlx::query_scalar!(
-            "select count(*) as \"count!\" from ( \
-                 select player_id from player_match_rating_deltas \
-                 group by player_id having count(*) >= $1 \
-             ) qualified",
+            "select count(*) as \"count!\" from player_current_ratings where matches >= $1",
             MINIMUM_MATCHES,
         )
         .fetch_one(&self.pool)
@@ -86,9 +81,16 @@ impl RankingRepository {
         let offset = (page - 1) * PAGE_SIZE;
 
         let rows = sqlx::query!(
-            "with qualified as ( \n                 select d.player_id, count(*)::bigint as matches, \n                        sum(d.delta) as match_delta \n                 from player_match_rating_deltas d \n                 group by d.player_id having count(*) >= $1 \n             ), adjusted as ( \n                 select a.player_id, sum(a.delta_mu) as adjust_delta \n                 from season_rating_adjustments a group by a.player_id \n             ) \n             select q.player_id as \"player_id!\", q.matches as \"matches!\", \n                    $2::double precision + coalesce(adj.adjust_delta, 0::double precision) \n                        + coalesce(q.match_delta, 0::double precision) as \"rating!\", \n                    p.trainer_name, \n                    (select s.display_name from player_discord_snapshots s \n                     where s.player_id = q.player_id order by s.id desc limit 1) as display_name \n             from qualified q \n             join players p on p.id = q.player_id \n             left join adjusted adj on adj.player_id = q.player_id \n             order by 3 desc, q.player_id \n             limit $3 offset $4",
+            "select v.player_id as \"player_id!\", v.matches as \"matches!\", 
+                    v.rating as \"rating!\", p.trainer_name, 
+                    (select s.display_name from player_discord_snapshots s 
+                     where s.player_id = v.player_id order by s.id desc limit 1) as display_name 
+             from player_current_ratings v 
+             join players p on p.id = v.player_id 
+             where v.matches >= $1 
+             order by v.rating desc, v.player_id 
+             limit $2 offset $3",
             MINIMUM_MATCHES,
-            DEFAULT_DISPLAY_MU,
             PAGE_SIZE,
             offset,
         )

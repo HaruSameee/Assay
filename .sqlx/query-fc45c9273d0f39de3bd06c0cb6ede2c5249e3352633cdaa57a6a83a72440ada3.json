@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select count(*) as \"count!\" from ( select player_id from player_match_rating_deltas group by player_id having count(*) >= $1 ) qualified",
+  "query": "select count(*) as \"count!\" from player_current_ratings where matches >= $1",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       null
     ]
   },
-  "hash": "1d3972446165a3f20bc7f814fbf3e1c6db51fdd0395b524bd50ceb940d1bb9bd"
+  "hash": "fc45c9273d0f39de3bd06c0cb6ede2c5249e3352633cdaa57a6a83a72440ada3"
 }
