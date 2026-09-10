@@ -786,3 +786,146 @@ async fn changing_the_delta_recomputes_every_past_match(owner: PgPool) {
 
     db.done().await;
 }
+
+/// **進行中の formation があるあいだは増減幅を変えられない。**
+///
+/// 1 行積んだ瞬間に全員のレートが動き、キュー中の人の範囲判定（±50）も同時に変わる。
+/// シーズン境界と同じ条件で止める。**断ったことは記録に残す。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn an_active_formation_blocks_the_change(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // 確定済みが 1 件（引き直しの対象）、進行中が 1 件
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+    play(&db, 2, 1500.0, 1500.0).await; // in_progress のまま
+
+    let preview = admin.rating_params_preview().await.unwrap();
+    assert_eq!(preview.active_formations, 1, "進行中を数えていない");
+    assert_eq!(preview.pending_reports, 1, "未報告を数えていない");
+    assert!(!preview.can_change(), "進行中があるのに実行できてしまう");
+
+    let blocked = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "進行中でも変えようとする".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(100),
+            idempotency_key: "while-active".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked,
+        RatingParamsOutcome::Blocked {
+            active_formations: 1
+        }
+    );
+
+    // **増減幅は動いていない。**行も増えていない
+    assert_eq!(admin.rating_params().await.unwrap().base_delta, 7.0);
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 7.0);
+    let rows: i64 = sqlx::query_scalar("select count(*) from rating_param_changes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "拒否したのに行が積まれている");
+
+    // **断ったことは admin_actions に残る**
+    let rejected: (String, serde_json::Value) = sqlx::query_as(
+        "select kind, payload from admin_actions where kind = 'rating_params_rejected'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected.1["requested_base_delta"], serde_json::json!(20.0));
+    assert_eq!(rejected.1["active_formations"], serde_json::json!(1));
+    println!("進行中 1 件 → 拒否。admin_actions: {}", rejected.0);
+
+    // 進行中の試合を終わらせれば通る
+    finish(&db, 2, K::Confirmed, "red").await;
+    let preview = admin.rating_params_preview().await.unwrap();
+    assert_eq!(preview.active_formations, 0);
+    assert!(preview.can_change());
+    let changed = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "終わったので変える".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(200),
+            idempotency_key: "after-active".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(changed, RatingParamsOutcome::Changed { .. }));
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 20.0);
+    println!("進行中 0 件 → 実行できる（増減幅 20 で引き直し）");
+
+    db.done().await;
+}
+
+/// **増減幅を変えると、キュー中の人の範囲判定（±50）の対象が変わる。**
+///
+/// レートが導出値なので、増減幅は「過去の勝敗がいまのレートに与える大きさ」を変える。
+/// その結果、誰と誰が同じ範囲に入るかがその場で動く。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn changing_the_delta_moves_who_is_in_range(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // player 1（red）が 1 勝、player 6（blue）が 1 敗。ほかは動かさない
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+
+    // 3 人をキューに入れる。player 2 も red なので 1 勝している
+    for who in [player(1), player(2), player(6)] {
+        enqueue(&db, who, "jungle", at(50)).await;
+    }
+
+    // 増減幅 7: 勝った 1 と 2 が 1507、負けた 6 が 1493。差は 14 で全員が範囲内
+    let winner_before = queued_rating(&db, player(1)).await;
+    let loser_before = queued_rating(&db, player(6)).await;
+    let before = db
+        .queue
+        .in_range_summary(player(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .total;
+    assert_eq!(winner_before, 1507.0);
+    assert_eq!(loser_before, 1493.0);
+    assert_eq!(before, 2, "差 14 なら 2 人とも範囲内");
+
+    // **増減幅を 30 に上げる。**勝者 1530 / 敗者 1470 で差 60 → 範囲外になる
+    admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 30.0,
+            reason: "範囲判定の変化を見る".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(300),
+            idempotency_key: "widen".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let winner_after = queued_rating(&db, player(1)).await;
+    let loser_after = queued_rating(&db, player(6)).await;
+    let after = db
+        .queue
+        .in_range_summary(player(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .total;
+    assert_eq!(winner_after, 1530.0);
+    assert_eq!(loser_after, 1470.0);
+    assert_eq!(after, 1, "差 60 になった相手は範囲外へ出る");
+
+    println!(
+        "増減幅 7 → 30: 勝者 {winner_before} → {winner_after} / 敗者 {loser_before} → {loser_after} / \
+         勝者から見た「範囲内でキュー中」 {before}人 → {after}人"
+    );
+
+    db.done().await;
+}

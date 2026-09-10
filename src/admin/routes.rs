@@ -1240,6 +1240,11 @@ async fn change_rating_params(
         Ok(RatingParamsOutcome::Duplicate) => {
             info("この操作は既に記録されています。行は増やしていません。".to_owned())
         }
+        Ok(RatingParamsOutcome::Blocked { active_formations }) => fail(format!(
+            "進行中の formation が {active_formations} 件あるため実行しませんでした。\
+             増減幅は 1 行積んだ瞬間に全員のレートとキューの範囲判定を変えます。\
+             終わってからやり直してください。"
+        )),
         Err(err) => {
             error!(%err, "could not change the rating params");
             return internal_error();

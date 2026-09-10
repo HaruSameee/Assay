@@ -48,8 +48,30 @@ pub struct RatingParamsPreview {
     pub matches_affected: usize,
     /// **影響を受けるプレイヤー数。**その試合に参加していた人。
     pub players_affected: usize,
+    /// 進行中の formation 数（matched / awaiting_host / awaiting_code / in_progress）。
+    /// **1 件でもあれば実行を拒否する。**
+    pub active_formations: usize,
+    /// 未報告の試合数。**`active_formations` の部分集合**（未報告なら必ず `in_progress`）
+    /// なので、これ自体は拒否の条件にしていない。画面に内訳として出すだけ。
+    pub pending_reports: usize,
+    /// 係争中の試合数。**拒否はしないが警告として出す。**裁定の時点で新しい値が
+    /// 適用されるので、いま変えると「揉めていた試合だけ別の幅で計算される」ことはない
+    /// ——が、運営が把握しないまま変えると説明できなくなる。
+    pub disputed: usize,
     /// 直近の変更履歴（新しい順）。空なら一度も変えていない。
     pub history: Vec<RatingParamChange>,
+}
+
+impl RatingParamsPreview {
+    /// 実行してよいか。**進行中の formation が 1 件でもあれば拒否する。**
+    ///
+    /// 増減幅は 1 行積んだ瞬間に全プレイヤーのレートを変える。進行中の試合が
+    /// あるあいだに変えると、その試合が始まったときのレートと確定時の計算が
+    /// 食い違って見え、キュー中の人の範囲判定（±50）も同時に動く。
+    /// シーズン境界（[`super::season::SeasonPreview::can_start`]）と同じ条件にしてある。
+    pub fn can_change(&self) -> bool {
+        self.active_formations == 0
+    }
 }
 
 /// 変更を追記した結果。
@@ -64,6 +86,11 @@ pub enum RatingParamsOutcome {
     },
     /// 同一 `idempotency_key` の行が既にある（no-op）。**状態ベースの判定はしない。**
     Duplicate,
+    /// 進行中の formation があるので実行しなかった。**断ったことは記録に残す。**
+    Blocked {
+        /// 進行中の件数。画面に出して止める。
+        active_formations: usize,
+    },
 }
 
 /// 増減幅の下限（この値そのものは許可しない。0 以下を拒否する）。

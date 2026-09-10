@@ -844,9 +844,43 @@ fn rating_params_counts(preview: &RatingParamsPreview) -> String {
          <thead><tr><th>項目</th><th>件数</th></tr></thead>\n<tbody>\n\
          <tr><td><strong>引き直される試合</strong></td><td class=\"num\">{matches}</td></tr>\n\
          <tr><td><strong>レートが動くプレイヤー</strong></td><td class=\"num\">{players}</td></tr>\n\
+         <tr><td>進行中の formation（1 件でもあれば実行できません）</td>\
+         <td class=\"num\">{active}</td></tr>\n\
+         <tr><td>うち未報告の試合</td><td class=\"num\">{pending}</td></tr>\n\
+         <tr><td>係争中の試合（裁定時に新しい値で計算されます）</td>\
+         <td class=\"num\">{disputed}</td></tr>\n\
          </tbody>\n</table></div>\n",
         matches = preview.matches_affected,
         players = preview.players_affected,
+        active = preview.active_formations,
+        pending = preview.pending_reports,
+        disputed = preview.disputed,
+    )
+}
+
+/// 進行中の formation があるので実行できない、という説明。
+fn rating_params_blocked(preview: &RatingParamsPreview) -> String {
+    format!(
+        "<p class=\"notice notice-error\"><strong>進行中の試合が {active} 件あるため、\
+         いまは増減幅を変更できません。</strong>増減幅は 1 行積んだ瞬間に全員のレートを\
+         変えるので、進行中の試合があると、その試合が始まったときのレートと確定時の計算が\
+         食い違って見えます。キュー中の人のマッチング範囲（±50）も同時に動きます。\
+         終わってからやり直してください。</p>\n",
+        active = preview.active_formations,
+    )
+}
+
+/// 係争中の試合があるときの警告。**拒否はしない。**
+fn rating_params_disputed_warning(preview: &RatingParamsPreview) -> String {
+    if preview.disputed == 0 {
+        return String::new();
+    }
+    format!(
+        "<p class=\"notice\">係争中の試合が {disputed} 件あります。\
+         裁定した時点で<strong>新しい</strong>増減幅が適用されるので、いま変えても\
+         「揉めていた試合だけ別の幅で計算される」ことはありません。\
+         ただし裁定の結果が変更後の値になることは把握しておいてください。</p>\n",
+        disputed = preview.disputed,
     )
 }
 
@@ -922,12 +956,23 @@ pub fn rating_params_page(view: &RatingParamsView<'_>) -> String {
             counts = rating_params_counts(view.preview),
             key = escape(view.form_key),
         )
+    } else if !view.preview.can_change() {
+        // 進行中の試合があるので、そもそもフォームを出さない
+        format!(
+            "{blocked}{disputed}{current}<h2>現在の状況</h2>\n{counts}\
+             <h2>変更履歴</h2>\n{history}",
+            blocked = rating_params_blocked(view.preview),
+            disputed = rating_params_disputed_warning(view.preview),
+            current = current_rating_params_line(view.preview),
+            counts = rating_params_counts(view.preview),
+            history = rating_params_history(view.preview),
+        )
     } else {
         // 1 段目: 警告と件数、値の入力
         format!(
             "<p class=\"lead\">1 試合あたりのレート増減幅です。勝ちが +この値、負けが −この値、\
              引き分けは 0 になります（相手との差は増減に影響しません）。</p>\n\
-             {warning}\
+             {disputed}{warning}\
              <p class=\"notice\"><strong>試合のログは 1 行も消えません。</strong>\
              レートは導出値で、増減幅も追記ログの最新行から導出されます。\
              値を変えると、同じ試合ログを新しい増減幅で計算し直すだけです。</p>\n\
@@ -943,6 +988,7 @@ pub fn rating_params_page(view: &RatingParamsView<'_>) -> String {
              </div></form>\n\
              <h2>変更履歴</h2>\n{history}",
             warning = RECOMPUTE_WARNING,
+            disputed = rating_params_disputed_warning(view.preview),
             current = current_rating_params_line(view.preview),
             counts = rating_params_counts(view.preview),
             key = escape(view.form_key),

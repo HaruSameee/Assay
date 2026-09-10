@@ -673,35 +673,9 @@ impl AdminRepository {
         effective_at: DateTime<Utc>,
     ) -> Result<SeasonPreview, sqlx::Error> {
         let current = self.current_season().await?;
-
-        // 進行中（matched / awaiting_host / awaiting_code / in_progress）と、
-        // 報告待ち（in_progress）を 1 回の走査で数える
-        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
-            .list_unfinished()
-            .await
-            .map_err(|error| match error {
-                crate::persistence::RepositoryError::Database(error) => error,
-                // list_unfinished は導出しかしないので、他の種別は起きない
-                other => sqlx::Error::Protocol(other.to_string()),
-            })?;
-        let mut active_formations = 0;
-        let mut pending_reports = 0;
-        for formation in &unfinished {
-            match &formation.snapshot.state {
-                crate::lifecycle::FormationState::Matched
-                | crate::lifecycle::FormationState::AwaitingHost { .. }
-                | crate::lifecycle::FormationState::AwaitingCode { .. } => active_formations += 1,
-                crate::lifecycle::FormationState::InProgress { .. } => {
-                    active_formations += 1;
-                    pending_reports += 1;
-                }
-                crate::lifecycle::FormationState::Disputed
-                | crate::lifecycle::FormationState::Confirmed
-                | crate::lifecycle::FormationState::Nullified
-                | crate::lifecycle::FormationState::Voided
-                | crate::lifecycle::FormationState::Abandoned => {}
-            }
-        }
+        let counts = self.unfinished_counts().await?;
+        let (active_formations, pending_reports) =
+            (counts.active_formations, counts.pending_reports);
 
         // 集計から外れる試合と、その参加者。いま導出に入っているものだけを数える
         // （`player_match_rating_deltas` が現在の境界で既に絞られている）
@@ -783,6 +757,53 @@ impl AdminRepository {
     }
 }
 
+/// 未終了 formation の内訳。**進行中を止める判定はここ 1 か所から取る。**
+///
+/// シーズン境界とレート増減幅の変更が同じ条件（進行中が 1 件でもあれば拒否）を
+/// 使うので、数え方を 2 か所に書かない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnfinishedCounts {
+    /// matched / awaiting_host / awaiting_code / in_progress。
+    pub active_formations: usize,
+    /// in_progress（＝まだ報告が揃っていない試合）。`active_formations` の部分集合。
+    pub pending_reports: usize,
+    /// disputed。進行中には数えないが、確定していないので警告として出す。
+    pub disputed: usize,
+}
+
+impl AdminRepository {
+    /// 未終了 formation を 1 回の走査で数える。
+    pub async fn unfinished_counts(&self) -> Result<UnfinishedCounts, sqlx::Error> {
+        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => error,
+                // list_unfinished は導出しかしないので、他の種別は起きない
+                other => sqlx::Error::Protocol(other.to_string()),
+            })?;
+        let mut counts = UnfinishedCounts::default();
+        for formation in &unfinished {
+            match &formation.snapshot.state {
+                crate::lifecycle::FormationState::Matched
+                | crate::lifecycle::FormationState::AwaitingHost { .. }
+                | crate::lifecycle::FormationState::AwaitingCode { .. } => {
+                    counts.active_formations += 1;
+                }
+                crate::lifecycle::FormationState::InProgress { .. } => {
+                    counts.active_formations += 1;
+                    counts.pending_reports += 1;
+                }
+                crate::lifecycle::FormationState::Disputed => counts.disputed += 1,
+                crate::lifecycle::FormationState::Confirmed
+                | crate::lifecycle::FormationState::Nullified
+                | crate::lifecycle::FormationState::Voided
+                | crate::lifecycle::FormationState::Abandoned => {}
+            }
+        }
+        Ok(counts)
+    }
+}
 // ----------------------------------------------------------------------
 // レート増減幅の変更
 // ----------------------------------------------------------------------
@@ -828,6 +849,7 @@ impl AdminRepository {
     /// シーズン境界より前の試合は最初から入らない）。
     pub async fn rating_params_preview(&self) -> Result<RatingParamsPreview, sqlx::Error> {
         let current = self.rating_params().await?;
+        let unfinished = self.unfinished_counts().await?;
         let counts = sqlx::query!(
             "select count(distinct d.formation_id) as \"matches!\", \
                     count(distinct d.player_id) as \"players!\" \
@@ -847,6 +869,9 @@ impl AdminRepository {
             current_params_version: current.params_version,
             matches_affected: usize::try_from(counts.matches).unwrap_or(0),
             players_affected: usize::try_from(counts.players).unwrap_or(0),
+            active_formations: unfinished.active_formations,
+            pending_reports: unfinished.pending_reports,
+            disputed: unfinished.disputed,
             history: history
                 .into_iter()
                 .map(|row| RatingParamChange {
@@ -870,6 +895,33 @@ impl AdminRepository {
         input: &NewRatingParams,
     ) -> Result<RatingParamsOutcome, AdminStoreError> {
         let preview = self.rating_params_preview().await?;
+        // **進行中の formation があるあいだは変えない。**1 行積んだ瞬間に全員のレートが
+        // 動き、キュー中の人の範囲判定も同時に変わる。断ったことは記録に残す
+        if !preview.can_change() {
+            let mut tx = self.pool.begin().await?;
+            append_action_on(
+                &mut tx,
+                &NewAdminAction {
+                    kind: AdminActionKind::RatingParamsRejected,
+                    actor_discord_user_id: input.actor_discord_user_id,
+                    target_player_id: None,
+                    reason: Some(input.reason.clone()),
+                    payload: serde_json::json!({
+                        "requested_base_delta": input.base_delta,
+                        "current_base_delta": preview.current_base_delta,
+                        "active_formations": preview.active_formations,
+                        "pending_reports": preview.pending_reports,
+                    }),
+                    occurred_at: input.created_at,
+                    idempotency_key: format!("rating_params_rejected:{}", input.idempotency_key),
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(RatingParamsOutcome::Blocked {
+                active_formations: preview.active_formations,
+            });
+        }
         let params_version = preview.current_params_version + 1;
 
         let mut tx = self.pool.begin().await?;
