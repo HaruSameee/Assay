@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into rating_param_changes (params_version, base_delta, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5, $6) on conflict (idempotency_key) do nothing returning id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rating_param_changes",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Float8",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "52126edd4c7848f850f147d48740cfdddb69e1af988f16e270068b6aaab16e60"
+}

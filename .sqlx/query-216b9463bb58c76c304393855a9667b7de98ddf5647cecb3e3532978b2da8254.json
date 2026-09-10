@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, $1::double precision + coalesce((select sum(a.delta_mu) from season_rating_adjustments a where a.player_id = q.player_id), 0::double precision) + coalesce(m.delta, 0::double precision) as \"rating!\", $2::double precision + coalesce((select sum(a.delta_sigma) from season_rating_adjustments a where a.player_id = q.player_id), 0::double precision) as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q left join player_match_ratings m on m.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
+  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, v.rating as \"rating!\", v.sigma as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q join player_current_ratings v on v.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
   "describe": {
     "columns": [
       {
@@ -51,13 +51,23 @@
         "ordinal": 4,
         "name": "rating!",
         "type_info": "Float8",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "rating"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "sigma!",
         "type_info": "Float8",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "sigma"
+          }
+        }
       },
       {
         "ordinal": 6,
@@ -94,22 +104,19 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Float8",
-        "Float8"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
       false,
       false,
       false,
-      null,
-      null,
+      true,
+      true,
       false,
       false,
       false
     ]
   },
-  "hash": "a96ab652640b8dfa18715e940b23835d888b8167e0273b5c68c08f4277dd4c7a"
+  "hash": "216b9463bb58c76c304393855a9667b7de98ddf5647cecb3e3532978b2da8254"
 }

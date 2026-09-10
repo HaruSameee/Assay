@@ -20,7 +20,6 @@ use sqlx::PgPool;
 
 use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 use crate::matchmaker::FirstChoiceRoleCounts;
-use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::model::{
     DOWN_RANGE, QueueEntry, QueueEntryId, QueueRequest, REMOVAL_NOTICE_WINDOW_HOURS,
@@ -245,14 +244,9 @@ impl QueueRepository {
             "select q.player_id, q.down_range, \
                     (select r.role from queue_entry_roles r \
                      where r.entry_id = q.id and r.priority = 1) as first_choice, \
-                    $1::double precision \
-                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                    where a.player_id = q.player_id), 0::double precision) \
-                        + coalesce(m.delta, 0::double precision) \
-                        as \"rating!\" \
+                    v.rating as \"rating!\" \
              from queue_entries q \
-             left join player_match_ratings m on m.player_id = q.player_id",
-            DEFAULT_DISPLAY_MU,
+             join player_current_ratings v on v.player_id = q.player_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -398,16 +392,9 @@ impl QueueRepository {
     /// 表示スケールの現在レート。現在値テーブルを作らず追記ログから導出する。
     async fn player_rating(&self, player_id: PlayerId) -> Result<Option<f64>, QueueError> {
         let row = sqlx::query!(
-            "select $2::double precision \
-                    + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                where a.player_id = p.id), 0::double precision) \
-                    + coalesce(m.delta, 0::double precision) \
-                    as \"rating!\" \
-             from players p \
-             left join player_match_ratings m on m.player_id = p.id \
-             where p.id = $1",
+            "select v.rating as \"rating!\" \
+             from player_current_ratings v where v.player_id = $1",
             player_id.0,
-            DEFAULT_DISPLAY_MU,
         )
         .fetch_optional(&self.pool)
         .await?;

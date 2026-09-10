@@ -18,7 +18,6 @@ use uuid::Uuid;
 
 use crate::lifecycle::{FormationId, PlayerId, Timestamp};
 use crate::persistence::{FormationRepository, RepositoryError};
-use crate::rating::DEFAULT_DISPLAY_MU;
 
 /// マッチ画面が読む1人分の行。**ロールは載せるが、出す相手は呼び出し側が決める。**
 ///
@@ -146,18 +145,14 @@ impl MatchRepository {
                     (select s.avatar_hash from player_discord_snapshots s \
                      where s.player_id = fp.player_id order by s.id desc limit 1) as avatar_hash, \
                     r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", \
-                    $2::double precision \
-                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                    where a.player_id = fp.player_id), 0::double precision) \
-                        + coalesce(m.delta, 0::double precision) as \"rating!\" \
+                    v.rating as \"rating!\" \
              from formation_players fp \
              join players p on p.id = fp.player_id \
              join roles r on r.id = fp.role \
-             left join player_match_ratings m on m.player_id = fp.player_id \
+             join player_current_ratings v on v.player_id = fp.player_id \
              where fp.formation_id = $1 \
              order by fp.team, r.sort_order, fp.player_id",
             formation_id.0,
-            DEFAULT_DISPLAY_MU,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -340,6 +335,12 @@ fn short_digest(value: &str) -> String {
 /// UUID をパスから読むときの補助（不正な値は `None`）。
 pub fn parse_formation_id(raw: &str) -> Option<FormationId> {
     Uuid::parse_str(raw.trim()).ok().map(FormationId)
+}
+
+/// リクエストボディの対象プレイヤー。**存在確認はしない**——参加者かどうかは
+/// 追記側が `formation_players` と突き合わせて判定する。
+pub fn parse_player_id(raw: &str) -> Option<PlayerId> {
+    Uuid::parse_str(raw.trim()).ok().map(PlayerId)
 }
 
 #[cfg(test)]

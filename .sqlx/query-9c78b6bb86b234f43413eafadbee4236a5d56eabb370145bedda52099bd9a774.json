@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select (select fp.team from formation_players fp where fp.formation_id = $1 and fp.player_id = $2) as \"reporter?\", (select fp.team from formation_players fp where fp.formation_id = $1 and fp.player_id = $3) as \"target?\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reporter?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "target?",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "9c78b6bb86b234f43413eafadbee4236a5d56eabb370145bedda52099bd9a774"
+}

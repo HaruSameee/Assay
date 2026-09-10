@@ -1,0 +1,73 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select v.player_id as \"player_id!\", v.matches as \"matches!\", \n                    v.rating as \"rating!\", p.trainer_name, \n                    (select s.display_name from player_discord_snapshots s \n                     where s.player_id = v.player_id order by s.id desc limit 1) as display_name \n             from player_current_ratings v \n             join players p on p.id = v.player_id \n             where v.matches >= $1 \n             order by v.rating desc, v.player_id \n             limit $2 offset $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "matches!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "matches"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "rating"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "9864bb489eae80a3cc53b6c36057d14c67dd754441fa700e8e944a3ec653fa85"
+}

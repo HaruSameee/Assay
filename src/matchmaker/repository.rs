@@ -31,7 +31,7 @@ use crate::persistence::{
 };
 use crate::queue::flex::{RoleAssignment, flex_compensation_owed};
 use crate::queue::model::clamp_down_range;
-use crate::rating::{DEFAULT_DISPLAY_MU, DEFAULT_DISPLAY_SIGMA, DISPLAY_SCALE};
+use crate::rating::DISPLAY_SCALE;
 
 use super::select::{
     Candidate, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch, RoleWish,
@@ -681,20 +681,12 @@ fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -
 async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, RepositoryError> {
     let rows = sqlx::query!(
         "select q.id, q.player_id, q.down_range, q.enqueued_at, \
-                $1::double precision \
-                    + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                where a.player_id = q.player_id), 0::double precision) \
-                    + coalesce(m.delta, 0::double precision) \
-                    as \"rating!\", \
-                $2::double precision \
-                    + coalesce((select sum(a.delta_sigma) from season_rating_adjustments a \
-                                where a.player_id = q.player_id), 0::double precision) \
-                    as \"sigma!\", \
+                v.rating as \"rating!\", v.sigma as \"sigma!\", \
                 latest.formation_id as \"latest_formation?\", \
                 latest.created_at as \"latest_matched_at?\", \
                 latest.role_was_flexed as \"latest_role_was_flexed?\" \
          from queue_entries q \
-         left join player_match_ratings m on m.player_id = q.player_id \
+         join player_current_ratings v on v.player_id = q.player_id \
          left join lateral ( \
              select fp.formation_id, f.created_at, fp.role_was_flexed \
              from formation_players fp join formations f on f.id = fp.formation_id \
@@ -702,8 +694,6 @@ async fn load_candidates(conn: &mut PgConnection) -> Result<Vec<Candidate>, Repo
              order by f.created_at desc, f.id desc limit 1 \
          ) latest on true \
          order by q.enqueued_at, q.id",
-        DEFAULT_DISPLAY_MU,
-        DEFAULT_DISPLAY_SIGMA,
     )
     .fetch_all(&mut *conn)
     .await?;

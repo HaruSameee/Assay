@@ -90,11 +90,15 @@ pub enum MatchResult {
 /// 要るため。**現在レートは使わない**（これがインクリメンタル更新を不要にしている）。
 ///
 /// 分岐が無いので、境界（差ちょうど 50）の比較演算子も浮動小数点の誤差も関係しない。
-pub fn match_delta(_own: f64, _opponent_mean: f64, result: MatchResult) -> f64 {
+/// **増減幅は実行時の値を渡すこと。**運営が管理パネルから変えられるようになったので、
+/// [`BASE_DELTA`] は「まだ一度も変えていないときの既定値」でしかない。正は
+/// `current_rating_params`（`rating_param_changes` の最新行から導出）で、
+/// アプリはそれを読んで渡す。
+pub fn match_delta(_own: f64, _opponent_mean: f64, result: MatchResult, base_delta: f64) -> f64 {
     match result {
         MatchResult::Drawn => 0.0,
-        MatchResult::Won => BASE_DELTA,
-        MatchResult::Lost => -BASE_DELTA,
+        MatchResult::Won => base_delta,
+        MatchResult::Lost => -base_delta,
     }
 }
 
@@ -112,17 +116,29 @@ pub struct PlayedMatch {
 }
 
 impl PlayedMatch {
-    /// この試合ぶんの増減。
-    pub fn delta(&self) -> f64 {
-        match_delta(self.own_rating, self.opponent_mean_rating, self.result)
+    /// この試合ぶんの増減。**現行の増減幅を渡すこと。**
+    pub fn delta(&self, base_delta: f64) -> f64 {
+        match_delta(
+            self.own_rating,
+            self.opponent_mean_rating,
+            self.result,
+            base_delta,
+        )
     }
 }
 
 /// 現在の表示レート。初期値（調整込み）に確定した試合の増減を足す。
 ///
 /// **総和なので、`matches` の順序は結果を変えない。**
-pub fn display_rating(initial: InitialRating, matches: &[PlayedMatch]) -> f64 {
-    initial.mu * DISPLAY_SCALE + matches.iter().map(PlayedMatch::delta).sum::<f64>()
+///
+/// `base_delta` は現行の増減幅。**過去の試合にも同じ値を適用する**（当時の値では
+/// 再生しない。docs/02 の不変条件 3）。
+pub fn display_rating(initial: InitialRating, matches: &[PlayedMatch], base_delta: f64) -> f64 {
+    initial.mu * DISPLAY_SCALE
+        + matches
+            .iter()
+            .map(|played| played.delta(base_delta))
+            .sum::<f64>()
 }
 
 /// 永続化された調整の、再計算に必要な列。
@@ -236,15 +252,32 @@ impl RatingAdjustmentRepository {
             .collect())
     }
 
-    /// 現在の表示レート。**1 プレイヤー分の正となる経路。**
+    /// 現在の表示レート。
     ///
-    /// キューとマッチメイカは人数ぶんまとめて読む必要があるので、同じ計算を
-    /// `player_match_ratings` ビューの側で行う。両者が一致することは `tests/rating.rs`
-    /// が検査する。
+    /// **合算は `player_current_ratings` に集約してある。**ここで式を組み立て直さない
+    /// ——キュー・マッチメイカ・マッチ画面・管理パネル・プロフィール・ランキングも
+    /// すべて同じビューを読む（導出の入口が増えたときに 1 か所だけ直せば済む）。
+    /// 純粋関数の [`display_rating`] は式そのものの単体テスト用に残してある。
     pub async fn display_rating(&self, player_id: PlayerId) -> Result<f64, sqlx::Error> {
-        let initial = self.initial_rating(player_id).await?;
-        let matches = self.played_matches(player_id).await?;
-        Ok(display_rating(initial, &matches))
+        // ビューは `players` を主にしているので、行が無いのは players に居ないときだけ
+        let rating = sqlx::query_scalar!(
+            "select rating as \"rating!\" from player_current_ratings where player_id = $1",
+            player_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(rating.unwrap_or(DEFAULT_DISPLAY_MU))
+    }
+
+    /// 現行の増減幅。`current_rating_params`（`rating_param_changes` の最新行）から導出する。
+    ///
+    /// 環境変数もコード上の定数も、ここでは参照しない。[`BASE_DELTA`] は
+    /// 「まだ一度も変更していないとき」に SQL 側の `coalesce` が返す既定値でしかない。
+    pub async fn base_delta(&self) -> Result<f64, sqlx::Error> {
+        let row = sqlx::query!("select base_delta as \"base_delta!\" from current_rating_params")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.base_delta)
     }
 }
 
@@ -297,12 +330,12 @@ mod tests {
     fn an_even_match_moves_the_base_amount() {
         for gap in [0.0, 1.0, -1.0, 49.0, -49.0, 49.999] {
             assert_eq!(
-                match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Won, BASE_DELTA),
                 7.0,
                 "gap {gap}"
             );
             assert_eq!(
-                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost, BASE_DELTA),
                 -7.0,
                 "gap {gap}"
             );
@@ -314,12 +347,12 @@ mod tests {
     fn beating_a_stronger_opponent_pays_exactly_the_same() {
         for gap in [50.0, 51.0, 300.0, 1000.0] {
             assert_eq!(
-                match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Won, BASE_DELTA),
                 7.0,
                 "gap {gap}"
             );
             assert_eq!(
-                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost, BASE_DELTA),
                 -7.0,
                 "gap {gap}"
             );
@@ -331,12 +364,12 @@ mod tests {
     fn beating_a_weaker_opponent_pays_exactly_the_same() {
         for gap in [-50.0, -51.0, -300.0, -1000.0] {
             assert_eq!(
-                match_delta(1500.0, 1500.0 + gap, MatchResult::Won),
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Won, BASE_DELTA),
                 7.0,
                 "gap {gap}"
             );
             assert_eq!(
-                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost),
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Lost, BASE_DELTA),
                 -7.0,
                 "gap {gap}"
             );
@@ -347,7 +380,10 @@ mod tests {
     #[test]
     fn a_draw_moves_nobody() {
         for gap in [0.0, 200.0, -200.0] {
-            assert_eq!(match_delta(1500.0, 1500.0 + gap, MatchResult::Drawn), 0.0);
+            assert_eq!(
+                match_delta(1500.0, 1500.0 + gap, MatchResult::Drawn, BASE_DELTA),
+                0.0
+            );
         }
     }
 
@@ -357,12 +393,12 @@ mod tests {
         // かつて境界だった 50 の周辺でも、値は一切変わらない
         for opponent_mean in [1449.9, 1450.0, 1450.1, 1549.9, 1550.0, 1550.1] {
             assert_eq!(
-                match_delta(1500.0, opponent_mean, MatchResult::Won),
+                match_delta(1500.0, opponent_mean, MatchResult::Won, BASE_DELTA),
                 BASE_DELTA,
                 "{opponent_mean}"
             );
             assert_eq!(
-                match_delta(1500.0, opponent_mean, MatchResult::Lost),
+                match_delta(1500.0, opponent_mean, MatchResult::Lost, BASE_DELTA),
                 -BASE_DELTA,
                 "{opponent_mean}"
             );
@@ -382,7 +418,11 @@ mod tests {
     fn one_win_is_not_enough_to_reach_the_upper_pool() {
         let initial = initial_rating([]);
         assert_eq!(initial.mu * DISPLAY_SCALE, 1500.0);
-        let rating = display_rating(initial, &[played(1500.0, 1500.0, MatchResult::Won)]);
+        let rating = display_rating(
+            initial,
+            &[played(1500.0, 1500.0, MatchResult::Won)],
+            BASE_DELTA,
+        );
         assert_eq!(rating, 1507.0);
         assert!(1600.0 - rating > 50.0, "1 勝では 1600 と両立しない");
 
@@ -390,7 +430,7 @@ mod tests {
         let eight_wins: Vec<PlayedMatch> = (0..8)
             .map(|_| played(1500.0, 1500.0, MatchResult::Won))
             .collect();
-        let climbed = display_rating(initial_rating([]), &eight_wins);
+        let climbed = display_rating(initial_rating([]), &eight_wins, BASE_DELTA);
         assert_eq!(climbed, 1556.0);
         assert!(1600.0 - climbed <= 50.0);
     }
@@ -404,10 +444,10 @@ mod tests {
             played(1500.0, 1500.0, MatchResult::Drawn),
             played(1500.0, 1500.0, MatchResult::Won),
         ];
-        let forward = display_rating(initial_rating([]), &matches);
+        let forward = display_rating(initial_rating([]), &matches, BASE_DELTA);
         let mut reversed = matches;
         reversed.reverse();
-        let backward = display_rating(initial_rating([]), &reversed);
+        let backward = display_rating(initial_rating([]), &reversed, BASE_DELTA);
         assert_eq!(forward, backward);
         // +7, -7, 0, +7
         assert_eq!(forward, 1500.0 + 7.0);
@@ -425,7 +465,11 @@ mod tests {
         assert_eq!(seeded.mu * DISPLAY_SCALE, 1600.0);
         // 1600 の人が同格に勝てば 1607
         assert_eq!(
-            display_rating(seeded, &[played(1600.0, 1600.0, MatchResult::Won)]),
+            display_rating(
+                seeded,
+                &[played(1600.0, 1600.0, MatchResult::Won)],
+                BASE_DELTA
+            ),
             1607.0
         );
     }
@@ -433,6 +477,6 @@ mod tests {
     /// 試合が無ければ初期値のまま。
     #[test]
     fn a_player_who_never_played_keeps_the_starting_rating() {
-        assert_eq!(display_rating(initial_rating([]), &[]), 1500.0);
+        assert_eq!(display_rating(initial_rating([]), &[], BASE_DELTA), 1500.0);
     }
 }

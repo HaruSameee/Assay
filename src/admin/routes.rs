@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::blocks::{AdminBlockOverrideError, BlockRepository};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::{Outcome, Team};
+use crate::quiet::QuietReportRepository;
 use crate::registration::html::error_page;
 use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
@@ -37,12 +38,14 @@ use super::actions::{
 };
 use super::config::AdminIds;
 use super::html::{
-    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, ReportsView, SearchView, SeasonView,
-    player_page, queue_page, reports_page, search_page, season_page,
+    MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView, RatingParamsView,
+    ReportsView, SearchView, SeasonView, player_page, queue_page, quiet_reports_page,
+    rating_params_page, reports_page, search_page, season_page,
 };
+use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewSeasonBoundary, NewStaffReport, RemovalOutcome, StaffReportOutcome,
+    NewRatingParams, NewSeasonBoundary, NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::season::{
     MAX_SEASON_LABEL_LENGTH, SeasonOutcome, confirmation_matches, normalize_label,
@@ -61,6 +64,8 @@ pub struct AdminState {
     ids: AdminIds,
     pub store: AdminRepository,
     pub blocks: BlockRepository,
+    /// 聞き専報告。**運営パネルだけがこれを読む**（票数と閾値を見られる唯一の経路）。
+    pub quiet: QuietReportRepository,
 }
 
 impl AdminState {
@@ -69,6 +74,7 @@ impl AdminState {
         ids: AdminIds,
         store: AdminRepository,
         blocks: BlockRepository,
+        quiet: QuietReportRepository,
     ) -> Self {
         let key = config.cookie_key();
         Self {
@@ -77,6 +83,7 @@ impl AdminState {
             ids,
             store,
             blocks,
+            quiet,
         }
     }
 }
@@ -110,6 +117,14 @@ pub fn router(state: AdminState) -> Router {
         // シーズン境界（導出の起点）。2 段階の確認。実行は POST /admin/season
         .route("/admin/reports", get(show_reports).post(enter_report))
         .route("/admin/season", get(show_season).post(start_season))
+        // レート増減幅。2 段階の確認。実行は POST /admin/rating-params
+        .route(
+            "/admin/rating-params",
+            get(show_rating_params).post(change_rating_params),
+        )
+        .route("/admin/rating-params/confirm", post(confirm_rating_params))
+        // 聞き専報告。**閲覧だけ**（運営が代理で入れる経路は作らない）
+        .route("/admin/quiet-reports", get(show_quiet_reports))
         .route("/admin/season/confirm", post(confirm_season))
         .with_state(state)
 }
@@ -1109,4 +1124,187 @@ fn rejection_message(state: &str) -> String {
         }
         _ => "この試合はまだ報告を受け付けられる段階にありません。".to_owned(),
     }
+}
+
+// ----------------------------------------------------------------------
+// レート増減幅
+// ----------------------------------------------------------------------
+//
+// **この操作は過去の全試合を引き直す。**docs/02 の不変条件 3 そのものなので、
+// 隠さずに画面で言い切り、2 段階の確認を挟む。
+// 1 段目は警告と件数、2 段目は**同じ数値の打ち直し**。クリック 2 回だと誤操作が通る。
+
+/// 増減幅の画面を描画する。件数は毎回数え直す（保存しない）。
+async fn render_rating_params(
+    app: &AdminState,
+    confirming: Option<f64>,
+    notice: Option<Notice>,
+    key: Option<&str>,
+) -> Response {
+    let preview = match app.store.rating_params_preview().await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not read the rating params preview");
+            return internal_error();
+        }
+    };
+    let generated = form_key();
+    Html(rating_params_page(&RatingParamsView {
+        preview: &preview,
+        form_key: key.unwrap_or(&generated),
+        confirming,
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_rating_params(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_rating_params(&app, None, None, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct RatingParamsConfirmForm {
+    #[serde(default)]
+    base_delta: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// 1 段目 → 2 段目。値を検証して確認画面を出すだけで、まだ何も書かない。
+async fn confirm_rating_params(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<RatingParamsConfirmForm>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    let Some(base_delta) = normalize_base_delta(&form.base_delta) else {
+        let notice = fail(format!(
+            "増減幅は 0 より大きく {MAX_BASE_DELTA} 以下の数値で入力してください。"
+        ));
+        return render_rating_params(&app, None, Some(notice), None).await;
+    };
+    // 冪等キーは 1 段目で発行したものを 2 段目へ持ち越す（同じ操作は 1 行にしかならない）
+    render_rating_params(&app, Some(base_delta), None, Some(&form.key)).await
+}
+
+#[derive(Debug, Deserialize)]
+struct RatingParamsChangeForm {
+    #[serde(default)]
+    base_delta: String,
+    #[serde(default)]
+    confirm_delta: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// 2 段目の送信。数値の打ち直しが一致したときだけ追記する。
+async fn change_rating_params(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<RatingParamsChangeForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let Some(base_delta) = normalize_base_delta(&form.base_delta) else {
+        let notice = fail("増減幅が不正です。".to_owned());
+        return render_rating_params(&app, None, Some(notice), None).await;
+    };
+    // 打ち直しは**数値として**比較する（"7" と "7.0" を別物にしない）
+    if normalize_base_delta(&form.confirm_delta) != Some(base_delta) {
+        let notice = fail("数値が一致しません。同じ値を入力してください。".to_owned());
+        return render_rating_params(&app, Some(base_delta), Some(notice), Some(&form.key)).await;
+    }
+    let Some(reason) = normalize_reason(&form.reason) else {
+        let notice = fail("理由を入力してください。".to_owned());
+        return render_rating_params(&app, Some(base_delta), Some(notice), Some(&form.key)).await;
+    };
+
+    let now = Utc::now();
+    let input = NewRatingParams {
+        base_delta,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: now,
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.change_rating_params(&input).await {
+        Ok(RatingParamsOutcome::Changed { id, params_version }) => info(format!(
+            "増減幅を ±{base_delta} に変更しました（#{id} / params v{params_version}）。\
+             過去の全試合が新しい値で引き直されています。試合ログは 1 行も変わっていません。"
+        )),
+        Ok(RatingParamsOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Ok(RatingParamsOutcome::Blocked { active_formations }) => fail(format!(
+            "進行中の formation が {active_formations} 件あるため実行しませんでした。\
+             増減幅は 1 行積んだ瞬間に全員のレートとキューの範囲判定を変えます。\
+             終わってからやり直してください。"
+        )),
+        Err(err) => {
+            error!(%err, "could not change the rating params");
+            return internal_error();
+        }
+    };
+    render_rating_params(&app, None, Some(notice), None).await
+}
+
+// ----------------------------------------------------------------------
+// 聞き専報告（閲覧のみ）
+// ----------------------------------------------------------------------
+//
+// **ここが票数と閾値を見られる唯一の画面。**入力の経路は作らない
+// （報告はプレイヤーがマッチ画面から出すもので、運営が代理で入れるものではない）。
+
+/// 一覧に出す件数の上限。
+const QUIET_HISTORY_LIMIT: i64 = 200;
+const QUIET_TALLY_LIMIT: i64 = 200;
+
+async fn show_quiet_reports(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    let tallies = match app.quiet.admin_tallies(QUIET_TALLY_LIMIT).await {
+        Ok(tallies) => tallies,
+        Err(err) => {
+            error!(%err, "could not read the quiet report tallies");
+            return internal_error();
+        }
+    };
+    let history = match app.quiet.admin_history(QUIET_HISTORY_LIMIT).await {
+        Ok(history) => history,
+        Err(err) => {
+            error!(%err, "could not read the quiet report history");
+            return internal_error();
+        }
+    };
+    let thresholds = match app.quiet.thresholds().await {
+        Ok(thresholds) => thresholds,
+        Err(err) => {
+            error!(%err, "could not read the quiet report thresholds");
+            return internal_error();
+        }
+    };
+    Html(quiet_reports_page(&QuietReportsView {
+        tallies: &tallies,
+        history: &history,
+        winner_threshold: thresholds.winner_threshold,
+        loser_threshold: thresholds.loser_threshold,
+        notice: None,
+    }))
+    .into_response()
 }

@@ -42,6 +42,7 @@ use unite_matchsystem::persistence::{
 };
 use unite_matchsystem::queue::model::{QueueRequest, RolePreference};
 use unite_matchsystem::queue::{QueueRepository, QueueState, router as queue_router};
+use unite_matchsystem::quiet::QuietReportRepository;
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
 use unite_matchsystem::registration::{AuthConfig, NewDeclaration, Rank, RegistrationRepository};
 use uuid::Uuid;
@@ -144,6 +145,7 @@ impl AppDb {
             ids,
             self.admin.clone(),
             self.blocks.clone(),
+            QuietReportRepository::new(self.pool.clone()),
         )))
     }
 

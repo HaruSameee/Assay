@@ -94,16 +94,16 @@ jobs:
       - name: Offline build
         run: SQLX_OFFLINE=true cargo check --all-targets
 
-      - name: Test (application role)
-        run: |
-          cargo test --lib --bins --test lifecycle
-          cargo test --doc
+      # **テストファイルを列挙しない。**列挙していた頃は match_screen / ranking /
+      # season が長らく漏れており、CI が緑のまま壊れたテストが main に入っていた。
+      # `--tests` は tests/*.rs を全部拾う（queue_bench は #[ignore] なので走らない）。
+      #
+      # `#[sqlx::test]` が隔離 DB を作るには CREATE DATABASE が要るので、
+      # DATABASE_URL は管理用接続にする。**それでもテスト本体はアプリ用ロールで走る** —
+      # 各スイートが owner から assay_app へ接続し直しており、それを忘れていないことは
+      # tests/harness.rs が検査する（環境変数では守れないので、テストで守る）。
+      - name: Test
+        run: DATABASE_URL="$TEST_ADMIN_DATABASE_URL" cargo test --tests
 
-      # #[sqlx::test] は隔離 DB を作るので、この 1 ステップだけ管理用接続を使う。
-      # テスト本体は assay_app に接続し直してリポジトリを操作する。
-      - name: Test (isolated databases; admin connection only bootstraps them)
-        run: |
-          DATABASE_URL="$TEST_ADMIN_DATABASE_URL" \
-            cargo test --test persistence --test discord --test schema --test registration \
-              --test queue --test matchmaker --test rating --test status --test admin \
-              --test admin_ops --test profiles --test blocks
+      - name: Doc tests
+        run: cargo test --doc

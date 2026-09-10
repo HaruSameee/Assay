@@ -19,6 +19,7 @@
 pub mod actions;
 pub mod config;
 pub mod html;
+pub mod rating_params;
 pub mod repository;
 pub mod routes;
 pub mod season;
@@ -30,9 +31,14 @@ pub use actions::{
 pub use config::{
     ADMIN_DISCORD_USER_IDS, AdminConfigError, AdminIds, admin_ids_from_env, parse_admin_ids,
 };
+pub use rating_params::{
+    MAX_BASE_DELTA, RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
+    normalize_base_delta,
+};
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
-    NewAdjustment, NewAdminAction, NewSeasonBoundary, QueuedEntry, QueuedRole, RemovalOutcome,
+    NewAdjustment, NewAdminAction, NewRatingParams, NewSeasonBoundary, QueuedEntry, QueuedRole,
+    RemovalOutcome,
 };
 pub use routes::{AdminState, router};
 pub use season::{

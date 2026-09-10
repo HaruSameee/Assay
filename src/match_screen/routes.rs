@@ -48,8 +48,10 @@ use crate::registration::{Audience, AuthConfig, CurrentSession, Viewer};
 use super::model::{
     AffordanceView, BLUE, MatchView, OpponentView, RED, StageView, TeammateView, VoiceView,
 };
+use crate::quiet::{QuietReportError, QuietReportOutcome, QuietReportRepository};
+
 use super::repository::{
-    MatchPlayer, MatchRepository, Outcome, parse_formation_id, submission_key,
+    MatchPlayer, MatchRepository, Outcome, parse_formation_id, parse_player_id, submission_key,
 };
 
 /// 未登録のトレーナー名の代わり。Discord 側の割り当て表と同じ文言。
@@ -68,6 +70,8 @@ pub struct MatchState {
     pub formations: FormationRepository,
     /// 画面の読み取り。
     pub matches: MatchRepository,
+    /// 聞き専報告。**読むのは「自分が出したか」だけ**（票数は読まない）。
+    pub quiet: QuietReportRepository,
     /// 期限と候補上限（画面の説明文に使う）。
     pub lifecycle: LifecycleConfig,
     /// 部屋設定のチェックリスト（先頭にマップを差し込んだもの）。
@@ -80,6 +84,7 @@ impl MatchState {
         config: AuthConfig,
         formations: FormationRepository,
         matches: MatchRepository,
+        quiet: QuietReportRepository,
         lifecycle: LifecycleConfig,
         room_map: &str,
         room_checklist: &[String],
@@ -93,6 +98,7 @@ impl MatchState {
             audience: Audience::default(),
             formations,
             matches,
+            quiet,
             lifecycle,
             room_checklist: Arc::new(checklist),
         }
@@ -130,6 +136,11 @@ pub fn router(state: MatchState) -> Router {
         .route("/match/{formation_id}/host", post(respond_to_host_prompt))
         .route("/match/{formation_id}/room-code", post(submit_room_code))
         .route("/match/{formation_id}/report", post(submit_report))
+        // 聞き専報告。**確定後だけ。**票数も閾値も返さない
+        .route(
+            "/match/{formation_id}/quiet-report",
+            post(submit_quiet_report),
+        )
         .with_state(state)
 }
 
@@ -149,6 +160,13 @@ struct HostResponseRequest {
 struct RoomCodeRequest {
     /// 入力されたルーム ID。前後の空白は落とす。
     room_code: String,
+}
+
+/// 聞き専報告。対象は**同じチームのメンバー**だけ。
+#[derive(Debug, Deserialize)]
+struct QuietReportRequest {
+    /// 対象の `players.id`。
+    target: String,
 }
 
 /// 報告。**`draw` は選択肢に入れない**（無効試合に寄せる）。
@@ -325,6 +343,80 @@ async fn submit_room_code(
     }
 }
 
+/// 聞き専報告。**確定後にだけ、同じチームのメンバーを対象にできる。**
+///
+/// 返すのは「受け付けた」か「もう出している」かだけで、**票数も閾値も返さない**。
+/// 表示しなくても JSON に入っていれば読めるので、そもそも入れない（docs/09）。
+async fn submit_quiet_report(
+    State(app): State<MatchState>,
+    session: Option<CurrentSession>,
+    Path(formation_id): Path<String>,
+    body: Option<Json<QuietReportRequest>>,
+) -> Response {
+    let Some(player_id) = player(session) else {
+        return unauthenticated(false);
+    };
+    let Some(formation) = parse_formation_id(&formation_id) else {
+        return not_found(false);
+    };
+    // 参加者以外には formation の存在も教えない
+    if !is_participant(&app, formation, player_id).await {
+        return not_found(false);
+    }
+    let Some(Json(request)) = body else {
+        return bad_request("invalid_request", "リクエストの形式が正しくありません。");
+    };
+    let Some(target) = parse_player_id(&request.target) else {
+        return bad_request("invalid_target", "対象の指定が正しくありません。");
+    };
+
+    let now = Utc::now();
+    // 検証（確定済みか・勝敗があるか・自チームか・自分自身でないか）はすべてリポジトリ側。
+    // 冪等キーは組み合わせから決める。**同じ相手への二度目は増えない**
+    let key = format!(
+        "quiet:{}:{}:{}",
+        formation.0.simple(),
+        player_id.0.simple(),
+        target.0.simple()
+    );
+    match app
+        .quiet
+        .report(formation, player_id, target, now, &key)
+        .await
+    {
+        Ok(QuietReportOutcome::Recorded) => {
+            // **対象も票数もログに残さない。**運営が見るのは DB の履歴だけ
+            info!(formation = %formation, "quiet report recorded");
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "quiet_reported": true })),
+            )
+                .into_response()
+        }
+        Ok(QuietReportOutcome::AlreadyReported) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "quiet_reported": true })),
+        )
+            .into_response(),
+        Err(QuietReportError::Database) => {
+            error!("could not record the quiet report");
+            internal_error(false)
+        }
+        Err(error) => {
+            // 確定前・勝敗なしは 409、対象が不正は 400
+            let status = match error {
+                QuietReportError::NotConfirmed | QuietReportError::NoWinner => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(json!({ "error": error.code(), "message": error.message() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// 3択の報告。**参加者だけ。**判定結果も件数も返さない。
 async fn submit_report(
     State(app): State<MatchState>,
@@ -483,6 +575,8 @@ async fn build_view(
     let roster = app.matches.roster(formation).await?;
     let vc = app.matches.voice_pair(formation).await?;
     let i_reported = app.matches.has_reported(formation, me).await?;
+    // **自分が出したかどうかだけ。**誰を報告したかも票数も読まない
+    let quiet_reported = app.quiet.has_reported(formation, me).await?;
 
     let host = host_of(&state);
     let name_of = |player: PlayerId| -> String {
@@ -553,6 +647,10 @@ async fn build_view(
             ),
         // 報告義務がある状態で、まだ自分が出していないときだけ。他人の状況は見ない
         report: state.requires_reports() && !i_reported,
+        // **確定していて勝敗がついているときだけ。**確定前に出さないのは、
+        // 勝敗で閾値が変わるため。票数も閾値もここには入らない
+        quiet_report: matches!(stage, StageView::Confirmed { .. }),
+        quiet_reported,
     };
 
     Ok(Some(MatchView {

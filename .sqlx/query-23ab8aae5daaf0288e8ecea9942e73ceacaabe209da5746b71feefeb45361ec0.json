@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select winner_threshold as \"winner!\", loser_threshold as \"loser!\" from current_quiet_report_params",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "winner!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_quiet_report_params",
+            "name": "winner_threshold"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "loser!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_quiet_report_params",
+            "name": "loser_threshold"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "23ab8aae5daaf0288e8ecea9942e73ceacaabe209da5746b71feefeb45361ec0"
+}

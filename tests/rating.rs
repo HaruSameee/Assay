@@ -15,13 +15,20 @@
 use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use unite_matchsystem::admin::{
+    AdminRepository, NewRatingParams, NewSeasonBoundary, RatingParamsOutcome,
+};
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
+use unite_matchsystem::match_screen::MatchRepository;
 use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES};
 use unite_matchsystem::persistence::{
-    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team, VcAssignment,
+    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team, VC_POOL_LOCK_KEY,
+    VcAssignment,
 };
+use unite_matchsystem::profiles::ProfileRepository;
 use unite_matchsystem::queue::QueueRepository;
 use unite_matchsystem::queue::model::{QueueRequest, RolePreference};
+use unite_matchsystem::ranking::RankingRepository;
 use unite_matchsystem::rating::{
     DEFAULT_DISPLAY_MU, DISPLAY_SCALE, MatchResult, RatingAdjustmentRepository, match_delta,
 };
@@ -231,6 +238,8 @@ async fn the_view_and_the_rust_formula_agree(owner: PgPool) {
             (player(1), red, blue, "red"),
             (player(6), blue, red, "blue"),
         ] {
+            // 増減幅は**ビューと同じ導出経路**から読む（定数を突き合わせない）
+            let base_delta = db.ratings.base_delta().await.unwrap();
             let expected = match_delta(
                 own,
                 opponent_mean,
@@ -239,6 +248,7 @@ async fn the_view_and_the_rust_formula_agree(owner: PgPool) {
                     w if w == team => MatchResult::Won,
                     _ => MatchResult::Lost,
                 },
+                base_delta,
             );
             assert_eq!(
                 view_delta(&db, who, fid(n)).await,
@@ -621,6 +631,796 @@ async fn five_hundred_matches_stay_within_budget(owner: PgPool) {
         outcome.candidates,
         outcome.created.len()
     );
+
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// レート増減幅の変更（運営操作）
+// ----------------------------------------------------------------------
+
+/// **増減幅を変えると、過去の全試合が新しい値で引き直される。**
+///
+/// docs/02 の不変条件 3（常に現行 params を全履歴に適用する）そのもの。
+/// あわせて、**試合ログの行数が 1 行も変わらない**ことを見る——引き直しは
+/// 再計算であって、書き換えではない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn changing_the_delta_recomputes_every_past_match(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // 3 試合ぶん確定させる（player 1 は red で 2 勝 1 敗）
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+    confirmed_match(&db, 2, 1500.0, 1500.0, "red").await;
+    confirmed_match(&db, 3, 1500.0, 1500.0, "blue").await;
+
+    async fn log_rows(db: &AppDb) -> (i64, i64) {
+        let events: i64 = sqlx::query_scalar("select count(*) from formation_events")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let players: i64 = sqlx::query_scalar("select count(*) from formation_players")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        (events, players)
+    }
+
+    // 既定値（7）での状態
+    let before_params = admin.rating_params().await.unwrap();
+    assert_eq!(before_params.base_delta, 7.0);
+    assert_eq!(before_params.params_version, 3);
+    let before_rating = db.ratings.display_rating(player(1)).await.unwrap();
+    let before_deltas = view_delta(&db, player(1), fid(1)).await;
+    let before_rows = log_rows(&db).await;
+    assert_eq!(before_deltas, 7.0);
+    // 2 勝 1 敗 = +7 +7 -7
+    assert_eq!(before_rating, 1500.0 + 7.0);
+
+    // 実行前のプレビュー: 引き直される試合数と人数
+    let preview = admin.rating_params_preview().await.unwrap();
+    assert_eq!(preview.matches_affected, 3, "引き直される試合数が違う");
+    assert_eq!(preview.players_affected, 10, "影響を受ける人数が違う");
+    assert!(preview.history.is_empty(), "まだ変更していない");
+
+    // **増減幅を 12 に変える**
+    let outcome = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 12.0,
+            reason: "テストで引き直しを確認する".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(100),
+            idempotency_key: "delta-12".to_owned(),
+        })
+        .await
+        .unwrap();
+    let RatingParamsOutcome::Changed { params_version, .. } = outcome else {
+        panic!("変更されていない: {outcome:?}");
+    };
+    // 版数は直前 +1
+    assert_eq!(params_version, 4);
+
+    // **過去の試合が新しい値で引き直されている**
+    let after_params = admin.rating_params().await.unwrap();
+    assert_eq!(after_params.base_delta, 12.0);
+    assert_eq!(after_params.params_version, 4);
+    let after_deltas = view_delta(&db, player(1), fid(1)).await;
+    let after_rating = db.ratings.display_rating(player(1)).await.unwrap();
+    assert_eq!(after_deltas, 12.0, "過去の試合が引き直されていない");
+    assert_eq!(
+        after_rating,
+        1500.0 + 12.0,
+        "現在レートが引き直されていない"
+    );
+    // 負けた試合も
+    assert_eq!(view_delta(&db, player(1), fid(3)).await, -12.0);
+
+    // **試合ログの行数は 1 行も変わらない**
+    let after_rows = log_rows(&db).await;
+    assert_eq!(after_rows, before_rows, "試合ログの行数が変わっている");
+
+    // 運営操作ログに残っている
+    let action: (String, serde_json::Value) = sqlx::query_as(
+        "select kind, payload from admin_actions where kind = 'rating_params_changed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(action.1["base_delta"], serde_json::json!(12.0));
+    assert_eq!(action.1["previous_base_delta"], serde_json::json!(7.0));
+    assert_eq!(action.1["matches_recomputed"], serde_json::json!(3));
+
+    println!(
+        "増減幅 7 → 12: 1 試合の増減 {before_deltas} → {after_deltas} / \
+         現在レート {before_rating} → {after_rating} / \
+         試合ログ（events, players）= {before_rows:?} → {after_rows:?}（変化なし）"
+    );
+
+    // **同一キーは no-op。**状態ベースの判定はしない
+    let again = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "同じキーでもう一度".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(200),
+            idempotency_key: "delta-12".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(again, RatingParamsOutcome::Duplicate);
+    assert_eq!(admin.rating_params().await.unwrap().base_delta, 12.0);
+
+    // 元の値へ戻すのも**追記**（消さずにもう 1 行積む）
+    admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 7.0,
+            reason: "戻す".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(300),
+            idempotency_key: "delta-back".to_owned(),
+        })
+        .await
+        .unwrap();
+    let restored = admin.rating_params().await.unwrap();
+    assert_eq!(restored.base_delta, 7.0);
+    assert_eq!(restored.params_version, 5, "戻しても版数は進む");
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 7.0);
+    let history = admin.rating_params_preview().await.unwrap().history;
+    assert_eq!(history.len(), 2, "変更の行が消えている");
+    println!(
+        "戻したあと: 増減幅 {} / params v{}（履歴 {} 行は残る）",
+        restored.base_delta,
+        restored.params_version,
+        history.len()
+    );
+
+    // **DB の CHECK が最後の砦。**0 以下・50 超はアプリを通さなくても入らない
+    for bad in [0.0, -1.0, 50.1, 100.0] {
+        let rejected = sqlx::query(
+            "insert into rating_param_changes \
+             (params_version, base_delta, reason, created_by, idempotency_key, created_at) \
+             values (99, $1, 'r', 'discord:1', $2, now())",
+        )
+        .bind(bad)
+        .bind(format!("bad-{bad}"))
+        .execute(&db.pool)
+        .await;
+        assert!(rejected.is_err(), "{bad} が DB に入ってしまった");
+    }
+    println!("DB の CHECK: 0 以下と 50 超は拒否");
+
+    db.done().await;
+}
+
+/// **進行中の formation があるあいだは増減幅を変えられない。**
+///
+/// 1 行積んだ瞬間に全員のレートが動き、キュー中の人の範囲判定（±50）も同時に変わる。
+/// シーズン境界と同じ条件で止める。**断ったことは記録に残す。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn an_active_formation_blocks_the_change(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // 確定済みが 1 件（引き直しの対象）、進行中が 1 件
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+    play(&db, 2, 1500.0, 1500.0).await; // in_progress のまま
+
+    let preview = admin.rating_params_preview().await.unwrap();
+    assert_eq!(preview.active_formations, 1, "進行中を数えていない");
+    assert_eq!(preview.pending_reports, 1, "未報告を数えていない");
+    assert!(!preview.can_change(), "進行中があるのに実行できてしまう");
+
+    let blocked = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "進行中でも変えようとする".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(100),
+            idempotency_key: "while-active".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked,
+        RatingParamsOutcome::Blocked {
+            active_formations: 1
+        }
+    );
+
+    // **増減幅は動いていない。**行も増えていない
+    assert_eq!(admin.rating_params().await.unwrap().base_delta, 7.0);
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 7.0);
+    let rows: i64 = sqlx::query_scalar("select count(*) from rating_param_changes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "拒否したのに行が積まれている");
+
+    // **断ったことは admin_actions に残る**
+    let rejected: (String, serde_json::Value) = sqlx::query_as(
+        "select kind, payload from admin_actions where kind = 'rating_params_rejected'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected.1["requested_base_delta"], serde_json::json!(20.0));
+    assert_eq!(rejected.1["active_formations"], serde_json::json!(1));
+    println!("進行中 1 件 → 拒否。admin_actions: {}", rejected.0);
+
+    // 進行中の試合を終わらせれば通る
+    finish(&db, 2, K::Confirmed, "red").await;
+    let preview = admin.rating_params_preview().await.unwrap();
+    assert_eq!(preview.active_formations, 0);
+    assert!(preview.can_change());
+    let changed = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "終わったので変える".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(200),
+            idempotency_key: "after-active".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(changed, RatingParamsOutcome::Changed { .. }));
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 20.0);
+    println!("進行中 0 件 → 実行できる（増減幅 20 で引き直し）");
+
+    db.done().await;
+}
+
+/// **増減幅を変えると、キュー中の人の範囲判定（±50）の対象が変わる。**
+///
+/// レートが導出値なので、増減幅は「過去の勝敗がいまのレートに与える大きさ」を変える。
+/// その結果、誰と誰が同じ範囲に入るかがその場で動く。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn changing_the_delta_moves_who_is_in_range(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // player 1（red）が 1 勝、player 6（blue）が 1 敗。ほかは動かさない
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+
+    // 3 人をキューに入れる。player 2 も red なので 1 勝している
+    for who in [player(1), player(2), player(6)] {
+        enqueue(&db, who, "jungle", at(50)).await;
+    }
+
+    // 増減幅 7: 勝った 1 と 2 が 1507、負けた 6 が 1493。差は 14 で全員が範囲内
+    let winner_before = queued_rating(&db, player(1)).await;
+    let loser_before = queued_rating(&db, player(6)).await;
+    let before = db
+        .queue
+        .in_range_summary(player(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .total;
+    assert_eq!(winner_before, 1507.0);
+    assert_eq!(loser_before, 1493.0);
+    assert_eq!(before, 2, "差 14 なら 2 人とも範囲内");
+
+    // **増減幅を 30 に上げる。**勝者 1530 / 敗者 1470 で差 60 → 範囲外になる
+    admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 30.0,
+            reason: "範囲判定の変化を見る".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(300),
+            idempotency_key: "widen".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let winner_after = queued_rating(&db, player(1)).await;
+    let loser_after = queued_rating(&db, player(6)).await;
+    let after = db
+        .queue
+        .in_range_summary(player(1))
+        .await
+        .unwrap()
+        .unwrap()
+        .total;
+    assert_eq!(winner_after, 1530.0);
+    assert_eq!(loser_after, 1470.0);
+    assert_eq!(after, 1, "差 60 になった相手は範囲外へ出る");
+
+    println!(
+        "増減幅 7 → 30: 勝者 {winner_before} → {winner_after} / 敗者 {loser_before} → {loser_after} / \
+         勝者から見た「範囲内でキュー中」 {before}人 → {after}人"
+    );
+
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 合算の突き合わせ（集約リファクタの前提確認）
+// ----------------------------------------------------------------------
+//
+// 現在レートの合算は 8 か所に散っている（`player_current_ratings` へ集約する前の状態）。
+// **集約が「同じ式を 1 か所へ寄せるだけ」であること**を、割れやすいケースを並べて確かめる。
+//
+// 境界の判定は **`formations.created_at`**（migrations/20260911090000 の
+// `where f.created_at >= s.started_at`）。確定イベントの時刻ではないので、
+// **境界より前に作られた試合は、境界より後に確定しても集計に入らない。**
+
+/// 名簿の読み取りに使う formation（不成立で終わらせるので集計には入らない）。
+const ROSTER_FORMATION: u128 = 29;
+
+/// 1 経路ぶんの読み取り結果。適用できない経路は `None`。
+#[derive(Debug, Clone, PartialEq)]
+struct RatingPaths {
+    values: Vec<(&'static str, Option<f64>)>,
+    /// 試合数を返す経路（プロフィールとランキング）。
+    matches: Vec<(&'static str, Option<i64>)>,
+}
+
+/// 8 経路すべてを 1 人について読む。
+async fn rating_paths(db: &AppDb, who: PlayerId) -> RatingPaths {
+    let by_rust = db.ratings.display_rating(who).await.unwrap();
+
+    let by_queue = db
+        .queue
+        .queued_players()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|queued| queued.player_id == who)
+        .map(|queued| queued.rating);
+
+    let by_preview: Option<f64> = sqlx::query_scalar(
+        "select $2::double precision \
+                + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
+                            where a.player_id = p.id), 0::double precision) \
+                + coalesce(m.delta, 0::double precision) \
+         from players p left join player_match_ratings m on m.player_id = p.id where p.id = $1",
+    )
+    .bind(who.0)
+    .bind(DEFAULT_DISPLAY_MU)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap();
+
+    let by_matchmaker: Option<f64> = sqlx::query_scalar(
+        "select $2::double precision \
+                + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
+                            where a.player_id = q.player_id), 0::double precision) \
+                + coalesce(m.delta, 0::double precision) \
+         from queue_entries q left join player_match_ratings m on m.player_id = q.player_id \
+         where q.player_id = $1",
+    )
+    .bind(who.0)
+    .bind(DEFAULT_DISPLAY_MU)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap();
+
+    // 名簿はどの formation でもよい（レートはプレイヤー単位の導出値）
+    let by_match_screen = MatchRepository::new(db.pool.clone())
+        .roster(fid(ROSTER_FORMATION))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.player_id == who)
+        .map(|entry| entry.rating);
+
+    let by_admin = AdminRepository::new(db.pool.clone())
+        .queued_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.player_id == who.0)
+        .map(|entry| entry.rating);
+
+    let profile = ProfileRepository::new(db.pool.clone())
+        .public_profile(who)
+        .await
+        .unwrap();
+
+    let ranked = RankingRepository::new(db.pool.clone())
+        .page(1)
+        .await
+        .unwrap()
+        .players
+        .into_iter()
+        .find(|row| row.player_id == who.0);
+
+    RatingPaths {
+        values: vec![
+            ("1 rating/mod.rs (Rust)", Some(by_rust)),
+            ("2 queue 範囲判定", by_queue),
+            ("3 queue プレビュー", by_preview),
+            ("4 matchmaker 凍結値", by_matchmaker),
+            ("5 match_screen 名簿", by_match_screen),
+            ("6 admin キュー一覧", by_admin),
+            (
+                "7 profiles 公開プロフィール",
+                profile.as_ref().map(|p| p.rating),
+            ),
+            ("8 ranking ランキング", ranked.as_ref().map(|r| r.rating)),
+        ],
+        matches: vec![
+            ("7 profiles", profile.as_ref().map(|p| p.matches)),
+            ("8 ranking", ranked.as_ref().map(|r| r.matches)),
+        ],
+    }
+}
+
+/// 監査の 1 シナリオ。
+struct Scenario {
+    name: &'static str,
+    who: PlayerId,
+    expected: f64,
+    /// 期待する試合数（`player_match_rating_deltas` の行数）。
+    expected_matches: i64,
+    /// どの formation にもいないので match_screen は行を持たない。
+    in_formation: bool,
+}
+
+/// 8 経路を突き合わせ、値と適用可否を検査する。
+fn assert_paths_agree(paths: &RatingPaths, scenario: &Scenario) {
+    for (name, value) in &paths.values {
+        let ranked = name.starts_with('8');
+        let roster = name.starts_with('5');
+        let applicable = if ranked {
+            scenario.expected_matches >= 5
+        } else if roster {
+            scenario.in_formation
+        } else {
+            true
+        };
+        match (applicable, value) {
+            (true, Some(value)) => assert_eq!(
+                *value, scenario.expected,
+                "{}: {name} がずれている",
+                scenario.name
+            ),
+            (true, None) => panic!("{}: {name} が行を返さなかった", scenario.name),
+            (false, Some(value)) => {
+                panic!(
+                    "{}: {name} は対象外のはずが {value} を返した",
+                    scenario.name
+                )
+            }
+            (false, None) => {}
+        }
+    }
+    for (name, matches) in &paths.matches {
+        if name.starts_with('8') && scenario.expected_matches < 5 {
+            assert!(
+                matches.is_none(),
+                "{}: {name} に載ってはいけない",
+                scenario.name
+            );
+            continue;
+        }
+        assert_eq!(
+            *matches,
+            Some(scenario.expected_matches),
+            "{}: {name} の試合数がずれている",
+            scenario.name
+        );
+    }
+}
+
+fn print_paths(paths: &RatingPaths, scenario: &Scenario) {
+    println!("--- {} (期待 {}) ---", scenario.name, scenario.expected);
+    for (name, value) in &paths.values {
+        match value {
+            Some(value) => println!("  {name:<32} {value}"),
+            None => println!("  {name:<32} （対象外）"),
+        }
+    }
+}
+
+/// **8 経路が同じ値を返すこと。**割れやすいケースを並べる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn every_rating_path_agrees(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    // 11・12 はどの formation にも入らない（1 試合もしていない人の検査用）
+    seed_players(&db, 12).await;
+
+    // 境界より前の試合を 2 件。**どの経路にも入ってはいけない**
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+    confirmed_match(&db, 2, 1500.0, 1500.0, "red").await;
+    // 境界（この時刻より前に**作られた**試合と調整が集計から外れる）
+    sqlx::query(
+        "insert into season_boundaries \
+         (effective_at, label, created_by, idempotency_key, created_at) \
+         values ($1, 'audit', 'discord:1', 'audit-boundary', $1)",
+    )
+    .bind(at(20))
+    .execute(&db.pool)
+    .await
+    .expect("append a boundary");
+
+    // 境界より後: red が 6 勝、引き分け 1、無効試合 1、不成立 1
+    for n in 21..=26u128 {
+        confirmed_match(&db, n, 1500.0, 1500.0, "red").await;
+    }
+    confirmed_match(&db, 27, 1500.0, 1500.0, "draw").await;
+    play(&db, 28, 1500.0, 1500.0).await;
+    finish(&db, 28, K::Nullified, "nullified").await;
+    // 名簿の読み取り用。不成立で終わらせるので集計にも進行中にも入らない
+    play(&db, ROSTER_FORMATION, 1500.0, 1500.0).await;
+    finish(&db, ROSTER_FORMATION, K::Voided, "voided").await;
+
+    // 調整は**境界より後**に入れる（adjust_rating は now() を使うので明示する）
+    for who in [player(1), player(12)] {
+        sqlx::query(
+            "insert into rating_adjustments \
+             (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+             values ($1, 100, 0, 'audit', 'staff:test', $2, $3)",
+        )
+        .bind(who.0)
+        .bind(at(30))
+        .bind(format!("audit-adjust-{}", who.0))
+        .execute(&db.pool)
+        .await
+        .expect("append an adjustment after the boundary");
+    }
+
+    // キューに入れる（2 / 4 / 6 の経路はキュー中の人しか返さない）
+    for who in [player(1), player(6), player(11), player(12)] {
+        enqueue(&db, who, "jungle", at(50)).await;
+    }
+
+    // 引き分けは行として数えるが増減 0。無効試合は行そのものが立たない
+    let scenarios = [
+        Scenario {
+            name: "A 勝ち越し + 調整あり（red）",
+            who: player(1),
+            expected: 1500.0 + 100.0 + 7.0 * 6.0,
+            expected_matches: 7,
+            in_formation: true,
+        },
+        Scenario {
+            name: "B 負け越し（blue・合計が負）",
+            who: player(6),
+            expected: 1500.0 - 7.0 * 6.0,
+            expected_matches: 7,
+            in_formation: true,
+        },
+        Scenario {
+            name: "C 1 試合もしていない",
+            who: player(11),
+            expected: 1500.0,
+            expected_matches: 0,
+            in_formation: false,
+        },
+        Scenario {
+            name: "D 調整のみ・試合ゼロ",
+            who: player(12),
+            expected: 1600.0,
+            expected_matches: 0,
+            in_formation: false,
+        },
+    ];
+
+    for scenario in &scenarios {
+        let paths = rating_paths(&db, scenario.who).await;
+        print_paths(&paths, scenario);
+        assert_paths_agree(&paths, scenario);
+    }
+    println!("=== 既定の増減幅 7 で 8 経路すべて一致 ===");
+
+    // ------------------------------------------------------------------
+    // 増減幅を既定値以外にしても、8 経路すべてが追従すること
+    // ------------------------------------------------------------------
+    AdminRepository::new(db.pool.clone())
+        .change_rating_params(&NewRatingParams {
+            base_delta: 12.0,
+            reason: "監査: 既定値以外で再確認".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(400),
+            idempotency_key: "audit-delta-12".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    let widened = [
+        (
+            "増減幅 12 / A",
+            player(1),
+            1500.0 + 100.0 + 12.0 * 6.0,
+            7,
+            true,
+        ),
+        ("増減幅 12 / B", player(6), 1500.0 - 12.0 * 6.0, 7, true),
+        ("増減幅 12 / C", player(11), 1500.0, 0, false),
+        ("増減幅 12 / D", player(12), 1600.0, 0, false),
+    ];
+    for (name, who, expected, expected_matches, in_formation) in widened {
+        let scenario = Scenario {
+            name,
+            who,
+            expected,
+            expected_matches,
+            in_formation,
+        };
+        let paths = rating_paths(&db, who).await;
+        print_paths(&paths, &scenario);
+        assert_paths_agree(&paths, &scenario);
+    }
+    println!("=== 増減幅 12 でも 8 経路すべて一致（7 のハードコードは無い） ===");
+
+    db.done().await;
+}
+
+/// **境界をまたぐ試合はどちら側に入るか。**
+///
+/// 判定は **`formations.created_at`**（確定イベントの時刻ではない）。
+/// したがって「境界より前に作られ、境界より後に確定した試合」は**入らない**。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_match_that_straddles_the_boundary_stays_outside(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+
+    // at(5) に作った試合を、まだ確定させずに置く
+    play(&db, 5, 1500.0, 1500.0).await;
+    // at(20) に境界を引く
+    sqlx::query(
+        "insert into season_boundaries \
+         (effective_at, label, created_by, idempotency_key, created_at) \
+         values ($1, 'straddle', 'discord:1', 'straddle-boundary', $1)",
+    )
+    .bind(at(20))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // **境界より後**に確定させる
+    let confirmed_at = at(40);
+    let event = NewEvent::new(K::Confirmed, None, confirmed_at, "straddle-finish")
+        .with_payload(serde_json::json!({ "outcome": "red" }));
+    db.formations.append_event(fid(5), &event).await.unwrap();
+
+    // 確定はしているが、**作られたのが境界より前なので集計に入らない**
+    let counted: i64 = sqlx::query_scalar(
+        "select count(*) from player_match_rating_deltas where formation_id = $1",
+    )
+    .bind(fid(5).0)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(counted, 0, "境界をまたいだ試合が集計に入っている");
+    assert_eq!(db.ratings.display_rating(player(1)).await.unwrap(), 1500.0);
+
+    println!(
+        "作成 {} / 境界 {} / 確定 {} → 集計対象 {} 行（判定は formations.created_at）",
+        at(5),
+        at(20),
+        confirmed_at,
+        counted
+    );
+
+    db.done().await;
+}
+
+/// **σ を導出しているのは 2 か所だけで、両者は一致する。**
+///
+/// σ は画面に出していない（`match_screen` に「σ を出さない」検査がある）。
+/// 現在 σ を導出するのはマッチメイカの `load_candidates` と Rust の
+/// `initial_rating` だけで、どちらも `season_rating_adjustments.delta_sigma` を足す。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_two_sigma_paths_agree(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+
+    sqlx::query(
+        "insert into rating_adjustments \
+         (player_id, delta_mu, delta_sigma, reason, created_by, created_at, idempotency_key) \
+         values ($1, 0, -120, 'sigma audit', 'staff:test', now(), 'sigma-audit')",
+    )
+    .bind(player(1).0)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    enqueue(&db, player(1), "jungle", at(0)).await;
+
+    // Rust 側（内部スケール → 表示スケールへ戻す）
+    let by_rust = db.ratings.initial_rating(player(1)).await.unwrap().sigma * DISPLAY_SCALE;
+    // マッチメイカ側（load_candidates と同じ式）
+    let by_matchmaker: f64 = sqlx::query_scalar(
+        "select $2::double precision \
+                + coalesce((select sum(a.delta_sigma) from season_rating_adjustments a \
+                            where a.player_id = q.player_id), 0::double precision) \
+         from queue_entries q where q.player_id = $1",
+    )
+    .bind(player(1).0)
+    .bind(500.0_f64)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(by_rust, by_matchmaker);
+    assert_eq!(by_rust, 380.0);
+    println!(
+        "σ: Rust {by_rust} / matchmaker {by_matchmaker}（導出はこの 2 か所だけ。画面には出さない）"
+    );
+
+    db.done().await;
+}
+
+/// **増減幅の変更とシーズン境界は、マッチメイカのスキャンと直列化される。**
+///
+/// スキャンは 1 回まるごとが 1 トランザクションで、先頭で
+/// `pg_advisory_xact_lock(VC_POOL_LOCK_KEY)` を取る（07 §4-1）。ロックを取らずに
+/// 「進行中の formation が 0 件か」を数えると、スキャンが走っているがまだ commit
+/// していない瞬間に 0 件と見えてしまい、直後に formation が生まれる。
+///
+/// いまは凍結値が増減の計算に入らないので実害は小さいが、μ+σ へ移ると凍結値が
+/// 計算に入り、原因の分からないずれになる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_params_change_waits_for_a_matchmaker_scan(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // マッチメイカのスキャンと同じロックを、別のトランザクションで握る
+    let mut scan = db.pool.begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(VC_POOL_LOCK_KEY)
+        .execute(&mut *scan)
+        .await
+        .unwrap();
+
+    // ロックを握られているあいだは進めない
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        admin.change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "スキャン中に変えようとする".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(100),
+            idempotency_key: "during-scan".to_owned(),
+        }),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "スキャンのロックを待たずに進んでしまった: {blocked:?}"
+    );
+    // 行も積まれていない
+    let rows: i64 = sqlx::query_scalar("select count(*) from rating_param_changes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    println!("スキャン中: 増減幅の変更はロック待ちで進まない");
+
+    // 境界も同じ
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        admin.start_season(&NewSeasonBoundary {
+            effective_at: at(200),
+            label: "スキャン中".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(200),
+            idempotency_key: "season-during-scan".to_owned(),
+        }),
+    )
+    .await;
+    assert!(blocked.is_err(), "境界がロックを待たずに進んでしまった");
+    println!("スキャン中: シーズン境界もロック待ちで進まない");
+
+    // スキャンが終われば通る
+    scan.commit().await.unwrap();
+    let changed = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "スキャンが終わったので変える".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(300),
+            idempotency_key: "after-scan".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(changed, RatingParamsOutcome::Changed { .. }));
+    assert_eq!(admin.rating_params().await.unwrap().base_delta, 20.0);
+    println!("スキャン終了後: 変更できる");
 
     db.done().await;
 }

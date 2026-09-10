@@ -11,7 +11,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::lifecycle::PlayerId;
-use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::model::{DiscordAppearance, ProfileEdit, PublicProfile, avatar_url};
 
@@ -166,17 +165,11 @@ impl ProfileRepository {
     ) -> Result<Option<PublicProfile>, sqlx::Error> {
         let Some(player) = sqlx::query!(
             "select p.discord_user_id, p.trainer_name, \
-                    $2::double precision \
-                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                    where a.player_id = p.id), 0::double precision) \
-                        + coalesce((select sum(d.delta) from player_match_rating_deltas d \
-                                    where d.player_id = p.id), 0::double precision) \
-                        as \"rating!\", \
-                    coalesce((select count(*) from player_match_rating_deltas d \
-                              where d.player_id = p.id), 0)::bigint as \"matches!\" \
-             from players p where p.id = $1",
+                    v.rating as \"rating!\", v.matches as \"matches!\" \
+             from players p \
+             join player_current_ratings v on v.player_id = p.id \
+             where p.id = $1",
             player_id.0,
-            DEFAULT_DISPLAY_MU,
         )
         .fetch_optional(&self.pool)
         .await?

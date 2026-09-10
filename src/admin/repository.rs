@@ -20,9 +20,11 @@ use uuid::Uuid;
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
 use crate::queue::model::clamp_down_range;
-use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
+use super::rating_params::{
+    RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
+};
 use super::season::{SeasonBoundary, SeasonOutcome, SeasonPreview};
 
 /// PostgreSQL の SQLSTATE。
@@ -453,16 +455,11 @@ impl AdminRepository {
         let rows = sqlx::query!(
             "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, \
                     p.discord_user_id, p.trainer_name, \
-                    $1::double precision \
-                        + coalesce((select sum(a.delta_mu) from season_rating_adjustments a \
-                                    where a.player_id = q.player_id), 0::double precision) \
-                        + coalesce(m.delta, 0::double precision) \
-                        as \"rating!\" \
+                    v.rating as \"rating!\" \
              from queue_entries q \
              join players p on p.id = q.player_id \
-             left join player_match_ratings m on m.player_id = q.player_id \
+             join player_current_ratings v on v.player_id = q.player_id \
              order by q.enqueued_at, q.id",
-            DEFAULT_DISPLAY_MU,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -670,35 +667,12 @@ impl AdminRepository {
         effective_at: DateTime<Utc>,
     ) -> Result<SeasonPreview, sqlx::Error> {
         let current = self.current_season().await?;
-
-        // 進行中（matched / awaiting_host / awaiting_code / in_progress）と、
-        // 報告待ち（in_progress）を 1 回の走査で数える
-        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
-            .list_unfinished()
-            .await
-            .map_err(|error| match error {
-                crate::persistence::RepositoryError::Database(error) => error,
-                // list_unfinished は導出しかしないので、他の種別は起きない
-                other => sqlx::Error::Protocol(other.to_string()),
-            })?;
-        let mut active_formations = 0;
-        let mut pending_reports = 0;
-        for formation in &unfinished {
-            match &formation.snapshot.state {
-                crate::lifecycle::FormationState::Matched
-                | crate::lifecycle::FormationState::AwaitingHost { .. }
-                | crate::lifecycle::FormationState::AwaitingCode { .. } => active_formations += 1,
-                crate::lifecycle::FormationState::InProgress { .. } => {
-                    active_formations += 1;
-                    pending_reports += 1;
-                }
-                crate::lifecycle::FormationState::Disputed
-                | crate::lifecycle::FormationState::Confirmed
-                | crate::lifecycle::FormationState::Nullified
-                | crate::lifecycle::FormationState::Voided
-                | crate::lifecycle::FormationState::Abandoned => {}
-            }
-        }
+        let counts = self.unfinished_counts().await?;
+        let (active_formations, pending_reports, disputed) = (
+            counts.active_formations,
+            counts.pending_reports,
+            counts.disputed,
+        );
 
         // 集計から外れる試合と、その参加者。いま導出に入っているものだけを数える
         // （`player_match_rating_deltas` が現在の境界で既に絞られている）
@@ -718,6 +692,7 @@ impl AdminRepository {
             pending_reports,
             matches_leaving: usize::try_from(leaving.matches).unwrap_or(usize::MAX),
             players_affected: usize::try_from(leaving.players).unwrap_or(usize::MAX),
+            disputed,
             current,
         })
     }
@@ -730,14 +705,22 @@ impl AdminRepository {
         &self,
         input: &NewSeasonBoundary,
     ) -> Result<SeasonOutcome, AdminStoreError> {
+        // **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+        // 先頭で同じ advisory lock を取る（07 §4-1）。ロックを取らずに数えると、
+        // 「スキャンは走っているがまだ commit していない」瞬間に進行中 0 件と見えてしまい、
+        // 境界を入れた直後に formation が生まれる。数えるのも入れるのもロックの内側で行う。
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        // ロックを取ってから数える。ここまで来た時点で、走っていたスキャンは commit 済み
         let preview = self.season_preview(input.effective_at).await?;
         if !preview.can_start() {
+            tx.commit().await?;
             return Ok(SeasonOutcome::Blocked {
                 active_formations: preview.active_formations,
             });
         }
 
-        let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query_scalar!(
             "insert into season_boundaries \
              (effective_at, label, created_by, idempotency_key, created_at) \
@@ -780,6 +763,226 @@ impl AdminRepository {
     }
 }
 
+/// 未終了 formation の内訳。**進行中を止める判定はここ 1 か所から取る。**
+///
+/// シーズン境界とレート増減幅の変更が同じ条件（進行中が 1 件でもあれば拒否）を
+/// 使うので、数え方を 2 か所に書かない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnfinishedCounts {
+    /// matched / awaiting_host / awaiting_code / in_progress。
+    pub active_formations: usize,
+    /// in_progress（＝まだ報告が揃っていない試合）。`active_formations` の部分集合。
+    pub pending_reports: usize,
+    /// disputed。進行中には数えないが、確定していないので警告として出す。
+    pub disputed: usize,
+}
+
+impl AdminRepository {
+    /// 未終了 formation を 1 回の走査で数える。
+    pub async fn unfinished_counts(&self) -> Result<UnfinishedCounts, sqlx::Error> {
+        let unfinished = crate::persistence::FormationRepository::new(self.pool.clone())
+            .list_unfinished()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::RepositoryError::Database(error) => error,
+                // list_unfinished は導出しかしないので、他の種別は起きない
+                other => sqlx::Error::Protocol(other.to_string()),
+            })?;
+        let mut counts = UnfinishedCounts::default();
+        for formation in &unfinished {
+            match &formation.snapshot.state {
+                crate::lifecycle::FormationState::Matched
+                | crate::lifecycle::FormationState::AwaitingHost { .. }
+                | crate::lifecycle::FormationState::AwaitingCode { .. } => {
+                    counts.active_formations += 1;
+                }
+                crate::lifecycle::FormationState::InProgress { .. } => {
+                    counts.active_formations += 1;
+                    counts.pending_reports += 1;
+                }
+                crate::lifecycle::FormationState::Disputed => counts.disputed += 1,
+                crate::lifecycle::FormationState::Confirmed
+                | crate::lifecycle::FormationState::Nullified
+                | crate::lifecycle::FormationState::Voided
+                | crate::lifecycle::FormationState::Abandoned => {}
+            }
+        }
+        Ok(counts)
+    }
+}
+// ----------------------------------------------------------------------
+// レート増減幅の変更
+// ----------------------------------------------------------------------
+//
+// **現在値のテーブルは作らない。**増減幅は `rating_param_changes` の最新行から
+// 導出する（`current_rating_params`）。値を変えると `player_match_rating_deltas` が
+// 過去の全試合を新しい値で引き直す——docs/02 の不変条件 3 そのもので、意図した挙動。
+
+/// 追記する変更 1 件。
+#[derive(Debug, Clone)]
+pub struct NewRatingParams {
+    /// 新しい増減幅（表示スケール）。**検証済みの値を渡すこと。**
+    pub base_delta: f64,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// いま効いている params。**最新行から導出する**（保存された現在値ではない）。
+    pub async fn rating_params(&self) -> Result<RatingParams, sqlx::Error> {
+        let row = sqlx::query!(
+            "select base_delta as \"base_delta!\", params_version as \"params_version!\" \
+             from current_rating_params"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(RatingParams {
+            base_delta: row.base_delta,
+            params_version: row.params_version,
+        })
+    }
+
+    /// 実行前に出す件数と履歴。**毎回数え直す**（保存しない）。
+    ///
+    /// 数える対象は「いま導出に入っている確定済みの試合」で、これがそのまま
+    /// **引き直される試合**である（`player_match_rating_deltas` を引くので、
+    /// シーズン境界より前の試合は最初から入らない）。
+    pub async fn rating_params_preview(&self) -> Result<RatingParamsPreview, sqlx::Error> {
+        let current = self.rating_params().await?;
+        let unfinished = self.unfinished_counts().await?;
+        let counts = sqlx::query!(
+            "select count(distinct d.formation_id) as \"matches!\", \
+                    count(distinct d.player_id) as \"players!\" \
+             from player_match_rating_deltas d"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let history = sqlx::query!(
+            "select id, base_delta as \"base_delta!\", params_version as \"params_version!\", \
+                    reason, created_by, created_at \
+             from rating_param_changes order by id desc limit 20"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(RatingParamsPreview {
+            current_base_delta: current.base_delta,
+            current_params_version: current.params_version,
+            matches_affected: usize::try_from(counts.matches).unwrap_or(0),
+            players_affected: usize::try_from(counts.players).unwrap_or(0),
+            active_formations: unfinished.active_formations,
+            pending_reports: unfinished.pending_reports,
+            disputed: unfinished.disputed,
+            history: history
+                .into_iter()
+                .map(|row| RatingParamChange {
+                    id: row.id,
+                    base_delta: row.base_delta,
+                    params_version: row.params_version,
+                    reason: row.reason,
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                })
+                .collect(),
+        })
+    }
+
+    /// 増減幅の変更を追記する。**版数は直前の値 +1 で採番する。**
+    ///
+    /// 採番も導出（`current_rating_params.params_version`）から取るので、
+    /// 版数の現在値を持つ列はどこにも無い。
+    pub async fn change_rating_params(
+        &self,
+        input: &NewRatingParams,
+    ) -> Result<RatingParamsOutcome, AdminStoreError> {
+        // **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+        // 先頭で同じ advisory lock を取る（07 §4-1）。ロックを取らずに数えると、
+        // 「スキャンは走っているがまだ commit していない」瞬間に進行中 0 件と見えてしまう。
+        // いまは凍結値が増減の計算に入らないので実害は小さいが、μ+σ へ移ると
+        // 凍結値が計算に入り、原因の分からないずれになる。
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        // ロックを取ってから数える。ここまで来た時点で、走っていたスキャンは commit 済み
+        let preview = self.rating_params_preview().await?;
+        // **進行中の formation があるあいだは変えない。**1 行積んだ瞬間に全員のレートが
+        // 動き、キュー中の人の範囲判定も同時に変わる。断ったことは記録に残す
+        if !preview.can_change() {
+            append_action_on(
+                &mut tx,
+                &NewAdminAction {
+                    kind: AdminActionKind::RatingParamsRejected,
+                    actor_discord_user_id: input.actor_discord_user_id,
+                    target_player_id: None,
+                    reason: Some(input.reason.clone()),
+                    payload: serde_json::json!({
+                        "requested_base_delta": input.base_delta,
+                        "current_base_delta": preview.current_base_delta,
+                        "active_formations": preview.active_formations,
+                        "pending_reports": preview.pending_reports,
+                    }),
+                    occurred_at: input.created_at,
+                    idempotency_key: format!("rating_params_rejected:{}", input.idempotency_key),
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(RatingParamsOutcome::Blocked {
+                active_formations: preview.active_formations,
+            });
+        }
+        let params_version = preview.current_params_version + 1;
+
+        // 同じトランザクション（＝同じロックの内側）で入れる
+        let inserted = sqlx::query_scalar!(
+            "insert into rating_param_changes \
+             (params_version, base_delta, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            params_version,
+            input.base_delta,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(RatingParamsOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::RatingParamsChanged,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "rating_param_change_id": id,
+                    "params_version": params_version,
+                    "previous_base_delta": preview.current_base_delta,
+                    "base_delta": input.base_delta,
+                    "matches_recomputed": preview.matches_affected,
+                    "players_affected": preview.players_affected,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("rating_params:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RatingParamsOutcome::Changed { id, params_version })
+    }
+}
 // ----------------------------------------------------------------------
 // 運営による報告の入力
 // ----------------------------------------------------------------------

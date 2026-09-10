@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select d.formation_id as \"formation_id!\", d.team as \"team!\", d.outcome as \"outcome!\", d.own_rating as \"own_rating!\", d.delta as \"delta!\", f.created_at as \"played_at!\" from player_match_rating_deltas d join formations f on f.id = d.formation_id where d.player_id = $1 order by f.created_at desc, d.formation_id desc limit $2",
+  "query": "select d.formation_id as \"formation_id!\", d.team as \"team!\", d.outcome as \"outcome!\", d.own_rating as \"own_rating!\", d.delta as \"delta!\", f.created_at as \"played_at!\", coalesce(q.delta, 0::double precision) as \"penalty!\" from player_match_rating_deltas d join formations f on f.id = d.formation_id left join quiet_report_penalties q on q.formation_id = d.formation_id and q.player_id = d.player_id where d.player_id = $1 order by f.created_at desc, d.formation_id desc limit $2",
   "describe": {
     "columns": [
       {
@@ -68,6 +68,12 @@
             "name": "created_at"
           }
         }
+      },
+      {
+        "ordinal": 6,
+        "name": "penalty!",
+        "type_info": "Float8",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -82,8 +88,9 @@
       true,
       true,
       true,
-      false
+      false,
+      null
     ]
   },
-  "hash": "aa80302dc83f35c5c5485b83c849068b243a7caa3733b835d7045e91325d305e"
+  "hash": "795104a339cc16dd25f83b5b3d6d58da0966126a128590b4f36c316acdad8a61"
 }

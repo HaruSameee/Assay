@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists( select 1 from quiet_reports where formation_id = $1 and reporter_id = $2 ) as \"reported!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reported!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6a0cefecf7a78bf81e17eed146bdb94c2fae6fd8e963d90ffba65cbaa79d068e"
+}
