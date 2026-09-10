@@ -40,6 +40,12 @@ const UNIQUE_VIOLATION: &str = "23505";
 pub struct InRangeSummary {
     /// 自分の範囲内で、かつ相手からも受け入れられる人数（07 §3-1）。
     pub total: usize,
+    /// **キュー全体の人数。**レート帯を問わず、いまキューにいる全員
+    /// (自分は含めない。`total` と分母を揃える)。
+    ///
+    /// `total` と**同じ 1 本のクエリの結果から数える**。別に count を投げると、
+    /// 2 つの数字がわずかに違う瞬間のキューを指すことがある。
+    pub queue_total: usize,
     /// その内訳（5 ロールすべて。0 人でも 0）。
     pub by_first_choice: FirstChoiceRoleCounts,
 }
@@ -275,6 +281,8 @@ impl QueueRepository {
         };
         Ok(Some(InRangeSummary {
             total: super::range::count_in_range(me, &queue),
+            // 自分を除く（`count_in_range` も自分は数えない）
+            queue_total: queue.len().saturating_sub(1),
             by_first_choice: super::range::count_by_first_choice(me, &queue),
         }))
     }
@@ -301,6 +309,8 @@ impl QueueRepository {
         };
         Ok(InRangeSummary {
             total: super::range::count_in_range(&me, &queue),
+            // 未投入なので自分はキューに入っていない。そのまま全員が「自分以外」
+            queue_total: queue.len(),
             by_first_choice: super::range::count_by_first_choice(&me, &queue),
         })
     }

@@ -1098,6 +1098,17 @@ async fn exactly_fifty_apart_counts_but_one_hundred_does_not(owner: PgPool) {
     let (_, from_middle) = get_queue(&app, Some(middle)).await;
     assert_eq!(from_middle["in_range"], 2, "{from_middle}");
 
+    // **全体の人数はレート帯を問わない。**3 人キューにいて、自分を除く 2 人が
+    // どこから見ても全体の数になる（範囲内の数と違って視点で変わらない）
+    for (who, label) in [(high, "1600"), (middle, "1550"), (low, "1500")] {
+        let (_, view) = get_queue(&app, Some(who)).await;
+        assert_eq!(view["queue_total"], 2, "{label} から見た全体: {view}");
+    }
+    println!(
+        "全体 2 / 範囲内: 1600→{} 1550→{} 1500→{}",
+        from_high["in_range"], from_middle["in_range"], from_low["in_range"]
+    );
+
     // 自分自身は数えない
     assert_eq!(
         db.queue

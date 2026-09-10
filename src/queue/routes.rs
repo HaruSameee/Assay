@@ -223,6 +223,11 @@ pub(super) struct StatusView {
     ///
     /// 範囲は上下 50 固定なので、キューに入る前でも決まる（読み取りに失敗したときだけ `null`）。
     pub(super) in_range: Option<usize>,
+    /// **キュー全体の人数**（レート帯を問わない。自分は含めない）。
+    ///
+    /// `in_range` と同じ 1 本のクエリから数えるので、2 つの数字が別の瞬間の
+    /// キューを指すことはない。読み取りに失敗したときだけ `null`。
+    pub(super) queue_total: Option<usize>,
     /// その内訳。**第1希望がそのロールの人の数**で、15 分サマリと同じ定義。
     /// 5 ロールすべてを返す（0 人でも 0。出ないと「集計されていない」と読まれる）。
     pub(super) in_range_by_first_choice: Vec<RoleCountView>,
@@ -521,7 +526,8 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
     Some(StatusView {
         queued: entry.is_some(),
         entry: entry.map(EntryView::from),
-        in_range: in_range.map(|summary| summary.total),
+        in_range: in_range.as_ref().map(|summary| summary.total),
+        queue_total: in_range.as_ref().map(|summary| summary.queue_total),
         in_range_by_first_choice,
         eligibility: EligibilityView::from(&eligibility),
         destination,
