@@ -18,6 +18,7 @@
 
 pub mod actions;
 pub mod config;
+pub mod disputes;
 pub mod html;
 pub mod matching_range;
 pub mod rating_params;
@@ -32,6 +33,7 @@ pub use actions::{
 pub use config::{
     ADMIN_DISCORD_USER_IDS, AdminConfigError, AdminIds, admin_ids_from_env, parse_admin_ids,
 };
+pub use disputes::{DisputeDecision, DisputeOutcome, NewDisputeResolution, parse_decision};
 pub use matching_range::{
     MatchingRangeChange, MatchingRangeError, MatchingRangeOutcome, MatchingRangePreview,
     parse_ranges,

@@ -37,6 +37,7 @@ use super::actions::{
     AdminActionKind, MAX_BLOCK_ALLOWANCE, normalize_reason, parse_block_allowance,
 };
 use super::config::AdminIds;
+use super::disputes::{DisputeOutcome, NewDisputeResolution, parse_decision};
 use super::html::{
     MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView,
     RatingParamsView, ReportsView, SearchView, SeasonView, matching_range_page, player_page,
@@ -118,6 +119,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/blocks/override", post(override_block))
         // シーズン境界（導出の起点）。2 段階の確認。実行は POST /admin/season
         .route("/admin/reports", get(show_reports).post(enter_report))
+        // 係争の裁定。**終端イベントを 1 行積むだけ**（報告は書き換えない）
+        .route("/admin/reports/dispute", post(resolve_dispute))
         .route("/admin/season", get(show_season).post(start_season))
         // レート増減幅。2 段階の確認。実行は POST /admin/rating-params
         .route(
@@ -993,6 +996,77 @@ async fn start_season(
 //
 // **プレイヤーの報告を UPDATE しない。**運営の報告も 1 行の追記で、確定判定は
 // 従来どおり各プレイヤーの最新報告を読む。対象は未報告の人だけ。
+
+#[derive(Debug, Deserialize)]
+struct ResolveDisputeForm {
+    #[serde(default)]
+    formation: String,
+    #[serde(default)]
+    decision: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// 係争を裁定する。**終端イベントを 1 行積むだけ。**
+///
+/// 報告は書き換えない。割れた報告はそのまま残り、裁定はその上に乗る別の 1 行になる。
+/// 追記は通常の経路を通るので、状態機械の検証も冪等キーもそのまま効く。
+async fn resolve_dispute(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<ResolveDisputeForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let Ok(formation_id) = Uuid::parse_str(form.formation.trim()) else {
+        return render_reports(&app, Some(fail("試合の指定が不正です。".to_owned()))).await;
+    };
+    let Some(decision) = parse_decision(&form.decision) else {
+        return render_reports(&app, Some(fail("裁定の指定が不正です。".to_owned()))).await;
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        return render_reports(&app, Some(fail("理由を入力してください。".to_owned()))).await;
+    };
+
+    let input = NewDisputeResolution {
+        formation_id: FormationId(formation_id),
+        decision,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.resolve_dispute(&input).await {
+        Ok(DisputeOutcome::Resolved { state }) => {
+            let ratings = if decision.changes_ratings() {
+                "この試合の増減がレートに入りました。"
+            } else {
+                "レートは動いていません。"
+            };
+            info(format!(
+                "裁定を記録しました（{label} / {state}）。{ratings}\
+                 プレイヤーの報告は 1 行も書き換えていません。",
+                label = decision.label(),
+            ))
+        }
+        Ok(DisputeOutcome::Duplicate) => {
+            info("この裁定は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Ok(DisputeOutcome::NotDisputed { state }) => fail(format!(
+            "その試合は係争中ではありません（現在: {state}）。\
+             ほかの運営が先に裁定した可能性があります。画面を読み直してください。"
+        )),
+        Err(err) => {
+            error!(%err, "could not resolve the dispute");
+            return internal_error();
+        }
+    };
+    render_reports(&app, Some(notice)).await
+}
 
 /// 報告の入力画面を描く。一覧は毎回引き直す（保存しない）。
 async fn render_reports(app: &AdminState, notice: Option<Notice>) -> Response {

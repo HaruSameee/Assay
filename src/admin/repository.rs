@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::disputes::{DisputeOutcome, NewDisputeResolution};
 use super::matching_range::{MatchingRangeChange, MatchingRangeOutcome, MatchingRangePreview};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
@@ -1458,5 +1459,110 @@ impl AdminRepository {
         }
         disputed.sort_by_key(|entry| entry.created_at);
         Ok(disputed)
+    }
+}
+
+impl AdminRepository {
+    /// 係争を裁定して終端イベントを 1 行積む。
+    ///
+    /// **報告は 1 行も書き換えない。**割れた報告はそのまま残り、裁定はその上に乗る
+    /// 別の 1 行である（docs/02 不変条件 1）。レートに入るのは
+    /// `confirmed` を積んだときだけで、`nullified` / `voided` は増減を生まない
+    /// （`player_match_rating_deltas` は `confirmed` しか読まない）。
+    ///
+    /// 追記は通常の経路（[`crate::persistence::FormationRepository::append_event`]）を
+    /// 通すので、**formation 単位のロック・冪等キー・状態機械の検証がそのまま効く**。
+    /// 係争中でない試合に積もうとすると状態機械が弾くが、その前に状態を読んで
+    /// [`DisputeOutcome::NotDisputed`] で返す（画面に何が起きたかを書くため）。
+    pub async fn resolve_dispute(
+        &self,
+        input: &NewDisputeResolution,
+    ) -> Result<DisputeOutcome, AdminStoreError> {
+        let formations = crate::persistence::FormationRepository::new(self.pool.clone());
+        let event_key = format!("dispute_resolved:{}", input.idempotency_key);
+        let log = formations
+            .load_events(input.formation_id)
+            .await
+            .map_err(repository_error)?;
+
+        // **冪等キーの判定を状態より先に置く。**同じフォームを 2 回送ると、
+        // 1 回目で状態が disputed でなくなる。状態を先に見ると、ただの二重送信が
+        // 「他の運営が先に裁定した」と表示されてしまう。
+        // 判定は**キーだけ**で行う（docs/02: 状態ベースにしない）。
+        if log
+            .events
+            .iter()
+            .any(|stored| stored.event.idempotency_key == event_key)
+        {
+            return Ok(DisputeOutcome::Duplicate);
+        }
+
+        let state = log.snapshot().state;
+        if state != crate::lifecycle::FormationState::Disputed {
+            return Ok(DisputeOutcome::NotDisputed {
+                state: state.name().to_owned(),
+            });
+        }
+
+        // payload は評価器が積む confirmed と同じ形にする。**裁定であることは
+        // basis で分かる**（一致率は運営の判断なので載せない。載せると
+        // 「10 人中 N 人が一致」という指標に運営の 1 票が混ざる）
+        let mut payload = serde_json::json!({ "decision_basis": "staff_adjudication" });
+        if let Some(outcome) = input.decision.outcome() {
+            payload["outcome"] = serde_json::json!(outcome.as_str());
+        }
+        let event = crate::persistence::NewEvent::new(
+            input.decision.kind(),
+            None,
+            input.created_at,
+            event_key,
+        )
+        .with_payload(payload);
+
+        let appended = formations
+            .append_event(input.formation_id, &event)
+            .await
+            .map_err(repository_error)?;
+        if appended.already_recorded {
+            return Ok(DisputeOutcome::Duplicate);
+        }
+
+        // 運営操作ログは**別トランザクション**で積む。イベントの追記と 1 つの
+        // トランザクションにまとめるには append_event を割る必要があり、そちらの
+        // ロックと冪等の保証を薄くする方が高くつく。両方とも冪等キーを持つので、
+        // ここで落ちても同じ操作をやり直せば揃う
+        let mut tx = self.pool.begin().await?;
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::DisputeResolved,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "formation_id": input.formation_id.0,
+                    "decision": input.decision.as_str(),
+                    "event_id": appended.event_id.0,
+                    "changes_ratings": input.decision.changes_ratings(),
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("dispute_resolved:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(DisputeOutcome::Resolved {
+            state: appended.state.name().to_owned(),
+        })
+    }
+}
+
+/// `RepositoryError` を `AdminStoreError` に寄せる。DB 以外の種別は導出の失敗なので、
+/// そのまま文字列で運ぶ（この経路では起きない）。
+fn repository_error(error: crate::persistence::RepositoryError) -> AdminStoreError {
+    match error {
+        crate::persistence::RepositoryError::Database(error) => AdminStoreError::from(error),
+        other => AdminStoreError::from(sqlx::Error::Protocol(other.to_string())),
     }
 }

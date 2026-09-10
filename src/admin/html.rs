@@ -14,6 +14,7 @@ use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
+use super::disputes::DisputeDecision;
 use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::{
@@ -1817,13 +1818,13 @@ pub fn reports_page(view: &ReportsView<'_>) -> String {
              その人の内容を運営が上書きする経路はありません。\
              <strong>係争中（disputed）の試合もこの一覧には出ません</strong> — \
              報告が割れたことが原因なので、未報告者ぶんを足しても状態は動きません。\
-             下の一覧で内訳だけ確認できます。</p>\n\
+             下の一覧で内訳を見て、そこから裁定してください。</p>\n\
              {notice}\
              {body}\
              {disputed}\
              </section>\n",
             nav = admin_nav("/admin/reports"),
-            disputed = disputed_section(view.disputed),
+            disputed = disputed_section(view.disputed, view.form_key),
             notice = notice_html(view.notice.as_ref()),
         ),
     )
@@ -1877,30 +1878,39 @@ fn awaiting_block(formation: &AwaitingReports, form_key: &str) -> String {
     )
 }
 
-/// 係争中の試合の一覧。**閲覧だけ。入力欄もボタンも置かない。**
+/// 係争中の試合の一覧と、**その場で裁定するフォーム**。
 ///
-/// 未報告者の一覧から係争中を外したので、そのままだと運営の視界から消える。
-/// Discord 上で裁定するための材料として、誰が何を報告したかを読めるようにする。
-/// 裁定結果を反映する経路は**ここには作らない**（開幕後に決める）。
-fn disputed_section(disputed: &[DisputedFormation]) -> String {
+/// 未報告者の一覧から係争中を外してあるので、運営が係争を見る場所はここだけ。
+/// 誰が何を報告したかを読んだうえで、同じ画面で裁定できる。
+///
+/// **報告は書き換えない。**裁定は終端イベントを 1 行積むだけで、割れた報告は
+/// そのまま残る。だから「誰の報告を採用したか」ではなく「運営が何と決めたか」を
+/// 記録することになる。
+fn disputed_section(disputed: &[DisputedFormation], form_key: &str) -> String {
     let body = if disputed.is_empty() {
         String::from("<p class=\"fine-print\">係争中の試合はありません。</p>\n")
     } else {
-        disputed.iter().map(disputed_block).collect::<String>()
+        disputed
+            .iter()
+            .map(|formation| disputed_block(formation, form_key))
+            .collect::<String>()
     };
     format!(
         "<section class=\"section\" aria-labelledby=\"disputed-title\">\n\
-         <h2 id=\"disputed-title\">係争中の試合（{count}件・閲覧のみ）</h2>\n\
+         <h2 id=\"disputed-title\">係争中の試合（{count}件）</h2>\n\
          <p class=\"fine-print\">報告が割れたまま期限を過ぎた試合です。\
-         <strong>ここから結果を入れることはできません。</strong>\
-         内訳を見て、裁定は Discord 上で行ってください。</p>\n\
+         内訳を見て裁定してください。<strong>裁定しないと、その試合で未報告の人は\
+         キューに入れないままになります。</strong>\
+         また、シーズン境界を引いた後に裁定しても新シーズンのレートには入りません。</p>\n\
+         <p class=\"fine-print\"><strong>報告は書き換わりません。</strong>\
+         割れた報告はそのまま残り、裁定はその上に積む別の 1 行として記録されます。</p>\n\
          {body}</section>\n",
         count = disputed.len(),
     )
 }
 
-/// 係争中の試合 1 件の内訳。
-fn disputed_block(formation: &DisputedFormation) -> String {
+/// 係争中の試合 1 件の内訳と裁定フォーム。
+fn disputed_block(formation: &DisputedFormation, form_key: &str) -> String {
     let rows = formation
         .votes
         .iter()
@@ -1926,16 +1936,44 @@ fn disputed_block(formation: &DisputedFormation) -> String {
             )
         })
         .collect::<String>();
+    let id = formation.formation_id.to_string();
+    let choices = DisputeDecision::ALL
+        .iter()
+        .map(|decision| {
+            let note = if decision.changes_ratings() {
+                "（レートが動きます）"
+            } else {
+                "（レートは動きません）"
+            };
+            format!(
+                "<option value=\"{value}\">{label}{note}</option>\n",
+                value = escape(decision.as_str()),
+                label = escape(decision.label()),
+            )
+        })
+        .collect::<String>();
     format!(
         "<h3>{label}</h3>\n<p class=\"fine-print\">成立: {at}</p>\n\
          <div class=\"table-wrap\"><table class=\"log\">\n\
          <thead><tr><th>プレイヤー</th><th>チーム</th><th>最新の報告</th></tr></thead>\n\
-         <tbody>\n{rows}</tbody></table></div>\n",
+         <tbody>\n{rows}</tbody></table></div>\n\
+         <form method=\"post\" action=\"/admin/reports/dispute\">\
+         <input type=\"hidden\" name=\"formation\" value=\"{id}\">\
+         <input type=\"hidden\" name=\"key\" value=\"dispute:{id}:{form_key}\">\
+         <label for=\"decision-{id}\">裁定</label>\
+         <select id=\"decision-{id}\" name=\"decision\" required>{choices}</select>\
+         <label for=\"reason-{id}\">理由（記録に残ります）</label>\
+         <input id=\"reason-{id}\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">この裁定で確定する</button>\
+         </div></form>\n",
         label = escape(&format!(
             "match-{}",
             &formation.formation_id.simple().to_string()[..8]
         )),
         at = escape(&display_time(formation.created_at)),
+        id = escape(&id),
+        form_key = escape(form_key),
     )
 }
 
