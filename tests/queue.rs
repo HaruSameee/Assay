@@ -511,7 +511,10 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
     assert!(queued.contains("data-view=\"queued\""), "{queued}");
     assert!(queued.contains("第1希望: 中央"), "{queued}");
     assert!(queued.contains("第2希望: サポート"), "{queued}");
-    assert!(queued.contains("上下 ±50（固定）"), "{queued}");
+    assert!(queued.contains("上 +50 / 下 -50"), "{queued}");
+    // 全体と範囲内の 2 つが並ぶ（自分ひとりなので全体 0 人）
+    assert!(queued.contains("全体でキュー中"), "{queued}");
+    assert!(queued.contains("範囲内でキュー中"), "{queued}");
 
     let (status, _) = delete_queue(&app, me).await;
     assert_eq!(status, StatusCode::OK);

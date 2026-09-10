@@ -260,7 +260,7 @@ fn queued_page(
          {breakdown}\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
          <dl class=\"details\"><div><dt>ロール希望</dt><dd><ol class=\"role-preferences\">{roles}</ol></dd></div>\n\
-         <div><dt>レート範囲</dt><dd>上下 ±{up_range}（固定）</dd></div></dl></section>\n\
+         <div><dt>レート範囲</dt><dd>上 +{up_range} / 下 -{down_range}</dd></div></dl></section>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button id=\"leave-queue\" class=\"button-danger\" type=\"button\">キューを離脱</button></div>\n\
          <p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
@@ -268,6 +268,7 @@ fn queued_page(
         enqueued = escape(&entry.enqueued_at),
         breakdown = first_choice_breakdown(status),
         up_range = entry.up_range,
+        down_range = entry.down_range,
         reported = reported_notice(reported),
         script = QUEUED_SCRIPT,
     );
@@ -650,7 +651,7 @@ mod tests {
         );
         assert!(rendered.contains("02:03"));
         assert!(rendered.contains("第1希望: 中央"));
-        assert!(rendered.contains("上下 ±50（固定）"));
+        assert!(rendered.contains("上 +50 / 下 -50"));
         assert!(rendered.contains("キューを離脱"));
         assert!(rendered.contains("setInterval(poll, 10000)"));
         // **全体と範囲内を 2 つ並べる。**「範囲内 4 人」だけだと、
