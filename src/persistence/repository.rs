@@ -42,7 +42,7 @@ const VC_RELEASE_KINDS: [FormationEventKind; 5] = [
 ///
 /// formation 単位のロックだけでは、異なる formation が同じ空き組を同時に選べる。割当候補の
 /// 選択と `vc_assigned` の INSERT は必ずこのロックを取った同一トランザクションで行う。
-const VC_POOL_LOCK_KEY: i64 = 0x4153_5341_595F_5643;
+pub const VC_POOL_LOCK_KEY: i64 = 0x4153_5341_595F_5643;
 
 /// 訂正チェーンの分岐を防ぐ部分 unique インデックス名（マイグレーションと一致させる）。
 const SUPERSEDES_UNIQUE_INDEX: &str = "match_reports_supersedes_uniq";

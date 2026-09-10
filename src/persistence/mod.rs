@@ -39,4 +39,4 @@ pub use model::{
     UnfinishedFormation, UnreadableRow, VcAssignment,
 };
 pub(crate) use model::{ReportDecision, ReportVote};
-pub use repository::{FormationRepository, VcAssignmentOutcome};
+pub use repository::{FormationRepository, VC_POOL_LOCK_KEY, VcAssignmentOutcome};

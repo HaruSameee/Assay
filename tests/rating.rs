@@ -15,12 +15,15 @@
 use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use unite_matchsystem::admin::{AdminRepository, NewRatingParams, RatingParamsOutcome};
+use unite_matchsystem::admin::{
+    AdminRepository, NewRatingParams, NewSeasonBoundary, RatingParamsOutcome,
+};
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::match_screen::MatchRepository;
 use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES};
 use unite_matchsystem::persistence::{
-    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team, VcAssignment,
+    FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team, VC_POOL_LOCK_KEY,
+    VcAssignment,
 };
 use unite_matchsystem::profiles::ProfileRepository;
 use unite_matchsystem::queue::QueueRepository;
@@ -1337,6 +1340,87 @@ async fn the_two_sigma_paths_agree(owner: PgPool) {
     println!(
         "σ: Rust {by_rust} / matchmaker {by_matchmaker}（導出はこの 2 か所だけ。画面には出さない）"
     );
+
+    db.done().await;
+}
+
+/// **増減幅の変更とシーズン境界は、マッチメイカのスキャンと直列化される。**
+///
+/// スキャンは 1 回まるごとが 1 トランザクションで、先頭で
+/// `pg_advisory_xact_lock(VC_POOL_LOCK_KEY)` を取る（07 §4-1）。ロックを取らずに
+/// 「進行中の formation が 0 件か」を数えると、スキャンが走っているがまだ commit
+/// していない瞬間に 0 件と見えてしまい、直後に formation が生まれる。
+///
+/// いまは凍結値が増減の計算に入らないので実害は小さいが、μ+σ へ移ると凍結値が
+/// 計算に入り、原因の分からないずれになる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_params_change_waits_for_a_matchmaker_scan(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // マッチメイカのスキャンと同じロックを、別のトランザクションで握る
+    let mut scan = db.pool.begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock($1)")
+        .bind(VC_POOL_LOCK_KEY)
+        .execute(&mut *scan)
+        .await
+        .unwrap();
+
+    // ロックを握られているあいだは進めない
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        admin.change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "スキャン中に変えようとする".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(100),
+            idempotency_key: "during-scan".to_owned(),
+        }),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "スキャンのロックを待たずに進んでしまった: {blocked:?}"
+    );
+    // 行も積まれていない
+    let rows: i64 = sqlx::query_scalar("select count(*) from rating_param_changes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    println!("スキャン中: 増減幅の変更はロック待ちで進まない");
+
+    // 境界も同じ
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        admin.start_season(&NewSeasonBoundary {
+            effective_at: at(200),
+            label: "スキャン中".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(200),
+            idempotency_key: "season-during-scan".to_owned(),
+        }),
+    )
+    .await;
+    assert!(blocked.is_err(), "境界がロックを待たずに進んでしまった");
+    println!("スキャン中: シーズン境界もロック待ちで進まない");
+
+    // スキャンが終われば通る
+    scan.commit().await.unwrap();
+    let changed = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "スキャンが終わったので変える".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(300),
+            idempotency_key: "after-scan".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(changed, RatingParamsOutcome::Changed { .. }));
+    assert_eq!(admin.rating_params().await.unwrap().base_delta, 20.0);
+    println!("スキャン終了後: 変更できる");
 
     db.done().await;
 }

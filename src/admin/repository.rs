@@ -705,14 +705,22 @@ impl AdminRepository {
         &self,
         input: &NewSeasonBoundary,
     ) -> Result<SeasonOutcome, AdminStoreError> {
+        // **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+        // 先頭で同じ advisory lock を取る（07 §4-1）。ロックを取らずに数えると、
+        // 「スキャンは走っているがまだ commit していない」瞬間に進行中 0 件と見えてしまい、
+        // 境界を入れた直後に formation が生まれる。数えるのも入れるのもロックの内側で行う。
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        // ロックを取ってから数える。ここまで来た時点で、走っていたスキャンは commit 済み
         let preview = self.season_preview(input.effective_at).await?;
         if !preview.can_start() {
+            tx.commit().await?;
             return Ok(SeasonOutcome::Blocked {
                 active_formations: preview.active_formations,
             });
         }
 
-        let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query_scalar!(
             "insert into season_boundaries \
              (effective_at, label, created_by, idempotency_key, created_at) \
@@ -892,11 +900,19 @@ impl AdminRepository {
         &self,
         input: &NewRatingParams,
     ) -> Result<RatingParamsOutcome, AdminStoreError> {
+        // **マッチメイカのスキャンと直列化する。**スキャンは 1 回まるごとが 1 トランザクションで、
+        // 先頭で同じ advisory lock を取る（07 §4-1）。ロックを取らずに数えると、
+        // 「スキャンは走っているがまだ commit していない」瞬間に進行中 0 件と見えてしまう。
+        // いまは凍結値が増減の計算に入らないので実害は小さいが、μ+σ へ移ると
+        // 凍結値が計算に入り、原因の分からないずれになる。
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+
+        // ロックを取ってから数える。ここまで来た時点で、走っていたスキャンは commit 済み
         let preview = self.rating_params_preview().await?;
         // **進行中の formation があるあいだは変えない。**1 行積んだ瞬間に全員のレートが
         // 動き、キュー中の人の範囲判定も同時に変わる。断ったことは記録に残す
         if !preview.can_change() {
-            let mut tx = self.pool.begin().await?;
             append_action_on(
                 &mut tx,
                 &NewAdminAction {
@@ -922,7 +938,7 @@ impl AdminRepository {
         }
         let params_version = preview.current_params_version + 1;
 
-        let mut tx = self.pool.begin().await?;
+        // 同じトランザクション（＝同じロックの内側）で入れる
         let inserted = sqlx::query_scalar!(
             "insert into rating_param_changes \
              (params_version, base_delta, reason, created_by, idempotency_key, created_at) \
