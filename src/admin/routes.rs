@@ -37,6 +37,8 @@ use super::actions::{
     AdminActionKind, MAX_BLOCK_ALLOWANCE, normalize_reason, parse_block_allowance,
 };
 use super::config::AdminIds;
+use crate::nullified::NullifiedReportRepository;
+
 use super::disputes::{DisputeOutcome, NewDisputeResolution, parse_decision};
 use super::html::{
     MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView,
@@ -70,6 +72,8 @@ pub struct AdminState {
     pub blocks: BlockRepository,
     /// 聞き専報告。**運営パネルだけがこれを読む**（票数と閾値を見られる唯一の経路）。
     pub quiet: QuietReportRepository,
+    /// 無効試合の通報。**運営パネルだけがこれを読む**（票数と閾値を見られる唯一の経路）。
+    pub nullified: NullifiedReportRepository,
 }
 
 impl AdminState {
@@ -79,6 +83,7 @@ impl AdminState {
         store: AdminRepository,
         blocks: BlockRepository,
         quiet: QuietReportRepository,
+        nullified: NullifiedReportRepository,
     ) -> Self {
         let key = config.cookie_key();
         Self {
@@ -88,6 +93,7 @@ impl AdminState {
             store,
             blocks,
             quiet,
+            nullified,
         }
     }
 }
@@ -1509,9 +1515,34 @@ async fn show_quiet_reports(
             return internal_error();
         }
     };
+    let nullified_tallies = match app.nullified.admin_tallies(QUIET_TALLY_LIMIT).await {
+        Ok(tallies) => tallies,
+        Err(err) => {
+            error!(%err, "could not read the nullified report tallies");
+            return internal_error();
+        }
+    };
+    let nullified_history = match app.nullified.admin_history(QUIET_HISTORY_LIMIT).await {
+        Ok(history) => history,
+        Err(err) => {
+            error!(%err, "could not read the nullified report history");
+            return internal_error();
+        }
+    };
+    let (nullified_threshold, nullified_penalty) = match app.nullified.nullified_params().await {
+        Ok(params) => params,
+        Err(err) => {
+            error!(%err, "could not read the nullified report params");
+            return internal_error();
+        }
+    };
     Html(quiet_reports_page(&QuietReportsView {
         tallies: &tallies,
         history: &history,
+        nullified_tallies: &nullified_tallies,
+        nullified_history: &nullified_history,
+        nullified_threshold,
+        nullified_penalty,
         winner_threshold: thresholds.winner_threshold,
         loser_threshold: thresholds.loser_threshold,
         notice: None,

@@ -30,6 +30,7 @@ use unite_matchsystem::lifecycle::{
     FormationEventKind as K, FormationId, LifecycleConfig, PlayerId, Timestamp,
 };
 use unite_matchsystem::match_screen::{MatchRepository, MatchState, router};
+use unite_matchsystem::nullified::NullifiedReportRepository;
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team,
 };
@@ -112,6 +113,7 @@ impl AppDb {
             self.formations.clone(),
             self.matches.clone(),
             self.quiet.clone(),
+            NullifiedReportRepository::new(self.pool.clone()),
             LifecycleConfig::default(),
             "kyogre",
             &["大会モード".to_owned()],

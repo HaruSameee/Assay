@@ -36,6 +36,7 @@ use unite_matchsystem::lifecycle::{
 use unite_matchsystem::matchmaker::{
     Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
 };
+use unite_matchsystem::nullified::NullifiedReportRepository;
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
     VcAssignment,
@@ -146,6 +147,7 @@ impl AppDb {
             self.admin.clone(),
             self.blocks.clone(),
             QuietReportRepository::new(self.pool.clone()),
+            NullifiedReportRepository::new(self.pool.clone()),
         )))
     }
 

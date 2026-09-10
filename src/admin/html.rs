@@ -22,6 +22,7 @@ use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
 };
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
+use crate::nullified::{NullifiedReportRow, NullifiedTally};
 use crate::quiet::{QuietReportRow, QuietReporterTally};
 
 /// 検索画面に渡すデータ。
@@ -1325,6 +1326,13 @@ pub struct QuietReportsView<'a> {
     /// いま効いている閾値。**運営にだけ出す。**
     pub winner_threshold: i32,
     pub loser_threshold: i32,
+    /// 無効試合の通報の集計（票の多い順）。
+    pub nullified_tallies: &'a [NullifiedTally],
+    /// 無効試合の通報の履歴（新しい順）。「誰も通報しない」も含む。
+    pub nullified_history: &'a [NullifiedReportRow],
+    /// 無効試合の通報の閾値とペナルティ幅。**運営にだけ出す。**
+    pub nullified_threshold: i32,
+    pub nullified_penalty: f64,
     pub notice: Option<Notice>,
 }
 
@@ -1335,6 +1343,82 @@ fn reporter_side(won: Option<bool>) -> &'static str {
         Some(false) => "<strong>負け</strong>",
         None => "—",
     }
+}
+
+/// 無効試合の通報の集計。**票数が見えるのはここだけ。**
+///
+/// 「まだ無効試合になっていない試合の票」も出す。通報は報告直後に受け付けるので、
+/// 結局勝敗がついた試合の票も残る——それが**レートに効いていない**ことが
+/// 運営から見えないと、「票が入っているのに下がっていない」が事故に見える。
+fn nullified_tallies(tallies: &[NullifiedTally]) -> String {
+    if tallies.is_empty() {
+        return String::from("<p class=\"muted\">まだ無効試合の通報はありません。</p>\n");
+    }
+    let rows = tallies
+        .iter()
+        .map(|row| {
+            let state = if row.penalised {
+                "<span class=\"tag tag-danger\">成立</span>"
+            } else if row.match_nullified {
+                "<span class=\"tag\">未達</span>"
+            } else {
+                "<span class=\"tag\">無効試合でない</span>"
+            };
+            format!(
+                "<tr><td>{name}</td><td class=\"num\">{votes}</td><td>{state}</td>\
+                 <td class=\"num\">{formation}</td></tr>\n",
+                name = escape(row.trainer_name.as_deref().unwrap_or("（未設定）")),
+                votes = row.votes,
+                formation = escape(&format!(
+                    "match-{}",
+                    &row.formation_id.simple().to_string()[..8]
+                )),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>通報された人</th><th>票</th><th>状態</th><th>試合</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+/// 無効試合の通報の履歴。**「誰も通報しない」も 1 行として出す。**
+fn nullified_history(history: &[NullifiedReportRow]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let rows = history
+        .iter()
+        .map(|row| {
+            let target = row.target_name.as_deref().map_or_else(
+                || String::from("<span class=\"muted\">誰も通報しない</span>"),
+                escape,
+            );
+            let side = match row.cross_team {
+                Some(true) => "<span class=\"tag\">相手チーム</span>",
+                Some(false) => "<span class=\"tag\">自チーム</span>",
+                None => "",
+            };
+            format!(
+                "<tr><td>{at}</td><td>{reporter}</td><td>{target} {side}</td>\
+                 <td class=\"num\">{formation}</td></tr>\n",
+                at = escape(&display_time(row.reported_at)),
+                reporter = escape(row.reporter_name.as_deref().unwrap_or("（未設定）")),
+                formation = escape(&format!(
+                    "match-{}",
+                    &row.formation_id.simple().to_string()[..8]
+                )),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<h2>無効試合の通報（履歴）</h2>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>通報した人</th><th>通報された人</th>\
+         <th>試合</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
 }
 
 pub fn quiet_reports_page(view: &QuietReportsView<'_>) -> String {
@@ -1408,19 +1492,30 @@ pub fn quiet_reports_page(view: &QuietReportsView<'_>) -> String {
              プレイヤー側の画面にも API にも、票数・閾値・報告の内容は出ません。</p>\n\
              <p class=\"notice\">現在の閾値: 勝ちチームからの報告 <strong>{winner}</strong> 票 / \
              負けチームからの報告 <strong>{loser}</strong> 票。\
-             負けチームは対象者を除くと 4 人しか報告できないため、\
-             {loser} 票は満場一致にあたります。閾値は環境変数で変えられ、\
-             変更すると過去の試合も新しい閾値で再判定されます。</p>\n\
+             報告できるのは対象者を除いた同チームの 4 人なので、3 票は「4 人中 3 人」です。\
+             閾値は環境変数で変えられ、変更すると過去の試合も新しい閾値で再判定されます。</p>\n\
              <h2>プレイヤーごとの集計</h2>\n\
              <p class=\"field-help\"><strong>報告した数の多い順</strong>に並べています。\
              負け試合でしか報告していない人は「うち負け試合」が「報告した数」と同じになります。</p>\n\
              {tallies}\
              {history}\
+             <h2>無効試合の通報</h2>\n\
+             <p class=\"notice\">現在の閾値: <strong>{nullified_threshold}</strong> 票で\
+             <strong>−{nullified_penalty}</strong>。<strong>相手チームも通報できます。</strong>\
+             通報は「無効試合」を報告した直後に受け付けるので、\
+             <strong>結局勝敗がついた試合の票も残ります</strong>——その票はレートに効きません\
+             （状態が「無効試合でない」の行）。</p>\n\
+             {nullified_tallies}\
+             {nullified_history}\
              </section>\n",
             nav = admin_nav("/admin/quiet-reports"),
             notice = notice_html(view.notice.as_ref()),
             winner = view.winner_threshold,
             loser = view.loser_threshold,
+            nullified_threshold = view.nullified_threshold,
+            nullified_penalty = view.nullified_penalty.round() as i64,
+            nullified_tallies = nullified_tallies(view.nullified_tallies),
+            nullified_history = nullified_history(view.nullified_history),
         ),
     )
 }

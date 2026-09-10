@@ -224,6 +224,10 @@ fn stage_block(view: &MatchView) -> String {
         }
         _ => {}
     }
+    // **無効試合の通報は、無効試合を報告した直後に出す。**確定は待たない
+    if view.actions.nullified_report || view.actions.nullified_reported {
+        block.push_str(&nullified_report_block(view));
+    }
     // **聞き専報告は勝敗報告の上に置く。**確定後にだけ出る（確定前は入口ごと無い）
     if view.actions.quiet_report {
         block.push_str(&quiet_report_block(view));
@@ -260,6 +264,81 @@ impl StageView {
             Self::Nullified | Self::Voided | Self::Abandoned | Self::Confirmed { .. }
         )
     }
+}
+
+/// 無効試合の通報の入口。**「無効試合」を報告した直後に出す。**
+///
+/// 聞き専報告と違う点は 2 つ:
+///
+/// * **相手チームも選べる。**部屋を壊すのは味方とは限らない
+/// * **「誰も通報しない」も 1 つの答えとして選ばせる。**選ばずに閉じられると、
+///   答えていない人と区別できず、画面が催促を出し続けることになる
+///
+/// **票数も閾値も書かない。**「あと何票で成立するか」を逆算させないため
+/// （docs/09: サーバー側でそもそも送らない）。
+fn nullified_report_block(view: &MatchView) -> String {
+    if view.actions.nullified_reported {
+        return String::from(
+            "<section class=\"section\" aria-labelledby=\"nullified-title\">\n\
+             <h2 id=\"nullified-title\">無効試合の原因</h2>\n\
+             <div class=\"notice\"><p><strong>受け付けました。</strong>\
+             同じ試合で選び直すことはできません。</p>\n\
+             <p class=\"fine-print\">何票入っているかは表示されません。</p></div>\n\
+             </section>\n",
+        );
+    }
+    // **自チームと相手チームの両方**。どちらの人かが分かるように分けて並べる
+    let mine = view
+        .teammates
+        .iter()
+        .filter(|teammate| !teammate.is_me)
+        .map(|teammate| {
+            format!(
+                "<option value=\"{id}\">{name}（{role}）</option>\n",
+                id = escape(&teammate.player_id.to_string()),
+                name = escape(&teammate.trainer_name),
+                role = escape(&teammate.role),
+            )
+        })
+        .collect::<String>();
+    // 相手チームはロールを持たない（[`OpponentView`] に無い）ので名前だけ
+    let theirs = view
+        .opponents
+        .iter()
+        .map(|opponent| {
+            format!(
+                "<option value=\"{id}\">{name}</option>\n",
+                id = escape(&opponent.player_id.to_string()),
+                name = escape(&opponent.trainer_name),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"section\" aria-labelledby=\"nullified-title\">\n\
+         <h2 id=\"nullified-title\">無効試合の原因</h2>\n\
+         <p class=\"field-help\">試合が成立しなくなった原因のプレイヤーを 1 人選べます。\
+         <strong>相手チームも選べます。</strong>\
+         一定以上の通報が集まると、その人のレートが大きく下がります。</p>\n\
+         <ul class=\"fine-print quiet-notes\">\n\
+         <li><strong>通報の義務はありません。</strong>原因がはっきりしない場合は\
+         「誰も通報しない」を選んでください。</li>\n\
+         <li>運営が通報履歴を確認しています。根拠のない通報が散見される場合、\
+         <strong>通報した側にペナルティが付与されます</strong>。</li>\n\
+         <li>選べるのは 1 人だけで、後から選び直すことはできません。</li>\n\
+         <li>この試合が無効試合として確定しなかった場合、通報は記録に残りますが\
+         レートには影響しません。</li>\n\
+         </ul>\n\
+         <div class=\"field\"><label for=\"nullified-target\">原因のプレイヤー</label>\n\
+         <select id=\"nullified-target\">\n\
+         <option value=\"\">誰も通報しない</option>\n\
+         <optgroup label=\"自分のチーム\">\n{mine}</optgroup>\n\
+         <optgroup label=\"相手チーム\">\n{theirs}</optgroup>\n\
+         </select></div>\n\
+         <div class=\"actions\">\
+         <button id=\"nullified-submit\" class=\"button-secondary\" type=\"button\">\
+         この内容で送信する</button>\
+         </div>\n</section>\n"
+    )
 }
 
 /// 聞き専報告の入口。**確定後にだけ出す。**
@@ -531,6 +610,11 @@ const POLL_SCRIPT: &str = r#"
     const value = input ? input.value.trim() : '';
     if (!value) { showError('ルーム ID を入力してください。'); return; }
     send('/room-code', { room_code: value });
+  });
+  // 無効試合の通報。**「誰も通報しない」も 1 票として送る**（空の target）
+  click('nullified-submit', () => {
+    const select = document.getElementById('nullified-target');
+    send('/nullified-report', { target: select ? select.value : '' });
   });
   // 聞き専報告。**選んだ相手だけを送る。**票数も閾値もクライアントには無い
   click('quiet-submit', () => {

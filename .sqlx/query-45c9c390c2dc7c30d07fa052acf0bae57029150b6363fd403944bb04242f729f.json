@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select r.id, r.formation_id, r.created_at, r.reporter_id, reporter.trainer_name as reporter_name, r.target_id, target.trainer_name as target_name, case when r.target_id is null then null else (select rfp.team <> tfp.team from formation_players rfp, formation_players tfp where rfp.formation_id = r.formation_id and rfp.player_id = r.reporter_id and tfp.formation_id = r.formation_id and tfp.player_id = r.target_id) end as \"cross_team?\" from nullified_reports r join players reporter on reporter.id = r.reporter_id left join players target on target.id = r.target_id order by r.id desc limit $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "formation_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "formation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "reporter_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "reporter_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "reporter_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "target_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "nullified_reports",
+            "name": "target_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "target_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "cross_team?",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "45c9c390c2dc7c30d07fa052acf0bae57029150b6363fd403944bb04242f729f"
+}
