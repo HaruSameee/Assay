@@ -34,6 +34,8 @@ pub enum AdminActionKind {
     BlockOverrideRemoved,
     /// 未報告のプレイヤーに運営が報告を入れた。
     ReportEntered,
+    /// レートの増減幅を変えた（過去の全試合が引き直される）。
+    RatingParamsChanged,
     /// 運営の報告入力を断った（係争中・確定済みの試合）。
     ReportRejected,
 }
@@ -41,12 +43,13 @@ pub enum AdminActionKind {
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
         Self::BlockAllowanceSet,
         Self::SeasonStarted,
+        Self::RatingParamsChanged,
         Self::BlockOverrideRemoved,
         Self::ReportEntered,
         Self::ReportRejected,
@@ -60,6 +63,7 @@ impl AdminActionKind {
             Self::QueueRemoved => "queue_removed",
             Self::BlockAllowanceSet => "block_allowance_set",
             Self::SeasonStarted => "season_started",
+            Self::RatingParamsChanged => "rating_params_changed",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -74,6 +78,7 @@ impl AdminActionKind {
             "queue_removed" => Some(Self::QueueRemoved),
             "block_allowance_set" => Some(Self::BlockAllowanceSet),
             "season_started" => Some(Self::SeasonStarted),
+            "rating_params_changed" => Some(Self::RatingParamsChanged),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -89,6 +94,7 @@ impl AdminActionKind {
             Self::QueueRemoved => "キューから強制離脱",
             Self::BlockAllowanceSet => "ブロック枠の変更",
             Self::SeasonStarted => "シーズン開始（導出の起点を追記）",
+            Self::RatingParamsChanged => "レート増減幅の変更（全履歴を引き直し）",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",

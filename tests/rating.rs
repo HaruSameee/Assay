@@ -15,6 +15,7 @@
 use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use unite_matchsystem::admin::{AdminRepository, NewRatingParams, RatingParamsOutcome};
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::matchmaker::{Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES};
 use unite_matchsystem::persistence::{
@@ -231,6 +232,8 @@ async fn the_view_and_the_rust_formula_agree(owner: PgPool) {
             (player(1), red, blue, "red"),
             (player(6), blue, red, "blue"),
         ] {
+            // 増減幅は**ビューと同じ導出経路**から読む（定数を突き合わせない）
+            let base_delta = db.ratings.base_delta().await.unwrap();
             let expected = match_delta(
                 own,
                 opponent_mean,
@@ -239,6 +242,7 @@ async fn the_view_and_the_rust_formula_agree(owner: PgPool) {
                     w if w == team => MatchResult::Won,
                     _ => MatchResult::Lost,
                 },
+                base_delta,
             );
             assert_eq!(
                 view_delta(&db, who, fid(n)).await,
@@ -621,6 +625,164 @@ async fn five_hundred_matches_stay_within_budget(owner: PgPool) {
         outcome.candidates,
         outcome.created.len()
     );
+
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// レート増減幅の変更（運営操作）
+// ----------------------------------------------------------------------
+
+/// **増減幅を変えると、過去の全試合が新しい値で引き直される。**
+///
+/// docs/02 の不変条件 3（常に現行 params を全履歴に適用する）そのもの。
+/// あわせて、**試合ログの行数が 1 行も変わらない**ことを見る——引き直しは
+/// 再計算であって、書き換えではない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn changing_the_delta_recomputes_every_past_match(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    let admin = AdminRepository::new(db.pool.clone());
+
+    // 3 試合ぶん確定させる（player 1 は red で 2 勝 1 敗）
+    confirmed_match(&db, 1, 1500.0, 1500.0, "red").await;
+    confirmed_match(&db, 2, 1500.0, 1500.0, "red").await;
+    confirmed_match(&db, 3, 1500.0, 1500.0, "blue").await;
+
+    async fn log_rows(db: &AppDb) -> (i64, i64) {
+        let events: i64 = sqlx::query_scalar("select count(*) from formation_events")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let players: i64 = sqlx::query_scalar("select count(*) from formation_players")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        (events, players)
+    }
+
+    // 既定値（7）での状態
+    let before_params = admin.rating_params().await.unwrap();
+    assert_eq!(before_params.base_delta, 7.0);
+    assert_eq!(before_params.params_version, 3);
+    let before_rating = db.ratings.display_rating(player(1)).await.unwrap();
+    let before_deltas = view_delta(&db, player(1), fid(1)).await;
+    let before_rows = log_rows(&db).await;
+    assert_eq!(before_deltas, 7.0);
+    // 2 勝 1 敗 = +7 +7 -7
+    assert_eq!(before_rating, 1500.0 + 7.0);
+
+    // 実行前のプレビュー: 引き直される試合数と人数
+    let preview = admin.rating_params_preview().await.unwrap();
+    assert_eq!(preview.matches_affected, 3, "引き直される試合数が違う");
+    assert_eq!(preview.players_affected, 10, "影響を受ける人数が違う");
+    assert!(preview.history.is_empty(), "まだ変更していない");
+
+    // **増減幅を 12 に変える**
+    let outcome = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 12.0,
+            reason: "テストで引き直しを確認する".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(100),
+            idempotency_key: "delta-12".to_owned(),
+        })
+        .await
+        .unwrap();
+    let RatingParamsOutcome::Changed { params_version, .. } = outcome else {
+        panic!("変更されていない: {outcome:?}");
+    };
+    // 版数は直前 +1
+    assert_eq!(params_version, 4);
+
+    // **過去の試合が新しい値で引き直されている**
+    let after_params = admin.rating_params().await.unwrap();
+    assert_eq!(after_params.base_delta, 12.0);
+    assert_eq!(after_params.params_version, 4);
+    let after_deltas = view_delta(&db, player(1), fid(1)).await;
+    let after_rating = db.ratings.display_rating(player(1)).await.unwrap();
+    assert_eq!(after_deltas, 12.0, "過去の試合が引き直されていない");
+    assert_eq!(
+        after_rating,
+        1500.0 + 12.0,
+        "現在レートが引き直されていない"
+    );
+    // 負けた試合も
+    assert_eq!(view_delta(&db, player(1), fid(3)).await, -12.0);
+
+    // **試合ログの行数は 1 行も変わらない**
+    let after_rows = log_rows(&db).await;
+    assert_eq!(after_rows, before_rows, "試合ログの行数が変わっている");
+
+    // 運営操作ログに残っている
+    let action: (String, serde_json::Value) = sqlx::query_as(
+        "select kind, payload from admin_actions where kind = 'rating_params_changed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(action.1["base_delta"], serde_json::json!(12.0));
+    assert_eq!(action.1["previous_base_delta"], serde_json::json!(7.0));
+    assert_eq!(action.1["matches_recomputed"], serde_json::json!(3));
+
+    println!(
+        "増減幅 7 → 12: 1 試合の増減 {before_deltas} → {after_deltas} / \
+         現在レート {before_rating} → {after_rating} / \
+         試合ログ（events, players）= {before_rows:?} → {after_rows:?}（変化なし）"
+    );
+
+    // **同一キーは no-op。**状態ベースの判定はしない
+    let again = admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 20.0,
+            reason: "同じキーでもう一度".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(200),
+            idempotency_key: "delta-12".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(again, RatingParamsOutcome::Duplicate);
+    assert_eq!(admin.rating_params().await.unwrap().base_delta, 12.0);
+
+    // 元の値へ戻すのも**追記**（消さずにもう 1 行積む）
+    admin
+        .change_rating_params(&NewRatingParams {
+            base_delta: 7.0,
+            reason: "戻す".to_owned(),
+            actor_discord_user_id: 1001,
+            created_at: at(300),
+            idempotency_key: "delta-back".to_owned(),
+        })
+        .await
+        .unwrap();
+    let restored = admin.rating_params().await.unwrap();
+    assert_eq!(restored.base_delta, 7.0);
+    assert_eq!(restored.params_version, 5, "戻しても版数は進む");
+    assert_eq!(view_delta(&db, player(1), fid(1)).await, 7.0);
+    let history = admin.rating_params_preview().await.unwrap().history;
+    assert_eq!(history.len(), 2, "変更の行が消えている");
+    println!(
+        "戻したあと: 増減幅 {} / params v{}（履歴 {} 行は残る）",
+        restored.base_delta,
+        restored.params_version,
+        history.len()
+    );
+
+    // **DB の CHECK が最後の砦。**0 以下・50 超はアプリを通さなくても入らない
+    for bad in [0.0, -1.0, 50.1, 100.0] {
+        let rejected = sqlx::query(
+            "insert into rating_param_changes \
+             (params_version, base_delta, reason, created_by, idempotency_key, created_at) \
+             values (99, $1, 'r', 'discord:1', $2, now())",
+        )
+        .bind(bad)
+        .bind(format!("bad-{bad}"))
+        .execute(&db.pool)
+        .await;
+        assert!(rejected.is_err(), "{bad} が DB に入ってしまった");
+    }
+    println!("DB の CHECK: 0 以下と 50 超は拒否");
 
     db.done().await;
 }

@@ -91,15 +91,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         report_majority_threshold = lifecycle.report_majority_threshold,
         "report settlement settings loaded"
     );
-    // どの params で走っているかを起動ログに残す。レート側は導出値なので凍結せず、
-    // ここに出る版数が「いま全履歴に適用されている式」を指す（00 §3-3）
+    // **コード上の既定値**。実際に適用されている値は DB から読んで下でもう一度出す
+    // （レート増減幅は管理パネルの最新行が正で、この定数は「一度も変えていないとき」の値）。
     info!(
-        rating_params_version = RATING_PARAMS_VERSION,
-        base_delta = BASE_DELTA,
+        default_rating_params_version = RATING_PARAMS_VERSION,
+        default_base_delta = BASE_DELTA,
         matchmaking_params_version = MATCHMAKING_PARAMS_VERSION,
         down_range = DOWN_RANGE,
         up_range = UP_RANGE,
-        "rating and matchmaking params loaded"
+        "compiled-in params defaults"
     );
 
     let pool = PgPoolOptions::new()
@@ -114,6 +114,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let status_repo = StatusRepository::new(pool.clone());
     let admin_store = AdminRepository::new(pool.clone())
         .with_majority_threshold(lifecycle.report_majority_threshold);
+    // **いま実際に全履歴へ適用されている値。**管理パネルの最新行から導出したもので、
+    // 上のログに出た定数ではない。どちらで走っているかを起動時に必ず見えるようにする
+    match admin_store.rating_params().await {
+        Ok(params) => info!(
+            rating_params_version = params.params_version,
+            base_delta = params.base_delta,
+            source = if params.params_version == RATING_PARAMS_VERSION {
+                "compiled-in default"
+            } else {
+                "rating_param_changes (admin panel)"
+            },
+            "rating params in effect"
+        ),
+        Err(error) => {
+            warn!(%error, "could not read the rating params in effect");
+        }
+    }
     let block_repo = BlockRepository::new(pool.clone());
     let match_pool = pool.clone();
     let ranking_pool = pool.clone();

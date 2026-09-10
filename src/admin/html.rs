@@ -13,6 +13,7 @@ use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
+use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
 };
@@ -469,11 +470,12 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/queue", "キューと運用"),
         link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
+        link("/admin/rating-params", "レート増減幅"),
     )
 }
 
@@ -804,6 +806,165 @@ pub fn season_page(view: &SeasonView<'_>) -> String {
              {body}\
              </section>\n",
             nav = admin_nav("/admin/season"),
+            notice = notice_html(view.notice.as_ref()),
+        ),
+    )
+}
+
+// ----------------------------------------------------------------------
+// レート増減幅
+// ----------------------------------------------------------------------
+//
+// **この操作は過去の全試合を引き直す。**docs/02 の不変条件 3（常に現行 params を
+// 全履歴に適用する）そのもので、意図した挙動である。だからこそ画面で必ず言い切る。
+
+pub struct RatingParamsView<'a> {
+    /// 実行前の件数と履歴。すべて導出値。
+    pub preview: &'a RatingParamsPreview,
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    /// 2 段目なら、1 段目で入力された値。1 段目では `None`。
+    pub confirming: Option<f64>,
+    pub notice: Option<Notice>,
+}
+
+/// 増減幅を人が読める形にする。整数なら小数点を出さない。
+fn delta_text(value: f64) -> String {
+    if (value - value.round()).abs() < f64::EPSILON {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// 引き直しの規模。**実行前に必ず出す。**
+fn rating_params_counts(preview: &RatingParamsPreview) -> String {
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>項目</th><th>件数</th></tr></thead>\n<tbody>\n\
+         <tr><td><strong>引き直される試合</strong></td><td class=\"num\">{matches}</td></tr>\n\
+         <tr><td><strong>レートが動くプレイヤー</strong></td><td class=\"num\">{players}</td></tr>\n\
+         </tbody>\n</table></div>\n",
+        matches = preview.matches_affected,
+        players = preview.players_affected,
+    )
+}
+
+/// いま効いている値。
+fn current_rating_params_line(preview: &RatingParamsPreview) -> String {
+    format!(
+        "<p class=\"notice\">現在の増減幅: <strong>勝ち +{delta} / 負け −{delta}</strong>\
+         （params v{version}）</p>\n",
+        delta = escape(&delta_text(preview.current_base_delta)),
+        version = preview.current_params_version,
+    )
+}
+
+/// 変更履歴。追記専用なので、過去の行はそのまま残る。
+fn rating_params_history(preview: &RatingParamsPreview) -> String {
+    if preview.history.is_empty() {
+        return "<p class=\"muted\">まだ一度も変更していません（既定値のまま）。</p>\n".to_owned();
+    }
+    let rows = preview
+        .history
+        .iter()
+        .map(|change| {
+            format!(
+                "<tr><td>{at}</td><td class=\"num\">v{version}</td>\
+                 <td class=\"num\">±{delta}</td><td>{reason}</td><td>{by}</td></tr>\n",
+                at = escape(&display_time(change.created_at)),
+                version = change.params_version,
+                delta = escape(&delta_text(change.base_delta)),
+                reason = escape(&change.reason),
+                by = escape(&change.created_by),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>版</th><th>増減幅</th><th>理由</th><th>操作者</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+/// **引き直しの警告。**1 段目と 2 段目の両方で出す。
+const RECOMPUTE_WARNING: &str = "<p class=\"notice notice-error\">\
+     <strong>変更すると過去の全試合のレートが引き直されます。</strong>\
+     新しい値が過去にさかのぼって適用されるため、全プレイヤーの現在レートとランキングが\
+     その場で変わります。「これから行う試合にだけ効く」設定ではありません。</p>\n";
+
+pub fn rating_params_page(view: &RatingParamsView<'_>) -> String {
+    let body = if let Some(base_delta) = view.confirming {
+        // 2 段目: 同じ数値を手で入力させる
+        format!(
+            "<h2>確認</h2>\n\
+             {warning}\
+             <p class=\"notice notice-error\"><strong>この操作は取り消せません。</strong>\
+             追記専用なので、間違えた場合は「元の値をもう 1 行追記して戻す」ことになります\
+             （そのときも全履歴が引き直されます）。</p>\n\
+             <p>新しい増減幅: <strong>勝ち +{delta} / 負け −{delta}</strong>\
+             （現在は ±{current}）</p>\n\
+             {counts}\
+             <form method=\"post\" action=\"/admin/rating-params\">\
+             <input type=\"hidden\" name=\"base_delta\" value=\"{delta}\">\
+             <input type=\"hidden\" name=\"key\" value=\"rating-params:{key}\">\
+             <label for=\"reason\">理由（記録に残ります）</label>\
+             <input id=\"reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+             <label for=\"confirm_delta\">確認のため、同じ数値をもう一度入力してください</label>\
+             <input id=\"confirm_delta\" name=\"confirm_delta\" type=\"text\" autocomplete=\"off\" required>\
+             <div class=\"actions\">\
+             <button class=\"button button-primary\" type=\"submit\">増減幅を変更して全履歴を引き直す</button>\
+             <a class=\"button button-secondary\" href=\"/admin/rating-params\">やめる</a>\
+             </div></form>\n",
+            warning = RECOMPUTE_WARNING,
+            delta = escape(&delta_text(base_delta)),
+            current = escape(&delta_text(view.preview.current_base_delta)),
+            counts = rating_params_counts(view.preview),
+            key = escape(view.form_key),
+        )
+    } else {
+        // 1 段目: 警告と件数、値の入力
+        format!(
+            "<p class=\"lead\">1 試合あたりのレート増減幅です。勝ちが +この値、負けが −この値、\
+             引き分けは 0 になります（相手との差は増減に影響しません）。</p>\n\
+             {warning}\
+             <p class=\"notice\"><strong>試合のログは 1 行も消えません。</strong>\
+             レートは導出値で、増減幅も追記ログの最新行から導出されます。\
+             値を変えると、同じ試合ログを新しい増減幅で計算し直すだけです。</p>\n\
+             {current}\
+             <h2>この操作で引き直されるもの</h2>\n\
+             {counts}\
+             <form method=\"post\" action=\"/admin/rating-params/confirm\">\
+             <input type=\"hidden\" name=\"key\" value=\"{key}\">\
+             <label for=\"base_delta\">新しい増減幅（0 より大きく {max} 以下）</label>\
+             <input id=\"base_delta\" name=\"base_delta\" type=\"text\" inputmode=\"decimal\" autocomplete=\"off\" required>\
+             <div class=\"actions\">\
+             <button class=\"button button-primary\" type=\"submit\">確認へ進む</button>\
+             </div></form>\n\
+             <h2>変更履歴</h2>\n{history}",
+            warning = RECOMPUTE_WARNING,
+            current = current_rating_params_line(view.preview),
+            counts = rating_params_counts(view.preview),
+            key = escape(view.form_key),
+            max = delta_text(MAX_BASE_DELTA),
+            history = rating_params_history(view.preview),
+        )
+    };
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / レート増減幅",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-rating-params-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-rating-params-title\">レートの増減幅を変える</h1>\n\
+             {nav}\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/rating-params"),
             notice = notice_html(view.notice.as_ref()),
         ),
     )

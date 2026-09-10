@@ -23,6 +23,9 @@ use crate::queue::model::clamp_down_range;
 use crate::rating::DEFAULT_DISPLAY_MU;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
+use super::rating_params::{
+    RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
+};
 use super::season::{SeasonBoundary, SeasonOutcome, SeasonPreview};
 
 /// PostgreSQL の SQLSTATE。
@@ -780,6 +783,140 @@ impl AdminRepository {
     }
 }
 
+// ----------------------------------------------------------------------
+// レート増減幅の変更
+// ----------------------------------------------------------------------
+//
+// **現在値のテーブルは作らない。**増減幅は `rating_param_changes` の最新行から
+// 導出する（`current_rating_params`）。値を変えると `player_match_rating_deltas` が
+// 過去の全試合を新しい値で引き直す——docs/02 の不変条件 3 そのもので、意図した挙動。
+
+/// 追記する変更 1 件。
+#[derive(Debug, Clone)]
+pub struct NewRatingParams {
+    /// 新しい増減幅（表示スケール）。**検証済みの値を渡すこと。**
+    pub base_delta: f64,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// いま効いている params。**最新行から導出する**（保存された現在値ではない）。
+    pub async fn rating_params(&self) -> Result<RatingParams, sqlx::Error> {
+        let row = sqlx::query!(
+            "select base_delta as \"base_delta!\", params_version as \"params_version!\" \
+             from current_rating_params"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(RatingParams {
+            base_delta: row.base_delta,
+            params_version: row.params_version,
+        })
+    }
+
+    /// 実行前に出す件数と履歴。**毎回数え直す**（保存しない）。
+    ///
+    /// 数える対象は「いま導出に入っている確定済みの試合」で、これがそのまま
+    /// **引き直される試合**である（`player_match_rating_deltas` を引くので、
+    /// シーズン境界より前の試合は最初から入らない）。
+    pub async fn rating_params_preview(&self) -> Result<RatingParamsPreview, sqlx::Error> {
+        let current = self.rating_params().await?;
+        let counts = sqlx::query!(
+            "select count(distinct d.formation_id) as \"matches!\", \
+                    count(distinct d.player_id) as \"players!\" \
+             from player_match_rating_deltas d"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let history = sqlx::query!(
+            "select id, base_delta as \"base_delta!\", params_version as \"params_version!\", \
+                    reason, created_by, created_at \
+             from rating_param_changes order by id desc limit 20"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(RatingParamsPreview {
+            current_base_delta: current.base_delta,
+            current_params_version: current.params_version,
+            matches_affected: usize::try_from(counts.matches).unwrap_or(0),
+            players_affected: usize::try_from(counts.players).unwrap_or(0),
+            history: history
+                .into_iter()
+                .map(|row| RatingParamChange {
+                    id: row.id,
+                    base_delta: row.base_delta,
+                    params_version: row.params_version,
+                    reason: row.reason,
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                })
+                .collect(),
+        })
+    }
+
+    /// 増減幅の変更を追記する。**版数は直前の値 +1 で採番する。**
+    ///
+    /// 採番も導出（`current_rating_params.params_version`）から取るので、
+    /// 版数の現在値を持つ列はどこにも無い。
+    pub async fn change_rating_params(
+        &self,
+        input: &NewRatingParams,
+    ) -> Result<RatingParamsOutcome, AdminStoreError> {
+        let preview = self.rating_params_preview().await?;
+        let params_version = preview.current_params_version + 1;
+
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar!(
+            "insert into rating_param_changes \
+             (params_version, base_delta, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            params_version,
+            input.base_delta,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(RatingParamsOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::RatingParamsChanged,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "rating_param_change_id": id,
+                    "params_version": params_version,
+                    "previous_base_delta": preview.current_base_delta,
+                    "base_delta": input.base_delta,
+                    "matches_recomputed": preview.matches_affected,
+                    "players_affected": preview.players_affected,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("rating_params:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RatingParamsOutcome::Changed { id, params_version })
+    }
+}
 // ----------------------------------------------------------------------
 // 運営による報告の入力
 // ----------------------------------------------------------------------
