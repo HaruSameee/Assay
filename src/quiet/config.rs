@@ -18,16 +18,24 @@ pub const QUIET_REPORT_LOSER_THRESHOLD: &str = "QUIET_REPORT_LOSER_THRESHOLD";
 /// 勝ちチームは 5 人で、対象者を除くと報告できるのは 4 人。3 票は「4 人中 3 人」で、
 /// 1 人の反対を許容する。
 pub const DEFAULT_WINNER_THRESHOLD: i32 = 3;
-/// 既定の負け側の閾値。
+/// 既定の負け側の閾値。**勝ち側と同じ 3。**
 ///
-/// 負けチームも 5 人で、対象者を除くと報告できるのは 4 人。したがって
-/// **4 票は満場一致**である。負け直後の報告が「戦犯選出」になることを避けるため、
-/// 負け側は全員一致を要求する。成立しにくいのは織り込み済みで、
-/// **成立しなくても報告の記録は残る**（運営が履歴で個別に対応する）。
-pub const DEFAULT_LOSER_THRESHOLD: i32 = 4;
+/// 以前は 4（対象者を除いた 4 人の満場一致）にしてあった。負け直後の報告が
+/// 「戦犯選出」になるのを防ぐ意図だったが、実際には**負け側で成立しない**という
+/// 別の偏りを作っていた。聞き専は勝っても負けても同じ迷惑なのに、
+/// 負けた試合でだけ 1 人の反対で潰せるのは、抑止としても記録としても筋が悪い。
+///
+/// 戦犯選出への歯止めは、閾値の非対称ではなく
+/// **下限を 3 に引き上げたこと**（[`MIN_THRESHOLD`]）と、
+/// ペナルティを −1 に留めていること（1 試合の勝敗 ±7 の 1/7）で持たせる。
+pub const DEFAULT_LOSER_THRESHOLD: i32 = 3;
 
-/// 閾値の下限。0 票で成立してしまうと報告が要らなくなる。
-const MIN_THRESHOLD: i32 = 1;
+/// 閾値の下限。**3。**
+///
+/// 報告できるのは対象者を除いた同チームの 4 人なので、3 票は「4 人中 3 人」。
+/// これより下げると 2 人の口裏合わせで成立してしまい、聞き専の判定ではなく
+/// 私怨の道具になる。0 票で成立すると報告そのものが要らなくなる。
+const MIN_THRESHOLD: i32 = 3;
 /// 閾値の上限。対象者を除いた同チームの人数（5 - 1 = 4）。
 /// これを超えると誰も到達できない。
 const MAX_THRESHOLD: i32 = 4;
@@ -117,13 +125,14 @@ fn threshold(name: &'static str, raw: &str) -> Result<i32, QuietReportConfigErro
 mod tests {
     use super::*;
 
+    /// 既定は**勝ち負けとも 3**。
     #[test]
     fn unset_environment_keeps_the_defaults() {
         assert_eq!(
             QuietReportConfig::parse(None, None).unwrap(),
             QuietReportConfig {
                 winner_threshold: 3,
-                loser_threshold: 4,
+                loser_threshold: 3,
             }
         );
         // 空文字・空白だけも「未設定」と同じ
@@ -135,24 +144,27 @@ mod tests {
 
     #[test]
     fn the_thresholds_come_from_the_environment() {
-        let config = QuietReportConfig::parse(Some("2"), Some("3")).unwrap();
-        assert_eq!(config.winner_threshold, 2);
+        let config = QuietReportConfig::parse(Some("4"), Some("3")).unwrap();
+        assert_eq!(config.winner_threshold, 4);
         assert_eq!(config.loser_threshold, 3);
         // 片方だけでもよい
-        let only_loser = QuietReportConfig::parse(None, Some("1")).unwrap();
+        let only_loser = QuietReportConfig::parse(None, Some("4")).unwrap();
         assert_eq!(only_loser.winner_threshold, 3);
-        assert_eq!(only_loser.loser_threshold, 1);
+        assert_eq!(only_loser.loser_threshold, 4);
     }
 
-    /// **1 以上 4 以下だけ。**0 は報告ゼロで成立、5 以上は到達できない。
+    /// **3 以上 4 以下だけ。**2 以下は 2 人の口裏合わせで成立し、5 以上は到達できない。
     #[test]
     fn a_meaningless_threshold_fails_at_startup() {
         for (winner, loser) in [
             (Some("0"), None),
+            (Some("1"), None),
+            (Some("2"), None),
             (Some("5"), None),
             (Some("-1"), None),
             (Some("たくさん"), None),
             (None, Some("0")),
+            (None, Some("2")),
             (None, Some("5")),
             (None, Some("10")),
             (None, Some("")),
@@ -167,24 +179,29 @@ mod tests {
         }
         let error = QuietReportConfig::parse(Some("5"), None).unwrap_err();
         assert!(error.to_string().contains(QUIET_REPORT_WINNER_THRESHOLD));
-        let error = QuietReportConfig::parse(None, Some("0")).unwrap_err();
+        let error = QuietReportConfig::parse(None, Some("2")).unwrap_err();
         assert!(error.to_string().contains(QUIET_REPORT_LOSER_THRESHOLD));
     }
 
-    /// **負け側の 4 は満場一致にあたる。**5 人から対象者を除くと 4 人しか報告できない。
+    /// **勝ちも負けも同じ票数を要求する。**
+    ///
+    /// 以前は負け側だけ 4（満場一致）にしてあった。負け直後の「戦犯選出」を
+    /// 防ぐ意図だったが、負け側でだけ 1 人の反対で潰せる状態になっていた。
+    /// 歯止めは下限 3 の側に移してある。
     #[test]
-    fn the_losing_threshold_is_unanimous_among_those_who_can_report() {
+    fn both_sides_need_the_same_number_of_votes() {
+        let defaults = QuietReportConfig::default();
+        assert_eq!(defaults.winner_threshold, defaults.loser_threshold);
+        assert_eq!(defaults.winner_threshold, MIN_THRESHOLD);
+
         let team_size = crate::matchmaker::TEAM_SIZE;
         let eligible = team_size - 1;
         assert_eq!(eligible, 4, "チームは 5 人（対象者を除くと 4 人）");
-        assert_eq!(
-            QuietReportConfig::default().loser_threshold as usize,
-            eligible,
-            "負け側の既定値は満場一致"
-        );
+        // 3 票は「4 人中 3 人」。1 人の反対は許容するが、2 人では成立しない
+        assert!((defaults.winner_threshold as usize) < eligible);
         assert!(
-            (QuietReportConfig::default().winner_threshold as usize) < eligible,
-            "勝ち側は 1 人の反対を許容する"
+            defaults.winner_threshold >= 3,
+            "2 人の口裏合わせで成立しない"
         );
         assert_eq!(MAX_THRESHOLD as usize, eligible);
     }

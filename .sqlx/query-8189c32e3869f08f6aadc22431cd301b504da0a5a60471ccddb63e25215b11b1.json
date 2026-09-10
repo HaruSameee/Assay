@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*) as \"count!\" from players p where $1::text is null or p.trainer_name ilike '%' || $1 || '%' or p.discord_user_id::text = $1 or exists ( select 1 from player_discord_snapshots s where s.player_id = p.id and s.display_name ilike '%' || $1 || '%' )",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8189c32e3869f08f6aadc22431cd301b504da0a5a60471ccddb63e25215b11b1"
+}

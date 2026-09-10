@@ -17,6 +17,7 @@ use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
 use super::disputes::DisputeDecision;
 use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
+use super::repository::RosterPage;
 use super::repository::{
     AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
 };
@@ -99,6 +100,14 @@ table.log td.num { text-align: right; font-variant-numeric: tabular-nums;
 .tag { display: inline-block; border-radius: 999px; padding: 1px 10px;
        font-size: 0.78rem; font-weight: 700; border: 1px solid var(--border);
        color: var(--muted); white-space: nowrap; }
+.tag-danger { border-color: var(--danger); color: var(--danger); }
+/* 登録者一覧: 名前の下に Discord 表示名を小さく重ねる */
+td.who { overflow-wrap: anywhere; }
+td.who .trainer { display: block; color: var(--muted); font-size: 0.82rem; }
+td.who .tag { margin-left: 6px; }
+.pager { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 20px; }
+.pager .position { color: var(--muted); font-size: 0.85rem; }
+form.search { margin: 0 0 20px; }
 form.inline { display: inline; }
 button.revert { background: none; border: 1px solid var(--border); color: var(--text);
                 border-radius: 999px; padding: 2px 12px; font: inherit; font-size: 0.8rem;
@@ -474,8 +483,9 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
+        link("/admin/players", "登録者一覧"),
         link("/admin/queue", "キューと運用"),
         link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
@@ -1150,6 +1160,155 @@ pub fn matching_range_page(view: &MatchingRangeView<'_>) -> String {
             notice = notice_html(view.notice.as_ref()),
         ),
     )
+}
+
+// ----------------------------------------------------------------------
+// 登録者の一覧
+// ----------------------------------------------------------------------
+//
+// 検索（`/admin`）は名前か Discord ID を知っている前提の入口だった。
+// 「誰が居るのか」を端から見る場所として別に置く。
+
+pub struct RosterView<'a> {
+    pub page: &'a RosterPage,
+}
+
+/// 停止処分のタグ。**通常の人には何も出さない**（全員に緑のタグを付けると、
+/// 目で拾いたい停止処分が埋もれる）。
+fn status_tag(status: &str) -> &'static str {
+    match status {
+        "suspended" => "<span class=\"tag tag-danger\">停止</span>",
+        _ => "",
+    }
+}
+
+fn roster_rows(page: &RosterPage) -> String {
+    page.players
+        .iter()
+        .map(|entry| {
+            let trainer = entry
+                .trainer_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty());
+            // **登録が済んでいない人を見落とさない。**名前が無いのは未登録の印なので、
+            // Discord 表示名で埋めずに「未登録」と出す
+            let name = trainer.map_or_else(
+                || String::from("<span class=\"muted\">（未登録）</span>"),
+                escape,
+            );
+            let discord = entry
+                .display_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .map_or_else(String::new, |name| {
+                    format!("<span class=\"trainer\">{}</span>", escape(name))
+                });
+            let registered = entry
+                .registered_at
+                .map_or_else(|| String::from("—"), |at| escape(&display_time(at)));
+            format!(
+                "<tr><td class=\"who\"><a href=\"/admin/player?player={id}\">{name}</a>\
+                 {status}{queued}{discord}</td>\
+                 <td class=\"num\">{rating}</td><td class=\"num\">{matches}</td>\
+                 <td>{registered}</td><td class=\"num\">{discord_id}</td></tr>\n",
+                id = escape(&entry.player_id.to_string()),
+                status = status_tag(&entry.status),
+                queued = if entry.queued {
+                    "<span class=\"tag\">キュー中</span>"
+                } else {
+                    ""
+                },
+                rating = entry.rating.round() as i64,
+                matches = entry.matches,
+                discord_id = entry.discord_user_id,
+            )
+        })
+        .collect::<String>()
+}
+
+fn roster_pager(page: &RosterPage) -> String {
+    let link = |target: i64, label: &str| {
+        // 絞り込みを持ち回る。**クエリ文字列なので percent エンコードしてから escape する**
+        // （どちらか片方だけだと、空白や & を含む名前でリンクが壊れる）
+        format!(
+            "<a class=\"button button-secondary\" href=\"/admin/players?page={target}&q={q}\">{label}</a>",
+            q = escape(&percent_encode(&page.query))
+        )
+    };
+    let previous = if page.page > 1 {
+        link(page.page - 1, "前へ")
+    } else {
+        String::from("<span></span>")
+    };
+    let next = if page.page < page.pages {
+        link(page.page + 1, "次へ")
+    } else {
+        String::from("<span></span>")
+    };
+    format!(
+        "<div class=\"pager\">{previous}\
+         <span class=\"position\">{page} / {pages} ページ（{total}人）</span>\
+         {next}</div>\n",
+        page = page.page,
+        pages = page.pages,
+        total = page.total,
+    )
+}
+
+pub fn roster_page(view: &RosterView<'_>) -> String {
+    let body = if view.page.total == 0 {
+        String::from("<p class=\"muted\">該当する登録者がいません。</p>\n")
+    } else {
+        format!(
+            "<div class=\"table-wrap\"><table class=\"log\">\n\
+             <thead><tr><th>プレイヤー</th><th>レート</th><th>試合</th>\
+             <th>登録</th><th>Discord ID</th></tr></thead>\n\
+             <tbody>\n{rows}</tbody></table></div>\n{pager}",
+            rows = roster_rows(view.page),
+            pager = roster_pager(view.page),
+        )
+    };
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / 登録者一覧",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-roster-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-roster-title\">登録者一覧</h1>\n\
+             {nav}\
+             <p class=\"lead\">登録の新しい順です。レート・試合数・キュー在席はすべて\
+             追記ログからの導出値で、この画面では何も保存しません。</p>\n\
+             <form method=\"get\" action=\"/admin/players\" class=\"search\">\
+             <label for=\"roster-q\">名前 / Discord 表示名 / Discord ID で絞り込む</label>\
+             <input id=\"roster-q\" name=\"q\" type=\"text\" autocomplete=\"off\" value=\"{q}\">\
+             <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">絞り込む</button>\
+             <a class=\"button button-secondary\" href=\"/admin/players\">解除</a></div></form>\n\
+             {body}",
+            nav = admin_nav("/admin/players"),
+            q = escape(&view.page.query),
+        ),
+    )
+}
+
+/// クエリ文字列に載せるための percent エンコード。
+///
+/// 依存を増やさないための最小実装。**通すのは RFC 3986 の unreserved だけ**で、
+/// それ以外は UTF-8 のバイト列として `%XX` にする。日本語のトレーナー名が
+/// そのまま来るので、ASCII だけを見る実装にはしない。
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 // ----------------------------------------------------------------------

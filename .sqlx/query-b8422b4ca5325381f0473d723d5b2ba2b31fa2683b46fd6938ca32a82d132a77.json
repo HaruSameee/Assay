@@ -1,0 +1,116 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select p.id, p.discord_user_id, p.trainer_name, p.status, p.registered_at, v.rating as \"rating!\", v.matches as \"matches!\", (select s.display_name from player_discord_snapshots s where s.player_id = p.id order by s.id desc limit 1) as display_name, exists (select 1 from queue_entries q where q.player_id = p.id) as \"queued!\" from players p join player_current_ratings v on v.player_id = p.id where $1::text is null or p.trainer_name ilike '%' || $1 || '%' or p.discord_user_id::text = $1 or exists ( select 1 from player_discord_snapshots s where s.player_id = p.id and s.display_name ilike '%' || $1 || '%' ) order by p.registered_at desc nulls last, p.created_at desc, p.id limit $2 offset $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "discord_user_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "discord_user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "registered_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "registered_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "rating"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "matches!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "matches"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "queued!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "b8422b4ca5325381f0473d723d5b2ba2b31fa2683b46fd6938ca32a82d132a77"
+}

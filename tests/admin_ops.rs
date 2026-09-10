@@ -1881,3 +1881,117 @@ async fn a_match_that_is_no_longer_disputed_is_refused(owner: PgPool) {
 
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// 登録者一覧
+// ----------------------------------------------------------------------
+//
+// 検索（/admin）は名前か Discord ID を知っている前提の入口だった。
+// 「誰が居るのか」を端から見る場所として別に置く。
+
+/// **一覧は全員を出す。**検索と違って、何も入力しなくても並ぶ。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_roster_lists_everyone_without_a_query(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    // 管理者 1 人 + 参加者 12 人
+    seed_cast(&db, 12).await;
+    let app = db.router();
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/players").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = page.matches("/admin/player?player=").count();
+    assert_eq!(rows, 13, "全員が出ていない: {rows}");
+    assert!(page.contains("13人"), "総人数が出ていない: {page}");
+    println!("一覧に出た人数: {rows}");
+
+    // レート・試合数・登録日・Discord ID の列がある
+    for header in ["プレイヤー", "レート", "試合", "登録", "Discord ID"] {
+        assert!(page.contains(header), "{header}: {page}");
+    }
+
+    db.done().await;
+}
+
+/// **名前でも Discord ID でも絞り込める。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_roster_can_be_filtered(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 12).await;
+
+    // Discord ID は完全一致（参加者 n の ID は 1000 + n）
+    let by_id = db.admin.roster("1011", 1).await.unwrap();
+    assert_eq!(by_id.total, 1, "Discord ID で 1 人に絞れていない");
+    assert_eq!(by_id.players[0].discord_user_id, 1011);
+
+    // 名前は部分一致。全員が「トレーナーN」なので 13 人に当たる
+    let by_name = db.admin.roster("トレーナー", 1).await.unwrap();
+    assert_eq!(by_name.total, 13, "名前の部分一致が効いていない");
+
+    // 当たらない文字列なら 0 件で、その旨が画面に出る
+    let app = db.router();
+    let (status, empty) = get_html(&app, player(ADMIN), "/admin/players?q=zzzznotfound").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(empty.contains("該当する登録者がいません"), "{empty}");
+    println!(
+        "絞り込み: ID 1 件 / 名前 {} 件 / 該当なし 0 件",
+        by_name.total
+    );
+
+    db.done().await;
+}
+
+/// **未登録の人を名前で埋めない。**登録が済んでいないことが一覧から読める。
+///
+/// `seed_cast` は管理者を `register` しないので、管理者がその 1 人になる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_player_who_never_registered_is_marked_as_such(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 2).await;
+    let app = db.router();
+
+    let roster = db.admin.roster("", 1).await.unwrap();
+    let unregistered = roster
+        .players
+        .iter()
+        .filter(|entry| entry.registered_at.is_none())
+        .count();
+    assert_eq!(unregistered, 1, "未登録が 1 人のはず");
+    assert_eq!(roster.total, 3);
+
+    // 未登録でも players 行は残っているので、一覧からは消えない
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/players").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page.matches("/admin/player?player=").count(), 3);
+    // 登録済みの人はトレーナー名で出る
+    assert!(page.contains("トレーナー2"), "{page}");
+    println!("未登録: {unregistered} 人 / 全体: {} 人", roster.total);
+
+    db.done().await;
+}
+
+/// **キュー中の人には印が付く。**運営が「いま誰が待っているか」を一覧から読める。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_roster_marks_who_is_queued(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 12).await;
+    let app = db.router();
+
+    let before = db.admin.roster("", 1).await.unwrap();
+    assert_eq!(
+        before.players.iter().filter(|entry| entry.queued).count(),
+        0,
+        "誰もキューに入っていないはず"
+    );
+
+    enqueue(&db, player(2), "jungle", at(0)).await;
+    enqueue(&db, player(3), "top_carry", at(0)).await;
+
+    let after = db.admin.roster("", 1).await.unwrap();
+    let queued = after.players.iter().filter(|entry| entry.queued).count();
+    assert_eq!(queued, 2, "キュー中の印が合わない");
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/players").await;
+    assert_eq!(page.matches("キュー中").count(), 2, "{page}");
+    println!("キュー中の印: {queued} 人");
+
+    db.done().await;
+}

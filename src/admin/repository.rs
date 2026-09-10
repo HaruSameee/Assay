@@ -1566,3 +1566,132 @@ fn repository_error(error: crate::persistence::RepositoryError) -> AdminStoreErr
         other => AdminStoreError::from(sqlx::Error::Protocol(other.to_string())),
     }
 }
+
+// ----------------------------------------------------------------------
+// 登録者の一覧
+// ----------------------------------------------------------------------
+//
+// 検索（`/admin`）は名前か Discord ID を知っている前提の入口で、「誰が居るのか」を
+// 見る場所が無かった。運営が把握したいのは、登録済みか・停止されていないか・
+// どれくらい試合しているか、の 3 つ。**すべて導出値**で、ここでは保存しない。
+
+/// 1 ページあたりの人数。**運営画面なのでランキングより多く出す。**
+pub const ROSTER_PAGE_SIZE: i64 = 50;
+
+/// 一覧に出す 1 人。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterEntry {
+    pub player_id: Uuid,
+    pub discord_user_id: i64,
+    /// 登録フォームで申告したトレーナー名。未登録なら `None`。
+    pub trainer_name: Option<String>,
+    /// Discord の表示名（最新のスナップショット）。取れていなければ `None`。
+    pub display_name: Option<String>,
+    /// `players.status`（`active` / `suspended`）。停止処分がかかっているかを見る。
+    pub status: String,
+    /// 登録を済ませた時刻。まだなら `None`。
+    pub registered_at: Option<DateTime<Utc>>,
+    /// 表示スケールのレート（導出値）。
+    pub rating: f64,
+    /// 確定した試合数。
+    pub matches: i64,
+    /// **いまキューに入っているか。**運営が「誰が待っているか」を一覧から読めるようにする。
+    pub queued: bool,
+}
+
+/// 一覧 1 ページ分。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterPage {
+    pub players: Vec<RosterEntry>,
+    /// 1 始まりのページ番号。
+    pub page: i64,
+    /// 総ページ数（0 人でも 1）。
+    pub pages: i64,
+    /// 絞り込み後の総人数。
+    pub total: i64,
+    /// 絞り込みに使った文字列（空なら全員）。
+    pub query: String,
+}
+
+impl AdminRepository {
+    /// 登録者の一覧。**レートも試合数もキュー在席も導出値**で、保存しない。
+    ///
+    /// 並びは「登録の新しい順」。運営が見たいのは直近に入ってきた人なので、
+    /// レート順にはしない（レート順はランキングが担う）。
+    ///
+    /// `query` が空でなければ、トレーナー名・Discord 表示名・Discord ID で絞る
+    /// （`search_players` と同じ当たり方に、表示名ぶんを足したもの）。
+    pub async fn roster(&self, query: &str, page: i64) -> Result<RosterPage, sqlx::Error> {
+        let query = query.trim().to_owned();
+        let filter = if query.is_empty() {
+            None
+        } else {
+            Some(query.clone())
+        };
+        let total = sqlx::query_scalar!(
+            "select count(*) as \"count!\" \
+             from players p \
+             where $1::text is null \
+                or p.trainer_name ilike '%' || $1 || '%' \
+                or p.discord_user_id::text = $1 \
+                or exists ( \
+                    select 1 from player_discord_snapshots s \
+                    where s.player_id = p.id \
+                      and s.display_name ilike '%' || $1 || '%' \
+                )",
+            filter.as_deref(),
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let pages = ((total + ROSTER_PAGE_SIZE - 1) / ROSTER_PAGE_SIZE).max(1);
+        let page = page.clamp(1, pages);
+        let offset = (page - 1) * ROSTER_PAGE_SIZE;
+
+        let rows = sqlx::query!(
+            "select p.id, p.discord_user_id, p.trainer_name, p.status, p.registered_at, \
+                    v.rating as \"rating!\", v.matches as \"matches!\", \
+                    (select s.display_name from player_discord_snapshots s \
+                     where s.player_id = p.id order by s.id desc limit 1) as display_name, \
+                    exists (select 1 from queue_entries q where q.player_id = p.id) as \"queued!\" \
+             from players p \
+             join player_current_ratings v on v.player_id = p.id \
+             where $1::text is null \
+                or p.trainer_name ilike '%' || $1 || '%' \
+                or p.discord_user_id::text = $1 \
+                or exists ( \
+                    select 1 from player_discord_snapshots s \
+                    where s.player_id = p.id \
+                      and s.display_name ilike '%' || $1 || '%' \
+                ) \
+             order by p.registered_at desc nulls last, p.created_at desc, p.id \
+             limit $2 offset $3",
+            filter.as_deref(),
+            ROSTER_PAGE_SIZE,
+            offset,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(RosterPage {
+            players: rows
+                .into_iter()
+                .map(|row| RosterEntry {
+                    player_id: row.id,
+                    discord_user_id: row.discord_user_id,
+                    trainer_name: row.trainer_name,
+                    display_name: row.display_name,
+                    status: row.status,
+                    registered_at: row.registered_at,
+                    rating: row.rating,
+                    matches: row.matches,
+                    queued: row.queued,
+                })
+                .collect(),
+            page,
+            pages,
+            total,
+            query,
+        })
+    }
+}

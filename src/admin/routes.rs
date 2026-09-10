@@ -40,8 +40,9 @@ use super::config::AdminIds;
 use super::disputes::{DisputeOutcome, NewDisputeResolution, parse_decision};
 use super::html::{
     MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView,
-    RatingParamsView, ReportsView, SearchView, SeasonView, matching_range_page, player_page,
-    queue_page, quiet_reports_page, rating_params_page, reports_page, search_page, season_page,
+    RatingParamsView, ReportsView, RosterView, SearchView, SeasonView, matching_range_page,
+    player_page, queue_page, quiet_reports_page, rating_params_page, reports_page, roster_page,
+    search_page, season_page,
 };
 use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
@@ -108,6 +109,7 @@ impl FromRef<AdminState> for AuthConfig {
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(show_search))
+        .route("/admin/players", get(show_roster))
         .route("/admin/player", get(show_player))
         .route("/admin/adjustments", post(create_adjustment))
         .route("/admin/revert", post(create_revert))
@@ -217,6 +219,33 @@ fn fail(message: String) -> Notice {
         kind: NoticeKind::Error,
         message,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RosterQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    page: Option<i64>,
+}
+
+/// 登録者の一覧。**検索と違って、何も入力しなくても全員が出る。**
+async fn show_roster(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Query(params): Query<RosterQuery>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    let page = match app.store.roster(&params.q, params.page.unwrap_or(1)).await {
+        Ok(page) => page,
+        Err(err) => {
+            error!(%err, "could not list the registered players");
+            return internal_error();
+        }
+    };
+    Html(roster_page(&RosterView { page: &page })).into_response()
 }
 
 /// 追記結果を運用の言葉に翻訳する。打ち消しの制約違反は DB が正（回避しない）。
