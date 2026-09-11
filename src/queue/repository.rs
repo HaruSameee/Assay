@@ -247,7 +247,6 @@ impl QueueRepository {
     ///
     /// 集計は**1 回だけ**行って join する。プレイヤーごとの相関サブクエリにすると、
     /// キューの人数だけビュー全体を走査することになる。
-    ///
     /// 規模はキュー100人程度（07 §6）なので、全件読んで Rust 側で数える。
     /// 現在のマッチング範囲。`current_matching_ranges` の 1 行。
     ///
@@ -256,6 +255,24 @@ impl QueueRepository {
     pub async fn ranges(&self) -> Result<MatchingRanges, QueueError> {
         let mut conn = self.pool.acquire().await?;
         Ok(crate::persistence::repository::matching_ranges(&mut conn).await?)
+    }
+
+    /// **いまマッチメイカが止まっているか、その理由。**
+    ///
+    /// キュー画面に出すためだけに読む。止まっていることを黙っていると、
+    /// 稼働時間外に入った人が理由も分からず待ち続ける（待ち時間だけが増える）。
+    pub async fn matchmaker_stop(
+        &self,
+        now: Timestamp,
+    ) -> Result<Option<crate::admin::MatchmakerStop>, QueueError> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(crate::admin::repository::matchmaker_stop_on(&mut conn, now).await?)
+    }
+
+    /// 稼働スケジュール（画面に「次はいつ動くか」を書くため）。
+    pub async fn schedule(&self) -> Result<crate::admin::MatchmakerSchedule, QueueError> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(crate::admin::repository::matchmaker_schedule_on(&mut conn).await?)
     }
 
     /// キュー中の全員を、現在の幅で読む。

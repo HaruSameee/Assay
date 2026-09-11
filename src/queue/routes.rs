@@ -222,6 +222,13 @@ pub(super) struct StatusView {
     pub(super) up_range: i32,
     /// 現在の下方向のマッチング範囲。
     pub(super) down_range: i32,
+    /// **いまマッチメイカが動いているか。**止まっているなら画面で理由を出す。
+    ///
+    /// 黙っていると、稼働時間外に入った人は待ち時間だけが増えるのを眺めることになる。
+    pub(super) matchmaker_open: bool,
+    /// 稼働枠（`水金土日 21:00〜翌02:00` の形）。スケジュールを使っていなければ `null`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) matchmaker_window: Option<String>,
     /// 自分のエントリ。キュー中でなければ `null`。
     pub(super) entry: Option<EntryView>,
     /// 自分の範囲内でキュー中の人数（相互条件、07 §3-1）。
@@ -534,10 +541,35 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
         .await
         .inspect_err(|error| error!(%error, "could not read the matching ranges"))
         .ok()?;
+    // **止まっている理由を画面に出すため**に読む。読めなければ「動いている」側に倒す
+    // （読み取り失敗で余計な警告を出して混乱させない）
+    let now = Utc::now();
+    let stop = app.queue.matchmaker_stop(now).await.unwrap_or(None);
+    let matchmaker_window = app
+        .queue
+        .schedule()
+        .await
+        .ok()
+        .filter(|schedule| schedule.enabled)
+        .map(|schedule| {
+            format!(
+                "{days} {start}〜{wrap}{end}",
+                days = schedule.day_labels().join(""),
+                start = schedule.start_text(),
+                wrap = if schedule.crosses_midnight() {
+                    "翌"
+                } else {
+                    ""
+                },
+                end = schedule.end_text(),
+            )
+        });
     Some(StatusView {
         queued: entry.is_some(),
         up_range: ranges.up,
         down_range: ranges.down,
+        matchmaker_open: stop.is_none(),
+        matchmaker_window,
         entry: entry.map(EntryView::from),
         in_range: in_range.as_ref().map(|summary| summary.total),
         queue_total: in_range.as_ref().map(|summary| summary.queue_total),
