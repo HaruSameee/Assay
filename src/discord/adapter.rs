@@ -525,7 +525,7 @@ impl Adapter {
         } else if let Some(existing) = record.summon_notification {
             Some(existing)
         } else {
-            let message = render::summon(&roster, vc, &match_url);
+            let message = render::summon(id, &roster, vc, &match_url);
             match self
                 .retry("send:summon", || {
                     self.gateway

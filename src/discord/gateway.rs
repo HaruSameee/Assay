@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use serenity::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateAllowedMentions, CreateButton, CreateInputText,
-    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateModal,
-    EditMessage,
+    CreateActionRow, CreateAllowedMentions, CreateButton, CreateEmbed, CreateEmbedFooter,
+    CreateInputText, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
+    CreateModal, EditMessage,
 };
 use serenity::http::Http;
 use serenity::model::application::InputTextStyle;
@@ -48,6 +48,37 @@ pub struct Button {
     pub style: ButtonStyle,
 }
 
+/// 埋め込み（embed）の 1 項目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedField {
+    /// 見出し。
+    pub name: String,
+    /// 本文。`<@id>` / `<#id>` はここでも名前に展開される（**通知は飛ばない**）。
+    pub value: String,
+    /// 横に並べるか。
+    pub inline: bool,
+}
+
+/// メッセージに付ける埋め込み。**本文より読みやすくするためだけのもの。**
+///
+/// 埋め込みの中のメンションは表示だけで通知が飛ばない。通知したい相手は
+/// 本文（`content`）にも書き、`mention_users` に載せること。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Embed {
+    /// 見出し。
+    pub title: String,
+    /// 見出しのリンク先。
+    pub url: Option<String>,
+    /// 本文。
+    pub description: String,
+    /// 左端の色（RGB）。
+    pub color: u32,
+    /// 項目。
+    pub fields: Vec<EmbedField>,
+    /// 末尾の小さな文。
+    pub footer: Option<String>,
+}
+
 /// 投稿・編集するメッセージ。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutgoingMessage {
@@ -57,6 +88,8 @@ pub struct OutgoingMessage {
     pub buttons: Vec<Button>,
     /// 通知を飛ばすユーザー。本文中の他のメンションは通知しない。
     pub mention_users: Vec<UserId>,
+    /// 埋め込み。編集時に `None` なら既存の埋め込みを外す。
+    pub embed: Option<Embed>,
 }
 
 /// ルーム ID を受け取るモーダル。
@@ -163,6 +196,30 @@ fn components(buttons: &[Button]) -> Vec<CreateActionRow> {
     vec![CreateActionRow::Buttons(buttons)]
 }
 
+/// 埋め込みを serenity のビルダーにする。`None` は「埋め込み無し」（編集なら外す）。
+fn embeds(embed: Option<&Embed>) -> Vec<CreateEmbed> {
+    let Some(embed) = embed else {
+        return Vec::new();
+    };
+    let mut built = CreateEmbed::new()
+        .title(&embed.title)
+        .description(&embed.description)
+        .colour(embed.color)
+        .fields(
+            embed
+                .fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.value.as_str(), field.inline)),
+        );
+    if let Some(url) = &embed.url {
+        built = built.url(url);
+    }
+    if let Some(footer) = &embed.footer {
+        built = built.footer(CreateEmbedFooter::new(footer));
+    }
+    vec![built]
+}
+
 fn allowed_mentions(users: &[UserId]) -> CreateAllowedMentions {
     // 既定は「誰にも通知しない」。列挙したユーザーにだけ通知する。
     CreateAllowedMentions::new()
@@ -176,6 +233,7 @@ fn response_builder(response: InteractionResponse) -> CreateInteractionResponse 
         InteractionResponse::UpdateMessage(message) => CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new()
                 .content(message.content)
+                .embeds(embeds(message.embed.as_ref()))
                 .components(components(&message.buttons))
                 .allowed_mentions(allowed_mentions(&message.mention_users)),
         ),
@@ -233,6 +291,7 @@ impl Gateway for SerenityGateway {
                 &self.http,
                 CreateMessage::new()
                     .content(&message.content)
+                    .embeds(embeds(message.embed.as_ref()))
                     .components(components(&message.buttons))
                     .allowed_mentions(allowed_mentions(&message.mention_users)),
             )
@@ -252,6 +311,7 @@ impl Gateway for SerenityGateway {
                 message_id,
                 EditMessage::new()
                     .content(&message.content)
+                    .embeds(embeds(message.embed.as_ref()))
                     .components(components(&message.buttons))
                     .allowed_mentions(allowed_mentions(&message.mention_users)),
             )

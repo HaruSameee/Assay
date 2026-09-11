@@ -20,16 +20,27 @@ use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
 use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
 
-use super::gateway::OutgoingMessage;
+use super::gateway::{Embed, EmbedField, OutgoingMessage};
 use super::vc_pool::VcPair;
 
 /// 見出しの時刻は日本時間で出す（コミュニティの時間帯）。
 const JST_OFFSET_SECONDS: i32 = 9 * 3600;
 
+/// 成立通知の埋め込みの色。サイトのアクセント色に合わせた青緑。
+const SUMMON_COLOR: u32 = 0x2f_b3_a6;
+
 fn team_emoji(team: Team) -> &'static str {
     match team {
         Team::Red => "🔴",
         Team::Blue => "🔵",
+    }
+}
+
+/// 招集通知で使うチームの呼び名。
+fn team_label(team: Team) -> &'static str {
+    match team {
+        Team::Red => "赤チーム",
+        Team::Blue => "青チーム",
     }
 }
 
@@ -94,6 +105,7 @@ pub fn assignment(heading: &str, vc: &VcPair, team: Team, match_url: &str) -> Ou
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -157,6 +169,7 @@ pub fn matchmaker_run_log(outcome: &RunOutcome, at: Timestamp) -> OutgoingMessag
         content,
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -280,6 +293,7 @@ pub fn matchmaker_summary(summary: &MatchmakerSummary, at: Timestamp) -> Outgoin
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -312,7 +326,17 @@ fn rating(value: f64) -> String {
 /// レート、ロール割り当て、報告に関わる情報は全員が見る場所へ出さない（00 §3-5）。
 /// 出してよいのは**参加者名・チーム・行き先 VC と、サイトへの導線だけ**。
 /// 本文のメンションと `mention_users` は同じ 10 人に揃える。
-pub fn summon(roster: &[RosterEntry], vc: &VcPair, match_url: &str) -> OutgoingMessage {
+///
+/// **見た目は埋め込み（embed）。**本文に 10 人のメンションを平らに並べると読みにくい。
+/// 本文は通知のための 1 行（メンションは本文に無いと通知が飛ばない）だけにして、
+/// チームごとの顔ぶれ・行き先 VC・マッチ画面へのリンクは埋め込みに分けて出す。
+/// 埋め込みの中のメンションは表示だけで通知は飛ばないので、二重には鳴らない。
+pub fn summon(
+    formation: FormationId,
+    roster: &[RosterEntry],
+    vc: &VcPair,
+    match_url: &str,
+) -> OutgoingMessage {
     // チーム内はユーザー ID 順で安定させる（同じ編成なら毎回同じ本文になる）
     let team_users = |team: Team| -> Vec<UserId> {
         let mut users: Vec<UserId> = roster
@@ -324,30 +348,44 @@ pub fn summon(roster: &[RosterEntry], vc: &VcPair, match_url: &str) -> OutgoingM
         users.dedup();
         users
     };
-    let line = |team: Team, label: &str| -> String {
-        let mentions = team_users(team)
+    let team_field = |team: Team| -> EmbedField {
+        let names = team_users(team)
             .iter()
             .map(|user| mention(*user))
             .collect::<Vec<_>>()
-            .join(" ");
-        format!(
-            "{label}: {mentions} → <#{channel}>",
-            channel = vc.channel(team).get(),
-        )
+            .join("\n");
+        EmbedField {
+            name: format!("{} {}", team_emoji(team), team_label(team)),
+            value: format!(
+                "{names}\n集合: <#{channel}>",
+                channel = vc.channel(team).get()
+            ),
+            inline: true,
+        }
     };
     // 赤が先。マッチ画面もチーム表記も赤 → 青の順で揃えてある
     let mut users = team_users(Team::Red);
     users.extend(team_users(Team::Blue));
+    let mentions = users
+        .iter()
+        .map(|user| mention(*user))
+        .collect::<Vec<_>>()
+        .join(" ");
     OutgoingMessage {
-        content: format!(
-            "マッチが成立しました。**操作はすべてマッチ画面から**行います: {match_url}\n\
-             {red}\n{blue}\n\
-             割り当てと部屋設定もマッチ画面にあります",
-            red = line(Team::Red, "赤"),
-            blue = line(Team::Blue, "青"),
-        ),
+        content: format!("🔔 マッチが成立しました {mentions}"),
         buttons: Vec::new(),
         mention_users: users,
+        embed: Some(Embed {
+            title: format!("{} — マッチ画面を開く", match_label(formation)),
+            url: Some(match_url.to_owned()),
+            description: format!(
+                "**操作はすべてマッチ画面から**行います。\n{match_url}\n\
+                 自分のチームの VC に集合してください。"
+            ),
+            color: SUMMON_COLOR,
+            fields: vec![team_field(Team::Red), team_field(Team::Blue)],
+            footer: Some("割り当てと部屋設定もマッチ画面にあります".to_owned()),
+        }),
     }
 }
 
@@ -379,6 +417,7 @@ pub fn host_announcement(
         ),
         buttons: Vec::new(),
         mention_users: vec![host],
+        embed: None,
     }
 }
 
@@ -406,6 +445,7 @@ pub fn host_prompt(
         ),
         buttons: Vec::new(),
         mention_users: vec![candidate],
+        embed: None,
     }
 }
 
@@ -415,6 +455,7 @@ pub fn host_prompt_moved(heading: &str, to: Team) -> OutgoingMessage {
         content: format!("{heading}ホストの打診は {to} 側の VC に移りました。"),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -429,6 +470,7 @@ pub fn host_accepted(heading: &str, host: UserId, match_url: &str) -> OutgoingMe
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -470,6 +512,7 @@ pub fn code_reveal(
         } else {
             Vec::new()
         },
+        embed: None,
     }
 }
 
@@ -485,6 +528,7 @@ pub fn report_prompt(heading: &str, match_url: &str) -> OutgoingMessage {
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -530,6 +574,7 @@ pub(crate) fn dispute_notification(
         ),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -545,6 +590,7 @@ pub fn abandoned_notice(heading: &str, reason: AbandonReason) -> OutgoingMessage
         content: format!("{heading}{why}、この試合は解散になりました。キューに戻ります。"),
         buttons: Vec::new(),
         mention_users: Vec::new(),
+        embed: None,
     }
 }
 
@@ -748,45 +794,52 @@ mod tests {
         assert!(!blue.content.contains("vc3-red"), "{}", blue.content);
     }
 
-    /// **招集は 1 通。**10 人ぶんのメンションと URL 1 つで、行き先だけチームごとに書く。
+    /// **招集は 1 通。**本文は通知のための 1 行（10 人のメンション）、中身は埋め込み。
     ///
     /// 以前はチームごとに 2 通に分けていた。相手の構成を隠す意図だったが、
     /// 2 通とも同じ招集チャンネルに並ぶので隠せていなかった。
     #[test]
     fn the_summon_is_one_message_for_all_ten() {
-        let message = summon(&roster(), &vc(), SITE);
+        let message = summon(formation(), &roster(), &vc(), SITE);
+        // 本文は短い 1 行。**メンションは本文に無いと通知が飛ばない**のでここに置く
         assert_eq!(
             message.content,
-            format!(
-                "マッチが成立しました。**操作はすべてマッチ画面から**行います: {SITE}\n\
-                 赤: <@1001> <@1002> <@1003> <@1004> <@1005> → <#31>\n\
-                 青: <@1006> <@1007> <@1008> <@1009> <@1010> → <#32>\n\
-                 割り当てと部屋設定もマッチ画面にあります"
-            )
+            "🔔 マッチが成立しました <@1001> <@1002> <@1003> <@1004> <@1005> \
+             <@1006> <@1007> <@1008> <@1009> <@1010>"
         );
-        // **URL は 1 つだけ。**2 通に分かれていた頃は同じ URL が 2 回出ていた
-        assert_eq!(
-            message.content.matches(SITE).count(),
-            1,
-            "{}",
-            message.content
-        );
-        // 10 人全員がメンションされる（本文と mention_users が一致すること）
         assert_eq!(
             message.mention_users,
             (1001..=1010).map(UserId::new).collect::<Vec<_>>()
         );
-        for user in 1001..=1010 {
-            assert!(
-                message.content.contains(&format!("<@{user}>")),
-                "{}",
-                message.content
-            );
-        }
-        // 行き先は両方書く（どちらの VC に行くかが 1 通で分かる）
-        assert!(message.content.contains("<#31>"), "{}", message.content);
-        assert!(message.content.contains("<#32>"), "{}", message.content);
         assert!(message.buttons.is_empty());
+
+        // 中身は埋め込み。見出しがマッチ画面へのリンクで、**URL は 1 つだけ**
+        let embed = message.embed.as_ref().expect("the summon is an embed");
+        assert_eq!(embed.title, "match-00000000 — マッチ画面を開く");
+        assert_eq!(embed.url.as_deref(), Some(SITE));
+        assert_eq!(embed.description.matches(SITE).count(), 1, "{embed:?}");
+        assert!(!message.content.contains(SITE), "本文には URL を置かない");
+        assert!(embed.description.contains("操作はすべてマッチ画面から"));
+        assert_eq!(
+            embed.footer.as_deref(),
+            Some("割り当てと部屋設定もマッチ画面にあります")
+        );
+
+        // チームごとに 1 項目。顔ぶれは縦に並べ、行き先の VC を添える
+        assert_eq!(embed.fields.len(), 2);
+        let red = &embed.fields[0];
+        assert_eq!(red.name, "🔴 赤チーム");
+        assert_eq!(
+            red.value,
+            "<@1001>\n<@1002>\n<@1003>\n<@1004>\n<@1005>\n集合: <#31>"
+        );
+        let blue = &embed.fields[1];
+        assert_eq!(blue.name, "🔵 青チーム");
+        assert_eq!(
+            blue.value,
+            "<@1006>\n<@1007>\n<@1008>\n<@1009>\n<@1010>\n集合: <#32>"
+        );
+        assert!(red.inline && blue.inline, "赤と青を横に並べる");
     }
 
     /// ホストは**相手チームの人にも**伝える。メンションはホスト1人だけ。
@@ -1003,7 +1056,7 @@ mod tests {
         );
         println!(
             "========== 招集通知（red） ==========\n{}",
-            summon(&roster(), &vc(), SITE).content
+            summon(formation(), &roster(), &vc(), SITE).content
         );
         println!(
             "========== 成立時ログ ==========\n{}",
@@ -1031,7 +1084,7 @@ mod tests {
     fn dump_notifications_for_review() {
         let host = UserId::new(1001);
         println!("========== 招集チャンネル: 成立（10 人ぶん 1 通） ==========");
-        println!("{}", summon(&roster(), &vc(), SITE).content);
+        println!("{:#?}", summon(formation(), &roster(), &vc(), SITE));
         println!("\n========== 招集チャンネル: ホスト決定 ==========");
         println!("{}", host_announcement(formation(), host, 1, 3).content);
         println!("\n========== 招集チャンネル: ホスト交代 ==========");
@@ -1064,7 +1117,7 @@ mod tests {
     #[test]
     fn summon_never_leaks_ratings_roles_or_reports() {
         {
-            let message = summon(&roster(), &vc(), SITE);
+            let message = summon(formation(), &roster(), &vc(), SITE);
             for forbidden in [
                 "1500",
                 "レート",
@@ -1246,13 +1299,17 @@ mod tests {
             )
         );
         for message in [
-            summon(&roster(), &vc(), &url),
             host_prompt(&head(), UserId::new(1001), 1, 3, &url),
             host_accepted(&head(), UserId::new(1001), &url),
             report_prompt(&head(), &url),
         ] {
             assert!(message.content.contains(&url), "{}", message.content);
         }
+        // 招集は埋め込みで、URL は見出しのリンクと本文の両方に載る
+        let summon = summon(formation(), &roster(), &vc(), &url);
+        let embed = summon.embed.expect("embed");
+        assert_eq!(embed.url.as_deref(), Some(url.as_str()));
+        assert!(embed.description.contains(&url), "{}", embed.description);
         // 末尾の / を重ねない
         assert_eq!(
             match_url("https://match.example.test/", formation()),
@@ -1265,7 +1322,7 @@ mod tests {
     fn no_message_carries_an_interaction() {
         let mut messages = all_messages();
         messages.push(report_prompt(&head(), SITE));
-        messages.push(summon(&roster(), &vc(), SITE));
+        messages.push(summon(formation(), &roster(), &vc(), SITE));
         messages.push(host_announcement(formation(), UserId::new(1001), 1, 3));
         for message in messages {
             assert!(message.buttons.is_empty(), "{message:?}");
