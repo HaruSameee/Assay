@@ -8,7 +8,7 @@ use crate::registration::html::{escape, page_with_styles};
 use crate::status::html::display_time;
 
 use super::model::{MAX_BIO_CHARS, PublicProfile};
-use super::repository::OwnProfile;
+use super::repository::{OwnProfile, PoolImageSource};
 use crate::blocks::{BlockSearchResult, CurrentBlock};
 
 const PROFILE_STYLES: &str = r#"
@@ -24,6 +24,7 @@ const PROFILE_STYLES: &str = r#"
 .bio { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .role-tags { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
 .role-tags li { border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; color: var(--muted); font-size: 0.85rem; }
+.pool-image { display: block; max-width: 100%; height: auto; margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .links { margin-top: 18px; }
 .links a { overflow-wrap: anywhere; }
 .role-choice { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 0; }
@@ -78,6 +79,20 @@ pub fn public_page(viewer: Viewer, profile: &PublicProfile) -> String {
             "<section class=\"section\"><h2>担当ロール</h2>\n<ul class=\"role-tags\">{tags}</ul></section>\n"
         )
     });
+    // **キャラプールは担当ロールの公開設定とは独立。**ロールを隠したい人と、
+    // 絵を見せたい人は別なので、画像を置いていれば出す。
+    // `referrerpolicy` を付けて、どのページから読んだかを外部に渡さない
+    let pool = profile
+        .pool_image_url
+        .as_deref()
+        .map_or_else(String::new, |url| {
+            format!(
+                "<section class=\"section\"><h2>キャラプール</h2>\n\
+                 <img class=\"pool-image\" src=\"{url}\" alt=\"キャラプール\" \
+                 loading=\"lazy\" referrerpolicy=\"no-referrer\"></section>\n",
+                url = escape(url),
+            )
+        });
     let links = profile.x_id.as_ref().map_or_else(String::new, |x_id| {
         // 検証済みの `^[A-Za-z0-9_]{1,15}$` なので URL に埋めてよい
         format!(
@@ -94,7 +109,7 @@ pub fn public_page(viewer: Viewer, profile: &PublicProfile) -> String {
          <div class=\"profile-metrics\">\n\
          <div class=\"metric\"><span class=\"metric-label\">レート</span><strong class=\"metric-value\">{rating}</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">確定した試合</span><strong class=\"metric-value\">{matches}</strong></div>\n\
-         </div>\n{bio}{roles}{links}</section>\n",
+         </div>\n{bio}{roles}{pool}{links}</section>\n",
         avatar = escape(&profile.avatar_url),
         name = escape(&profile.display_name),
         rating = profile.rating.round() as i64,
@@ -228,6 +243,29 @@ pub fn edit_page(page: EditPage<'_>) -> String {
             .collect::<String>();
         format!("<ul class=\"block-search-results\">{rows}</ul>")
     };
+    // いま設定されている画像。**貼り直す前に何が出ているかを見せる。**
+    // アップロードは配信 URL、貼り付けは元の URL をそのまま出す
+    let (pool_preview, pool_url) = match &own.pool_image {
+        Some(PoolImageSource::Uploaded) => (
+            format!(
+                "<img class=\"pool-image\" src=\"/players/{player_id}/pool.png\" \
+                 alt=\"いま設定されているキャラプール\" loading=\"lazy\">\n"
+            ),
+            String::new(),
+        ),
+        Some(PoolImageSource::Url(url)) => (
+            format!(
+                "<img class=\"pool-image\" src=\"{url}\" alt=\"いま設定されているキャラプール\" \
+                 loading=\"lazy\" referrerpolicy=\"no-referrer\">\n",
+                url = escape(url),
+            ),
+            escape(url),
+        ),
+        None => (
+            String::from("<p class=\"field-help\">まだ設定していません。</p>\n"),
+            String::new(),
+        ),
+    };
 
     let body = format!(
         "<section aria-labelledby=\"edit-title\">\n<p class=\"eyebrow\">Profile</p>\n\
@@ -244,7 +282,8 @@ pub fn edit_page(page: EditPage<'_>) -> String {
          <input id=\"x_id\" name=\"x_id\" type=\"text\" maxlength=\"15\" value=\"{x_id}\"></div>\n\
          <fieldset class=\"field\"><legend>担当ロール</legend>\n\
          <div class=\"role-choice\">{checks}</div>\n\
-         <p class=\"field-help\"><label><input type=\"checkbox\" name=\"main_roles_public\" value=\"1\"{public_checked}> \
+         <p class=\"field-help\"><label class=\"check\">\
+         <input type=\"checkbox\" name=\"main_roles_public\" value=\"1\"{public_checked}> \
          担当ロールを公開プロフィールに表示する</label></p>\n\
          <p class=\"field-help\">公開しない場合、公開プロフィールには\
          <strong>担当ロールの欄そのものが出ません</strong>（未設定の人と区別できません）。</p>\n\
@@ -252,6 +291,23 @@ pub fn edit_page(page: EditPage<'_>) -> String {
          <div class=\"actions\"><button type=\"submit\">保存する</button>\
          <a class=\"button button-secondary\" href=\"/players/{player_id}\">公開プロフィールを見る</a></div>\n\
          </form>\
+         <section class=\"section\" aria-labelledby=\"pool-title\">\n\
+         <h2 id=\"pool-title\">キャラプール画像</h2>\n\
+         <p class=\"field-help\">担当ロールに添えて、公開プロフィールに出す画像です。\
+         <strong>PNG を 3MB まで</strong>アップロードするか、画像の URL を貼れます。\
+         どちらか一方だけにしてください。</p>\n\
+         <p class=\"field-help\">担当ロールの公開設定とは別です。画像を置けば、\
+         ロールを非公開にしていても画像は出ます。</p>\n\
+         {pool_preview}\
+         <form method=\"post\" action=\"/profile/pool-image\" enctype=\"multipart/form-data\">\n\
+         <div class=\"field\"><label for=\"pool_image\">PNG をアップロード</label>\n\
+         <input id=\"pool_image\" name=\"image\" type=\"file\" accept=\"image/png\"></div>\n\
+         <div class=\"field\"><label for=\"pool_image_url\">または画像の URL</label>\n\
+         <p class=\"field-help\">https:// で始まる URL を貼ってください。</p>\n\
+         <input id=\"pool_image_url\" name=\"image_url\" type=\"url\" maxlength=\"2048\" value=\"{pool_url}\"></div>\n\
+         <div class=\"actions\"><button type=\"submit\">画像を保存する</button></div>\n\
+         <p class=\"field-help\">どちらも空のまま保存すると、設定を消します。</p>\n\
+         </form></section>\
          <section class=\"section\" aria-labelledby=\"blocks-title\">\n\
          <h2 id=\"blocks-title\">味方ブロック</h2>\
          <p class=\"field-help\">指定したプレイヤーと味方チームにならないようにします。相手チームには影響せず、相手に通知されません。</p>\
@@ -270,6 +326,8 @@ pub fn edit_page(page: EditPage<'_>) -> String {
         x_id = escape(own.x_id.as_deref().unwrap_or("")),
         current_blocks = current_blocks,
         block_query = escape(block_query),
+        pool_preview = pool_preview,
+        pool_url = pool_url,
         search_results = search_results,
     );
     page_with_styles(viewer, "プロフィールの編集", &body, PROFILE_STYLES)
@@ -290,6 +348,7 @@ mod tests {
             bio: String::new(),
             x_id: None,
             main_roles: None,
+            pool_image_url: None,
         }
     }
 

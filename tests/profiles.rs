@@ -14,9 +14,9 @@ mod common;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use common::{APP_ROLE, APP_ROLE_PASSWORD, Browser, FakeOAuth, body_text, config, player, sign_in};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use unite_matchsystem::blocks::BlockRepository;
@@ -441,5 +441,252 @@ async fn an_unknown_player_is_not_found(owner: PgPool) {
             "{path}"
         );
     }
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// キャラプールの画像
+// ----------------------------------------------------------------------
+//
+// **1 人 1 枚で、貼り直しは置き換え。**`player_profiles` が追記専用なのと違い、
+// ここは可変の参照データとして扱う（自己紹介を直すたびに 3MB 積まないため）。
+
+/// PNG のシグネチャ + 指定バイトのダミー。
+fn png(extra: usize) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend(std::iter::repeat_n(0u8, extra));
+    bytes
+}
+
+/// **アップロードした PNG が配信され、公開プロフィールに出る。**
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn an_uploaded_png_is_served_and_shown(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let oauth = Arc::new(FakeOAuth::new("5000"));
+    let (mut browser, player_id) = signed_in(&db, &oauth, "5001").await;
+
+    let image = png(64);
+    let response = browser
+        .post_multipart("/profile/pool-image", Some(("image", &image)), &[])
+        .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER, "保存できていない");
+
+    // 公開 JSON に配信 URL が載る
+    let public = public_json(&db, &oauth, player_id).await;
+    assert_eq!(
+        public["pool_image_url"],
+        json!(format!("/players/{}/pool.png", player_id.0))
+    );
+
+    // その URL から本物のバイト列が返る
+    let mut anonymous = Browser::new(app(&db, oauth.clone()));
+    let served = anonymous
+        .get(&format!("/players/{}/pool.png", player_id.0))
+        .await;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(
+        served.headers().get(header::CONTENT_TYPE).unwrap(),
+        "image/png"
+    );
+    // **型を推測させない。**中身は検査済みだが配信側でも固定する
+    assert_eq!(
+        served.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let bytes = axum::body::to_bytes(served.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), image.as_slice(), "中身が変わっている");
+    println!("アップロード: {} バイトがそのまま配信された", bytes.len());
+
+    db.done().await;
+}
+
+/// **URL を貼るとそのまま出る。**アップロードはしない。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_pasted_url_is_shown_as_is(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let oauth = Arc::new(FakeOAuth::new("5000"));
+    let (mut browser, player_id) = signed_in(&db, &oauth, "5002").await;
+
+    let response = browser
+        .post_multipart(
+            "/profile/pool-image",
+            None,
+            &[("image_url", "https://example.test/pool.png")],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let public = public_json(&db, &oauth, player_id).await;
+    assert_eq!(
+        public["pool_image_url"],
+        json!("https://example.test/pool.png")
+    );
+    // 配信の口からは何も出ない（アップロードしていない）
+    let mut anonymous = Browser::new(app(&db, oauth.clone()));
+    let served = anonymous
+        .get(&format!("/players/{}/pool.png", player_id.0))
+        .await;
+    assert_eq!(served.status(), StatusCode::NOT_FOUND);
+    println!("URL 貼り付け: そのまま公開、配信の口は 404");
+
+    db.done().await;
+}
+
+/// **PNG 以外と 3MB 超は断る。**行も増えない。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_bad_image_is_refused(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let oauth = Arc::new(FakeOAuth::new("5000"));
+    let (mut browser, player_id) = signed_in(&db, &oauth, "5003").await;
+
+    // JPEG のシグネチャ
+    let jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0];
+    let response = browser
+        .post_multipart("/profile/pool-image", Some(("image", &jpeg)), &[])
+        .await;
+    let status = response.status();
+    let page = body_text(response).await;
+    // 検証で断ったときは 400 + 編集画面（既存の流儀）
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{page}");
+    assert!(page.contains("PNG の画像を選んでください"), "{page}");
+
+    // 3MB + 1 バイト
+    let too_big = png(3 * 1024 * 1024 - 8 + 1);
+    let response = browser
+        .post_multipart("/profile/pool-image", Some(("image", &too_big)), &[])
+        .await;
+    let page = body_text(response).await;
+    assert!(page.contains("3MB"), "{page}");
+
+    // http は断る
+    let response = browser
+        .post_multipart(
+            "/profile/pool-image",
+            None,
+            &[("image_url", "http://example.test/a.png")],
+        )
+        .await;
+    let page = body_text(response).await;
+    assert!(page.contains("https:// で始まる"), "{page}");
+
+    // 1 行も入っていない
+    let rows: i64 = sqlx::query_scalar("select count(*) from player_pool_images")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "断ったのに保存されている");
+    let public = public_json(&db, &oauth, player_id).await;
+    assert!(public.get("pool_image_url").is_none(), "{public}");
+    println!("PNG でない・3MB 超・http: どれも拒否、0 行");
+
+    db.done().await;
+}
+
+/// **貼り直しは置き換え。**行は増えず、古い画像は残らない。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn re_uploading_replaces_the_image(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let oauth = Arc::new(FakeOAuth::new("5000"));
+    let (mut browser, player_id) = signed_in(&db, &oauth, "5004").await;
+
+    let first = png(16);
+    browser
+        .post_multipart("/profile/pool-image", Some(("image", &first)), &[])
+        .await;
+    let second = png(32);
+    browser
+        .post_multipart("/profile/pool-image", Some(("image", &second)), &[])
+        .await;
+
+    let rows: i64 = sqlx::query_scalar("select count(*) from player_pool_images")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "**1 人 1 行**のはず");
+    let mut anonymous = Browser::new(app(&db, oauth.clone()));
+    let served = anonymous
+        .get(&format!("/players/{}/pool.png", player_id.0))
+        .await;
+    let bytes = axum::body::to_bytes(served.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.len(), second.len(), "古い画像が残っている");
+
+    // URL に貼り替えると、アップロードは消える
+    browser
+        .post_multipart(
+            "/profile/pool-image",
+            None,
+            &[("image_url", "https://example.test/b.png")],
+        )
+        .await;
+    let mut anonymous = Browser::new(app(&db, oauth.clone()));
+    let served = anonymous
+        .get(&format!("/players/{}/pool.png", player_id.0))
+        .await;
+    assert_eq!(served.status(), StatusCode::NOT_FOUND, "PNG が残っている");
+    let public = public_json(&db, &oauth, player_id).await;
+    assert_eq!(
+        public["pool_image_url"],
+        json!("https://example.test/b.png")
+    );
+
+    // 空で送ると消える
+    browser
+        .post_multipart("/profile/pool-image", None, &[("image_url", "")])
+        .await;
+    let public = public_json(&db, &oauth, player_id).await;
+    assert!(public.get("pool_image_url").is_none(), "{public}");
+    println!("貼り直し・URL へ切替・消去: すべて 1 行のまま");
+
+    db.done().await;
+}
+
+/// **担当ロールの公開設定とは独立。**ロールを隠していても画像は出る。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_pool_image_is_independent_of_the_role_visibility(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let oauth = Arc::new(FakeOAuth::new("5000"));
+    let (mut browser, player_id) = signed_in(&db, &oauth, "5005").await;
+
+    // ロールを設定して**非公開**にする
+    assert_eq!(
+        save(&mut browser, "bio=&x_id=&main_roles=jungle").await,
+        StatusCode::OK
+    );
+    browser
+        .post_multipart(
+            "/profile/pool-image",
+            None,
+            &[("image_url", "https://example.test/pool.png")],
+        )
+        .await;
+
+    let public = public_json(&db, &oauth, player_id).await;
+    assert!(public.get("main_roles").is_none(), "ロールが漏れている");
+    assert_eq!(
+        public["pool_image_url"],
+        json!("https://example.test/pool.png"),
+        "画像まで隠れている"
+    );
+    println!("ロール非公開 + 画像あり: ロールは隠れ、画像は出る");
+
     db.done().await;
 }

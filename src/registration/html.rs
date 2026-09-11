@@ -132,6 +132,29 @@ select {
   font: inherit;
 }
 input::placeholder { color: #747b88; }
+/* **チェックボックスとラジオは「幅いっぱいの入力欄」ではない。**
+   上の `input` 指定（width:100% / min-height:48px）に引っ張られると、
+   48px の巨大な箱が縦に並ぶ。型で指定して打ち消す。
+   型で直すので、チェックボックスを使う画面すべてに一度に効く */
+input[type="checkbox"],
+input[type="radio"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+/* チェックボックスを内側に持つラベルは、文字と横に並べる
+   （`label` は共通で display:block なので、そのままだと折り返す） */
+label.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-weight: 650;
+}
 input:focus,
 select:focus,
 .button:focus-visible,

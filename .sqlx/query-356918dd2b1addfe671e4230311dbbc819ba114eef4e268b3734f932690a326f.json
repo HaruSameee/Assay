@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select image from player_pool_images where player_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "image",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "player_pool_images",
+            "name": "image"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "356918dd2b1addfe671e4230311dbbc819ba114eef4e268b3734f932690a326f"
+}

@@ -180,6 +180,47 @@ impl Browser {
         self.send(builder.body(Body::from(body.to_owned())).unwrap())
             .await
     }
+
+    /// multipart/form-data で送る。**ファイルの中身をそのままバイト列で渡す。**
+    pub async fn post_multipart(
+        &mut self,
+        uri: &str,
+        file: Option<(&str, &[u8])>,
+        fields: &[(&str, &str)],
+    ) -> Response<Body> {
+        const BOUNDARY: &str = "----assaytestboundary";
+        let mut body: Vec<u8> = Vec::new();
+        if let Some((name, bytes)) = file {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "content-disposition: form-data; name=\"{name}\"; filename=\"pool.png\"\r\n\
+                     content-type: image/png\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        for (name, value) in fields {
+            body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("content-disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(value.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+
+        let mut builder = Request::post(uri).header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        );
+        if let Some(cookies) = self.cookie_header() {
+            builder = builder.header(header::COOKIE, cookies);
+        }
+        self.send(builder.body(Body::from(body)).unwrap()).await
+    }
 }
 
 pub async fn body_text(response: Response<Body>) -> String {

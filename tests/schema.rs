@@ -201,17 +201,22 @@ async fn the_audit_inspects_every_application_table(owner: sqlx::PgPool) {
     );
 
     for table in &tables {
-        // 可変テーブルと追記専用テーブルでは、壊す向きが逆になる
+        // 壊す向きは表の性質ごとに違う。**逆向きに壊しても監査が気付くこと**を見る
         let mutable = matches!(
             table.as_str(),
             "players" | "roles" | "queue_entries" | "queue_entry_roles"
         );
+        // 置き換え型（1 人 1 行で上書きする）。UPDATE はあるが DELETE は無い
+        let replace_in_place = matches!(table.as_str(), "player_pool_images");
         let break_it = if mutable {
             // 可変テーブルに保護トリガーが付いた（＝誤って追記専用にした）
             format!(
                 "create trigger audit_probe before update or delete on {table} \
                  for each statement execute function forbid_update_delete()"
             )
+        } else if replace_in_place {
+            // 置き換え型に DELETE 権限が付いた（上書きで足りるのに消せるようにした）
+            format!("grant delete on {table} to assay_app")
         } else {
             // 追記専用テーブルに UPDATE 権限が付いた
             format!("grant update on {table} to assay_app")

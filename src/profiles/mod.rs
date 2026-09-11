@@ -10,6 +10,7 @@
 
 pub mod html;
 pub mod model;
+pub mod pool;
 pub mod repository;
 pub mod routes;
 
@@ -17,5 +18,6 @@ pub use model::{
     DiscordAppearance, MAX_BIO_CHARS, MAX_MAIN_ROLES, ProfileEdit, ProfileError, PublicProfile,
     avatar_url, validate_edit,
 };
+pub use pool::{MAX_IMAGE_BYTES, PoolImage, PoolImageError, parse as parse_pool_image};
 pub use repository::{OwnProfile, PlayerDiscordIdentity, ProfileRepository};
 pub use routes::{ProfileState, router};
