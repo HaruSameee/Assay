@@ -37,7 +37,9 @@ use super::actions::{
     AdminActionKind, MAX_BLOCK_ALLOWANCE, normalize_reason, parse_block_allowance,
 };
 use super::config::AdminIds;
-use super::disputes::{DisputeOutcome, NewDisputeResolution, parse_decision};
+use super::disputes::{
+    DisputeOutcome, NewDisputeResolution, NewReadjudication, ReadjudicationOutcome, parse_decision,
+};
 use crate::nullified::NullifiedReportRepository;
 
 use super::html::{
@@ -132,6 +134,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/reports", get(show_reports).post(enter_report))
         // 係争の裁定。**終端イベントを 1 行積むだけ**（報告は書き換えない）
         .route("/admin/reports/dispute", post(resolve_dispute))
+        // 終わった試合の裁定のやり直し。同じく終端イベントを 1 行積むだけ
+        .route("/admin/reports/readjudicate", post(readjudicate))
         .route("/admin/season", get(show_season).post(start_season))
         // レート増減幅。2 段階の確認。実行は POST /admin/rating-params
         .route(
@@ -1244,6 +1248,80 @@ async fn resolve_dispute(
     render_reports(&app, Some(notice)).await
 }
 
+/// 終わった試合の裁定をやり直す。**終端イベントをもう 1 行積むだけ。**
+///
+/// 元の裁定もプレイヤーの報告も書き換えない。レートは導出値なので、最後の
+/// 終端イベントが変われば 10 人ぶんの増減が同時に引き直される。
+async fn readjudicate(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<ResolveDisputeForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let Ok(formation_id) = Uuid::parse_str(form.formation.trim()) else {
+        return render_reports(&app, Some(fail("試合の指定が不正です。".to_owned()))).await;
+    };
+    let Some(decision) = parse_decision(&form.decision) else {
+        return render_reports(&app, Some(fail("裁定の指定が不正です。".to_owned()))).await;
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        return render_reports(&app, Some(fail("理由を入力してください。".to_owned()))).await;
+    };
+
+    let input = NewReadjudication {
+        formation_id: FormationId(formation_id),
+        decision,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.readjudicate(&input).await {
+        Ok(ReadjudicationOutcome::Changed { before, state }) => {
+            let ratings = match (
+                before.kind == crate::lifecycle::FormationEventKind::Confirmed,
+                decision.changes_ratings(),
+            ) {
+                (true, true) => "10 人ぶんの増減が新しい結果で引き直されました。",
+                (true, false) => "この試合の増減が 10 人ぶんまとめてレートから消えました。",
+                (false, true) => "この試合の増減が 10 人ぶんレートに入りました。",
+                (false, false) => "レートは動いていません。",
+            };
+            info(format!(
+                "裁定をやり直しました（{before} → {label} / {state}）。{ratings}\
+                 元の裁定もプレイヤーの報告も 1 行も書き換えていません。",
+                before = before.label(),
+                label = decision.label(),
+            ))
+        }
+        Ok(ReadjudicationOutcome::Duplicate) => {
+            info("このやり直しは既に記録されています。行は増やしていません。".to_owned())
+        }
+        Ok(ReadjudicationOutcome::Unchanged { current }) => fail(format!(
+            "その試合は既に「{}」です。行は増やしていません。",
+            current.label()
+        )),
+        Ok(ReadjudicationOutcome::NotFinished { state }) => fail(format!(
+            "その試合はまだ終わっていません（現在: {state}）。\
+             係争中なら上の係争の一覧から、進行中なら報告の到着を待ってください。"
+        )),
+        Err(err) => {
+            error!(%err, "could not readjudicate the match");
+            return internal_error();
+        }
+    };
+    render_reports(&app, Some(notice)).await
+}
+
+/// 裁定のやり直しの一覧に出す件数。**直近の分だけ。**
+///
+/// 「後からやっぱり」は当日か翌日に起きる。1 晩で最大 50 組なので、
+/// 前の晩まで遡れる程度にしてある。
+const FINISHED_LIMIT: i64 = 80;
+
 /// 報告の入力画面を描く。一覧は毎回引き直す（保存しない）。
 async fn render_reports(app: &AdminState, notice: Option<Notice>) -> Response {
     let awaiting = match app.store.formations_awaiting_reports().await {
@@ -1260,10 +1338,18 @@ async fn render_reports(app: &AdminState, notice: Option<Notice>) -> Response {
             return internal_error();
         }
     };
+    let finished = match app.store.finished_formations(FINISHED_LIMIT).await {
+        Ok(finished) => finished,
+        Err(err) => {
+            error!(%err, "could not list the finished formations");
+            return internal_error();
+        }
+    };
     Html(reports_page(&ReportsView {
         awaiting: &awaiting,
         form_key: &form_key(),
         disputed: &disputed,
+        finished: &finished,
         notice,
     }))
     .into_response()

@@ -2301,3 +2301,452 @@ async fn the_default_schedule_is_the_nightly_window(owner: PgPool) {
 
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// 終わった試合の裁定のやり直し
+// ----------------------------------------------------------------------
+//
+// 「無効試合にするか微妙な試合を各自の判断で報告し、確定した後で『やっぱり
+// 無効試合にしよう』となる」ときに、10 人ぶんのレートを 1 人ずつ調整で打ち消す
+// 代わりに、試合の結果そのものを変える。**終端イベントをもう 1 行積むだけ**で、
+// レートは導出値なので 10 人ぶんが同時に引き直される。
+
+/// 全員一致で red の勝ちが確定した試合を 1 件作る。
+async fn confirmed_formation(db: &AppDb, n: u128) {
+    playable_formation(db, n).await;
+    for who in 2..=11u128 {
+        player_report(db, n, who, "red").await;
+    }
+    db.formations
+        .append_event(
+            fid(n),
+            &NewEvent::new(K::Confirmed, None, at(20), format!("confirmed-{n}"))
+                .with_payload(json!({ "outcome": "red", "decision_basis": "unanimous" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(db, n).await, S::Confirmed);
+}
+
+/// 画面の**その試合の**やり直しフォームから冪等キーを読む。
+fn readjudicate_key(html: &str, n: u128) -> String {
+    html.split(&format!("data-formation=\"{}\"", fid(n).0))
+        .nth(1)
+        .expect("the finished block is rendered")
+        .split("name=\"key\" value=\"")
+        .nth(1)
+        .expect("the hidden idempotency key")
+        .split('"')
+        .next()
+        .expect("the key value")
+        .to_owned()
+}
+
+/// **確定した試合を後から無効試合にすると、10 人ぶんの増減がまとめて消える。**
+/// 元の confirmed もプレイヤーの報告も 1 行も書き換わらない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn readjudicating_a_confirmed_match_as_nullified_reverses_all_ten_ratings(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    let app = db.router();
+
+    let untouched = ratings(&db).await;
+    confirmed_formation(&db, 1).await;
+    let confirmed = ratings(&db).await;
+    println!("確定後のレート: {confirmed:?}");
+    // 赤（player 2〜6）が +7、青（7〜11）が -7 になっている
+    for (index, (before, after)) in untouched.iter().zip(&confirmed).enumerate() {
+        let expected = if index < 5 { 7.0 } else { -7.0 };
+        assert!(
+            (after - before - expected).abs() < 0.01,
+            "player {}: {before} → {after}",
+            index + 2
+        );
+    }
+    let reports_before = count(&db, "match_reports").await;
+    let events_before = count(&db, "formation_events").await;
+
+    // 画面に「終わった試合」として出ていて、いまの結果が書いてある
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    let finished = page
+        .split("id=\"finished-title\"")
+        .nth(1)
+        .expect("the finished section");
+    assert!(finished.contains("いまの結果: 赤の勝ち"), "{finished}");
+    assert!(
+        finished.contains("action=\"/admin/reports/readjudicate\""),
+        "{finished}"
+    );
+    let key = readjudicate_key(&page, 1);
+
+    let (status, after_page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/readjudicate",
+        &format!(
+            "formation={}&decision=nullified&reason=after+discussion&key={key}",
+            fid(1).0
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(after_page.contains("裁定をやり直しました"), "{after_page}");
+    assert!(
+        after_page.contains("10 人ぶんまとめてレートから消えました"),
+        "{after_page}"
+    );
+
+    // 状態は nullified。**元の confirmed は残ったまま**（1 行増えただけ）
+    assert_eq!(state_of(&db, 1).await, S::Nullified);
+    assert_eq!(count(&db, "formation_events").await, events_before + 1);
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "select kind from formation_events where formation_id = $1 \
+         and kind in ('confirmed', 'nullified') order by id",
+    )
+    .bind(fid(1).0)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(kinds, vec!["confirmed", "nullified"]);
+    assert_eq!(count(&db, "match_reports").await, reports_before);
+
+    // **10 人全員が試合前の値に戻る**
+    let reversed = ratings(&db).await;
+    println!("やり直し後のレート: {reversed:?}");
+    for (index, (before, after)) in untouched.iter().zip(&reversed).enumerate() {
+        assert!(
+            (after - before).abs() < 0.01,
+            "player {}: 試合前 {before} / やり直し後 {after}",
+            index + 2
+        );
+    }
+    // 確定した試合の数からも消える
+    let played: i64 = sqlx::query_scalar!(
+        "select matches as \"matches!\" from player_current_ratings where player_id = $1",
+        player(2).0
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(played, 0, "無効にした試合が試合数に残っている");
+
+    // 画面のいまの結果も変わる
+    let (_, page) = get_html(&app, player(ADMIN), "/admin/reports").await;
+    assert!(page.contains("いまの結果: 無効試合"), "{page}");
+
+    // 運営操作ログ
+    let logged = sqlx::query!(
+        "select reason, payload from admin_actions where kind = 'match_readjudicated'"
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].reason.as_deref(), Some("after discussion"));
+    assert_eq!(logged[0].payload["decision"], json!("nullified"));
+    assert_eq!(logged[0].payload["previous_kind"], json!("confirmed"));
+    assert_eq!(logged[0].payload["previous_outcome"], json!("red"));
+    assert_eq!(logged[0].payload["changes_ratings"], json!(true));
+    println!(
+        "admin_actions: {} 行 / payload: {}",
+        logged.len(),
+        logged[0].payload
+    );
+
+    db.done().await;
+}
+
+/// **無効試合を後から勝敗に戻すと増減が入り、赤 → 青の入れ替えは符号が反転する。**
+/// 終端どうしを何度でも行き来でき、最後の 1 行だけが効く。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_readjudication_can_go_back_and_forth_and_only_the_last_one_counts(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    let app = db.router();
+    let untouched = ratings(&db).await;
+
+    // 無効試合で終わった試合
+    playable_formation(&db, 1).await;
+    for who in 2..=11u128 {
+        player_report(&db, 1, who, "nullified").await;
+    }
+    db.formations
+        .append_event(
+            fid(1),
+            &NewEvent::new(K::Nullified, None, at(20), "nullified-1")
+                .with_payload(json!({ "outcome": "nullified" })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ratings(&db).await,
+        untouched,
+        "無効試合でレートが動いている"
+    );
+
+    let readjudicate = |decision: &'static str, key_suffix: &'static str| {
+        let app = app.clone();
+        async move {
+            post_form(
+                &app,
+                player(ADMIN),
+                "/admin/reports/readjudicate",
+                &format!(
+                    "formation={}&decision={decision}&reason=r&key=k-{key_suffix}",
+                    fid(1).0
+                ),
+            )
+            .await
+        }
+    };
+
+    // 1. 無効試合 → 青の勝ち
+    let (status, page) = readjudicate("blue", "1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("10 人ぶんレートに入りました"), "{page}");
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+    let blue_won = ratings(&db).await;
+    for (index, (before, after)) in untouched.iter().zip(&blue_won).enumerate() {
+        let expected = if index < 5 { -7.0 } else { 7.0 };
+        assert!(
+            (after - before - expected).abs() < 0.01,
+            "player {}",
+            index + 2
+        );
+    }
+    println!("無効試合 → 青の勝ち: {blue_won:?}");
+
+    // 2. 青の勝ち → 赤の勝ち（状態は confirmed のまま、符号だけ反転）
+    let (_, page) = readjudicate("red", "2").await;
+    assert!(page.contains("新しい結果で引き直されました"), "{page}");
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+    let red_won = ratings(&db).await;
+    for (index, (before, after)) in untouched.iter().zip(&red_won).enumerate() {
+        let expected = if index < 5 { 7.0 } else { -7.0 };
+        assert!(
+            (after - before - expected).abs() < 0.01,
+            "player {}",
+            index + 2
+        );
+    }
+    println!("青の勝ち → 赤の勝ち: {red_won:?}");
+
+    // 3. 赤の勝ち → 不成立
+    let (_, page) = readjudicate("voided", "3").await;
+    assert!(
+        page.contains("10 人ぶんまとめてレートから消えました"),
+        "{page}"
+    );
+    assert_eq!(state_of(&db, 1).await, S::Voided);
+    assert_eq!(ratings(&db).await, untouched);
+
+    // 4. 不成立 → 無効試合（どちらもレートは動かない）
+    let (_, page) = readjudicate("nullified", "4").await;
+    assert!(page.contains("レートは動いていません"), "{page}");
+    assert_eq!(state_of(&db, 1).await, S::Nullified);
+    assert_eq!(ratings(&db).await, untouched);
+
+    // 終端イベントは 1 + 4 行。**どれも消えていない**
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "select kind from formation_events where formation_id = $1 \
+         and kind in ('confirmed', 'nullified', 'voided') order by id",
+    )
+    .bind(fid(1).0)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kinds,
+        vec!["nullified", "confirmed", "confirmed", "voided", "nullified"]
+    );
+    assert_eq!(count(&db, "admin_actions").await, 4);
+    println!("終端イベントの列: {kinds:?}");
+
+    db.done().await;
+}
+
+/// **同じ結果・二重送信・終わっていない試合は 1 行も積まない。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_readjudication_that_changes_nothing_records_nothing(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    let app = db.router();
+    confirmed_formation(&db, 1).await;
+    // 進行中の試合（報告待ち）
+    playable_formation(&db, 2).await;
+    let events_before = count(&db, "formation_events").await;
+
+    // 既に赤の勝ち
+    let (status, page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/readjudicate",
+        &format!("formation={}&decision=red&reason=r&key=same", fid(1).0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("既に「赤の勝ち」です"), "{page}");
+
+    // 進行中
+    let (_, page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/readjudicate",
+        &format!(
+            "formation={}&decision=nullified&reason=r&key=early",
+            fid(2).0
+        ),
+    )
+    .await;
+    assert!(
+        page.contains("まだ終わっていません（現在: in_progress）"),
+        "{page}"
+    );
+    assert_eq!(
+        state_of(&db, 2).await,
+        S::InProgress {
+            host: player(2),
+            room_code: "1234".to_owned()
+        }
+    );
+
+    // 理由なし
+    let (_, page) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/reports/readjudicate",
+        &format!(
+            "formation={}&decision=nullified&reason=&key=noreason",
+            fid(1).0
+        ),
+    )
+    .await;
+    assert!(page.contains("理由を入力してください"), "{page}");
+
+    assert_eq!(count(&db, "formation_events").await, events_before);
+    assert_eq!(count(&db, "admin_actions").await, 0);
+
+    // 本当に変える → 1 行。同じキーでもう一度 → 増えない
+    for attempt in 1..=2 {
+        let (_, page) = post_form(
+            &app,
+            player(ADMIN),
+            "/admin/reports/readjudicate",
+            &format!(
+                "formation={}&decision=nullified&reason=r&key=once",
+                fid(1).0
+            ),
+        )
+        .await;
+        if attempt == 1 {
+            assert!(page.contains("裁定をやり直しました"), "{page}");
+        } else {
+            assert!(page.contains("既に記録されています"), "{page}");
+        }
+    }
+    assert_eq!(count(&db, "formation_events").await, events_before + 1);
+    assert_eq!(count(&db, "admin_actions").await, 1);
+    println!("同じ結果 / 進行中 / 理由なし: 0 行。変更 + 二重送信: 1 行");
+
+    db.done().await;
+}
+
+/// **聞き専・無効試合通報のペナルティも最後の結果に追従する。**
+/// 確定した試合を無効にすると聞き専のペナルティが消え、無効試合を勝敗に戻すと
+/// 原因通報のペナルティが消える。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn penalties_follow_the_final_outcome_of_a_readjudicated_match(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 11).await;
+    let quiet = QuietReportRepository::new(db.pool.clone());
+    let nullified = NullifiedReportRepository::new(db.pool.clone());
+
+    // 試合 1: 赤の勝ちで確定。赤の 3 人（3, 4, 5）が player 6 を聞き専として報告
+    confirmed_formation(&db, 1).await;
+    for who in 3..=5u128 {
+        quiet
+            .report(
+                fid(1),
+                player(who),
+                player(6),
+                at(30),
+                &format!("quiet-{who}"),
+            )
+            .await
+            .unwrap();
+    }
+    let penalised: i64 =
+        sqlx::query_scalar("select count(*) from quiet_report_penalties where formation_id = $1")
+            .bind(fid(1).0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(penalised, 1, "聞き専のペナルティが成立していない");
+    let before = rating_of(&db, player(6)).await;
+
+    // 無効試合にやり直す → 増減もペナルティも消える
+    db.admin
+        .readjudicate(&unite_matchsystem::admin::NewReadjudication {
+            formation_id: fid(1),
+            decision: unite_matchsystem::admin::DisputeDecision::Nullified,
+            reason: "r".to_owned(),
+            actor_discord_user_id: ADMIN_ID,
+            created_at: at(60),
+            idempotency_key: "q".to_owned(),
+        })
+        .await
+        .unwrap();
+    let penalised: i64 =
+        sqlx::query_scalar("select count(*) from quiet_report_penalties where formation_id = $1")
+            .bind(fid(1).0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(penalised, 0, "無効にしたのに聞き専のペナルティが残っている");
+    let after = rating_of(&db, player(6)).await;
+    println!("player 6: 確定時 {before}（勝ち +7、聞き専 -1）→ 無効化後 {after}");
+    assert!((after - 1500.0).abs() < 0.01, "{after}");
+
+    // 試合 2: 無効試合。5 人が player 7 を原因として通報 → -21
+    playable_formation(&db, 2).await;
+    for who in 2..=11u128 {
+        player_report(&db, 2, who, "nullified").await;
+    }
+    db.formations
+        .append_event(
+            fid(2),
+            &NewEvent::new(K::Nullified, None, at(20), "nullified-2")
+                .with_payload(json!({ "outcome": "nullified" })),
+        )
+        .await
+        .unwrap();
+    for who in 2..=6u128 {
+        nullified
+            .report(fid(2), player(who), Some(player(7)), at(30))
+            .await
+            .unwrap();
+    }
+    let culprit = rating_of(&db, player(7)).await;
+    assert!(
+        (culprit - 1479.0).abs() < 0.01,
+        "通報が成立していない: {culprit}"
+    );
+
+    // 青の勝ちにやり直す → 通報のペナルティが消え、勝ちの +7 が入る
+    db.admin
+        .readjudicate(&unite_matchsystem::admin::NewReadjudication {
+            formation_id: fid(2),
+            decision: unite_matchsystem::admin::DisputeDecision::Win(Team::Blue),
+            reason: "r".to_owned(),
+            actor_discord_user_id: ADMIN_ID,
+            created_at: at(60),
+            idempotency_key: "n".to_owned(),
+        })
+        .await
+        .unwrap();
+    let restored = rating_of(&db, player(7)).await;
+    println!("player 7: 無効試合の通報 {culprit} → 青の勝ちにやり直し {restored}");
+    assert!((restored - 1507.0).abs() < 0.01, "{restored}");
+
+    db.done().await;
+}

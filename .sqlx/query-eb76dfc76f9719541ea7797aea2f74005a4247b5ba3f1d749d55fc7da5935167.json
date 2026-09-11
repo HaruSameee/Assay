@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select matches as \"matches!\" from player_current_ratings where player_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "matches!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "matches"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "eb76dfc76f9719541ea7797aea2f74005a4247b5ba3f1d749d55fc7da5935167"
+}

@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select reason, payload from admin_actions where kind = 'match_readjudicated'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "admin_actions",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "f097670272ad02d84401f63d6d97526e27a9d59df400160f7bb98f812f7f0f6d"
+}

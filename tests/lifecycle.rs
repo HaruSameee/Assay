@@ -183,8 +183,9 @@ fn voided_after_code_posted_does_not_raise_the_report_gate() {
         None
     );
 
-    // voided の後に勝敗を確定させることはできない
-    assert!(apply(&voided, &ev(5, K::Confirmed, None)).is_err());
+    // voided の後でも運営の再裁定なら勝敗を確定できる（終端どうしは移れる）。
+    // 係争へ戻すことはできない
+    assert!(apply(&voided, &ev(5, K::Confirmed, None)).is_ok());
     assert!(apply(&voided, &ev(5, K::Disputed, None)).is_err());
 
     // コード開示前の状態にも報告義務は無い
@@ -213,7 +214,12 @@ fn unanimous_invalid_is_distinct_from_no_report_voided() {
         "確定済みでも本人が報告するまではゲートを残す"
     );
     assert_ne!(nullified, S::Voided);
-    assert!(apply(&nullified, &ev(5, K::Confirmed, None)).is_err());
+    // 運営の再裁定で勝敗に変えられる（終端どうしは移れる）。係争には戻れない
+    assert_eq!(
+        apply(&nullified, &ev(5, K::Confirmed, None)).unwrap(),
+        S::Confirmed
+    );
+    assert!(apply(&nullified, &ev(5, K::Disputed, None)).is_err());
 }
 
 #[test]
@@ -284,7 +290,8 @@ fn derive_state_never_fails_on_a_corrupted_log() {
 
     // 検証用の apply は各不正イベントを Err にする。
     // ただし apply 単体は同一キーの重複（#8）を見抜けないので、素朴に適用し続けると
-    // #8 の voided が通り、その後の #9 confirmed が弾かれる。重複排除が DB の unique 制約と
+    // #8 の voided が通る（終端どうしは再裁定で移れるので、#9 の confirmed も通る）。
+    // 本来 #8 は重複で消えるべき行で、重複排除が DB の unique 制約と
     // derive_state の責務である理由がこれ
     let mut state = S::Matched;
     let mut rejected = Vec::new();
@@ -294,7 +301,7 @@ fn derive_state_never_fails_on_a_corrupted_log() {
             Err(_) => rejected.push(index),
         }
     }
-    assert_eq!(rejected, vec![1, 3, 4, 6, 9]);
+    assert_eq!(rejected, vec![1, 3, 4, 6]);
 
     // 導出は止まらず、不正なイベントをスキップして状態と Anomaly を返す
     let (state, anomalies) = derive_state(&events);
