@@ -177,7 +177,7 @@ fn unqueued_page(
          <div class=\"form-header\">\n<p class=\"eyebrow\">Match queue</p>\n\
          <h1 id=\"queue-title\">キューに参加</h1>\n\
          <p class=\"lead\">希望ロールを選びます。</p>\n</div>\n\
-         {reported}{removal}\
+         {stopped}{reported}{removal}\
          <form id=\"queue-form\" class=\"queue-form\" novalidate>\n\
          <fieldset class=\"field\"><legend>ロール希望</legend>\n\
          <p class=\"field-help\">第1希望は必須です。第2・第3希望は必要な分だけ選べます。</p>\n\
@@ -195,12 +195,38 @@ fn unqueued_page(
          <script>{script}</script>\n",
         up = status.up_range,
         down = status.down_range,
+        stopped = matchmaker_notice(status),
         reported = reported_notice(reported),
         breakdown = first_choice_breakdown(status),
         removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
     );
     page_with_styles(viewer, "キュー", &body, QUEUE_STYLES)
+}
+
+/// マッチメイカが止まっているときの告知。**動いていれば何も出さない。**
+///
+/// 稼働時間外に入った人に何も言わないと、待ち時間だけが増えていくのを
+/// 眺めることになる。「いつ動くか」まで書く。
+fn matchmaker_notice(status: &StatusView) -> String {
+    if status.matchmaker_open {
+        return String::new();
+    }
+    let when = status.matchmaker_window.as_deref().map_or_else(
+        || String::from("運営が再開するまでお待ちください。"),
+        |window| {
+            format!(
+                "稼働時間は <strong>{}</strong>（日本時間）です。",
+                escape(window)
+            )
+        },
+    );
+    format!(
+        "<div class=\"notice\" data-notice=\"matchmaker-stopped\" aria-live=\"polite\">\
+         <p><strong>いまマッチメイカは止まっています。</strong>{when}</p>\n\
+         <p class=\"fine-print\">キューに入ったままで構いません。動き出せば\
+         そのまま組まれます。</p></div>\n"
+    )
 }
 
 /// 「運営によってキューから外されました」。**黙って消さない**（そうすると
@@ -253,7 +279,7 @@ fn queued_page(
         "<section id=\"queue-app\" data-view=\"queued\" data-enqueued-at=\"{enqueued}\" aria-labelledby=\"queue-title\">\n\
          <p class=\"eyebrow\">Waiting for match</p>\n<h1 id=\"queue-title\">キュー参加中</h1>\n\
          <p class=\"lead\">マッチ成立までこの画面を開いたまま待機してください。</p>\n\
-         {reported}\
+         {stopped}{reported}\
          <div class=\"metrics\">\n<div class=\"metric\"><span class=\"metric-label\">待ち時間</span><strong id=\"wait-time\" class=\"metric-value\">{waiting}</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">全体でキュー中</span><strong id=\"queue-total\" class=\"metric-value\">{queue_total}人</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">範囲内でキュー中</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
@@ -269,6 +295,7 @@ fn queued_page(
         breakdown = first_choice_breakdown(status),
         up_range = entry.up_range,
         down_range = entry.down_range,
+        stopped = matchmaker_notice(status),
         reported = reported_notice(reported),
         script = QUEUED_SCRIPT,
     );
@@ -586,6 +613,8 @@ mod tests {
             queued: false,
             up_range: 50,
             down_range: 50,
+            matchmaker_open: true,
+            matchmaker_window: None,
             entry: None,
             queue_total: Some(9),
             in_range: Some(4),
@@ -624,6 +653,76 @@ mod tests {
         assert!(rendered.contains("現在この範囲内でキュー中"));
         assert!(rendered.contains("document.hidden"));
         assert!(rendered.contains("setInterval(preview, 10000)"));
+    }
+
+    /// **止まっているときは、その旨と稼働時間を画面に書く。**
+    ///
+    /// 黙っていると、稼働時間外に入った人は待ち時間だけが増えるのを眺めることになる。
+    #[test]
+    fn a_stopped_matchmaker_is_announced_with_its_window() {
+        // 動いていれば何も出さない
+        let running = status();
+        let rendered = queue_page(Viewer::MEMBER, &running, Utc::now(), None, &[]);
+        assert!(!rendered.contains("matchmaker-stopped"), "{rendered}");
+
+        // 稼働時間外なら、理由と枠を出す
+        let closed = StatusView {
+            matchmaker_open: false,
+            matchmaker_window: Some("水金土日 21:00〜翌02:00".to_owned()),
+            ..status()
+        };
+        let rendered = queue_page(Viewer::MEMBER, &closed, Utc::now(), None, &[]);
+        assert!(
+            rendered.contains("いまマッチメイカは止まっています"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("水金土日 21:00〜翌02:00"), "{rendered}");
+        // **キューから出させない。**入ったままでよいと書く
+        assert!(
+            rendered.contains("キューに入ったままで構いません"),
+            "{rendered}"
+        );
+
+        // 手動停止（枠が無い）のときは、枠の代わりに運営を待つよう書く
+        let paused = StatusView {
+            matchmaker_open: false,
+            matchmaker_window: None,
+            ..status()
+        };
+        let rendered = queue_page(Viewer::MEMBER, &paused, Utc::now(), None, &[]);
+        assert!(rendered.contains("運営が再開するまで"), "{rendered}");
+
+        // **キュー中の画面にも出る**（入った後に止まることがある）
+        let mut queued = StatusView {
+            matchmaker_open: false,
+            matchmaker_window: Some("水金土日 21:00〜翌02:00".to_owned()),
+            ..status()
+        };
+        queued.queued = true;
+        queued.entry = Some(EntryView {
+            id: Uuid::from_u128(1),
+            player_id: Uuid::from_u128(2),
+            enqueued_at: "2026-09-12T12:00:00+00:00".into(),
+            updated_at: "2026-09-12T12:00:00+00:00".into(),
+            down_range: 50,
+            up_range: 50,
+            roles: vec![RolePreference {
+                role: "jungle".into(),
+                priority: 1,
+            }],
+        });
+        let rendered = queue_page(
+            Viewer::MEMBER,
+            &queued,
+            Utc.with_ymd_and_hms(2026, 9, 12, 12, 2, 3).unwrap(),
+            None,
+            &[],
+        );
+        assert!(
+            rendered.contains("いまマッチメイカは止まっています"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("data-view=\"queued\""), "{rendered}");
     }
 
     #[test]

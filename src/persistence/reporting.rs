@@ -92,8 +92,10 @@ pub(crate) fn confirmation_from_latest_reports(
 
 /// 閾値に届いた結果があればそれを返す。
 ///
-/// 閾値は 2 人以上を強制してあり、参加者は 10 人しかいないので、同時に 2 つの結果が
-/// 届くことはない（設定の検証は [`crate::lifecycle::LifecycleConfig::parse`] 側）。
+/// **閾値は過半数（6 以上）を強制してある**ので、同時に 2 つの結果が届くことはない
+/// （6 × 2 = 12 > 10）。5 以下を許すと 5 対 5 で両方が届き、ここが返す結果が
+/// 報告の並び順に依存してしまう。検証は
+/// [`crate::lifecycle::LifecycleConfig::parse`] 側。
 fn leading_outcome(evidence: &ReportEvidence, majority_threshold: usize) -> Option<Outcome> {
     let latest = &evidence.latest_for_confirmation;
     latest.iter().map(|vote| vote.outcome).find(|outcome| {
@@ -153,6 +155,57 @@ mod tests {
             first_for_agreement_metric: votes,
             participant_count: 10,
         }
+    }
+
+    /// **閾値を下げると、2 つの結果が同時に閾値へ届きうる。**
+    ///
+    /// 参加者 10 人なので、閾値 5 以下では「赤 5・青 5」のように両方が届く。
+    /// いまの `leading_outcome` は**先に見つかった方**を返すので、
+    /// 結論が報告の並び順で変わってしまう。既定の 7 では起きない
+    /// （7 × 2 = 14 > 10）が、設定は 2〜10 を許している。
+    #[test]
+    fn a_threshold_below_a_majority_would_depend_on_report_order() {
+        use Outcome::Win;
+        let red_first = evidence(&[
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Blue),
+        ]);
+        let blue_first = evidence(&[
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Blue),
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Red),
+            Win(Team::Red),
+        ]);
+        // **下限が 6 なので、5 は設定できない。**仮に渡しても並び順で結論が変わる
+        // ——それをここで記録しておく（設定側で弾く根拠）
+        let a = confirmation_from_latest_reports(&red_first, false, 5);
+        let b = confirmation_from_latest_reports(&blue_first, false, 5);
+        assert_ne!(a.decision, b.decision, "5 以下が危険である根拠");
+
+        // **許される最小の 6 では起きない**（6 × 2 = 12 > 10）
+        let a = confirmation_from_latest_reports(&red_first, true, 6);
+        let b = confirmation_from_latest_reports(&blue_first, true, 6);
+        assert_eq!(a.decision, b.decision);
+        println!("閾値 6: どちらも {:?}", a.decision);
+
+        let a = confirmation_from_latest_reports(&red_first, true, 7);
+        let b = confirmation_from_latest_reports(&blue_first, true, 7);
+        assert_eq!(a.decision, b.decision);
+        println!("閾値 7: どちらも {:?}", a.decision);
     }
 
     fn decide(outcomes: &[Outcome], elapsed: bool) -> Confirmation {
