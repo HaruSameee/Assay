@@ -1165,18 +1165,23 @@ async fn an_elapsed_report_window_is_evaluated_by_the_existing_resume_loop(owner
 
     adapter.resume_unfinished().await.unwrap();
     let (log, state, _) = load(&db, fid(1)).await;
-    assert_eq!(state, S::Confirmed);
-    assert_eq!(log.events.last().unwrap().event.kind, K::Confirmed);
-    assert_eq!(log.events.last().unwrap().payload["outcome"], "red");
+    // **1 人の報告では確定しない。**期限が過ぎたので係争になる（voided でもない:
+    // 報告はあった）。以前はここで「報告した人の中で全員一致」として確定していた
+    assert_eq!(state, S::Disputed, "{:?}", kinds(&log));
+    assert_eq!(log.events.last().unwrap().event.kind, K::Disputed);
     assert!(log.events.iter().all(|event| event.event.kind != K::Voided));
+    assert!(
+        log.events
+            .iter()
+            .all(|event| event.event.kind != K::Confirmed)
+    );
 
-    // **評価器が書いた confirmed が、そのままレート導出の入力になること**（07 §2-2）。
-    // ここを繋いでおかないと、ビュー側のテストは自分で作った payload しか見ていない。
-    // formation(1) は red の平均 μ が 27（表示 1620）、blue が 22（表示 1320）。
-    // params v3: 差に関わらず red は +7、blue は −7（分岐なし）。
+    // **レートは動いていない。**1 票で動かしてはいけない
     let ratings = unite_matchsystem::rating::RatingAdjustmentRepository::new(db.pool.clone());
-    assert_eq!(ratings.display_rating(pid(1)).await.unwrap(), 1507.0);
-    assert_eq!(ratings.display_rating(pid(6)).await.unwrap(), 1493.0);
+    assert_eq!(ratings.display_rating(pid(1)).await.unwrap(), 1500.0);
+    assert_eq!(ratings.display_rating(pid(6)).await.unwrap(), 1500.0);
+    // 過半数がそろえば係争は確定へ進む（tests/match_screen.rs の
+    // `a_dispute_settles_itself_once_a_majority_reports_late`）
 
     db.done().await;
 }
@@ -1845,26 +1850,26 @@ async fn revealing_the_room_code_notifies_the_host_exactly_once(owner: PgPool) {
     db.done().await;
 }
 
-/// **報告期限を 15 分にしても、5 秒スキャンの評価経路はそのまま動く。**
+/// **既定の 30 分の報告期限が、5 秒スキャンの評価経路で評価される。**
 ///
-/// 既定値（`LifecycleConfig::default()`）をそのまま使い、最初の報告を 15 分 + 1 秒前に
-/// 置く。確定条件は変えていないので、
-/// `unanimous && (all_reported || report_window_elapsed)` のまま:
-/// 全員一致していない9人ぶんでも、期限が過ぎていれば確定する。
+/// 既定値（`LifecycleConfig::default()`）をそのまま使い、最初の報告を 30 分 + 1 秒前に
+/// 置く。期限が来ても**確定できるのは過半数（6 人）に届いた結果だけ**で、
+/// 届いていなければ係争になる。
 #[sqlx::test(
     fixtures("reference", "app_role"),
     fixtures("../ops/app_privileges.sql")
 )]
-async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner: PgPool) {
+async fn the_thirty_minute_report_window_is_evaluated_by_the_resume_loop(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let fake = Arc::new(FakeGateway::default());
-    // **既定の設定のまま**（report_window = 15 分）
+    // **既定の設定のまま**（report_window = 30 分、閾値 6 人）
     let lifecycle = LifecycleConfig::default();
-    assert_eq!(lifecycle.report_window, Duration::from_secs(15 * 60));
+    assert_eq!(lifecycle.report_window, Duration::from_secs(30 * 60));
+    assert_eq!(lifecycle.report_majority_threshold, 6);
     let adapter = adapter_with_lifecycle(&db, fake, 1, lifecycle);
 
-    // 最初の報告を 15 分 + 1 秒前に置く
-    let first_report_at = Utc::now() - TimeDelta::seconds(15 * 60 + 1);
+    // 最初の報告を 30 分 + 1 秒前に置く
+    let first_report_at = Utc::now() - TimeDelta::seconds(30 * 60 + 1);
     let started = first_report_at - TimeDelta::seconds(60);
     db.repo.create_formation(&formation(1)).await.unwrap();
     for event in [
@@ -1890,7 +1895,7 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
             .await
             .unwrap();
     }
-    // 全員は報告していないので、期限が来るまでは確定しない
+    // 評価はまだ走っていない（append_report は判定しない）
     let (_, state, _) = load(&db, fid(1)).await;
     assert!(matches!(state, S::InProgress { .. }), "{state:?}");
 
@@ -1898,7 +1903,7 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
     adapter.resume_unfinished().await.unwrap();
 
     let (log, state, _) = load(&db, fid(1)).await;
-    assert_eq!(state, S::Confirmed, "15 分の期限が評価されていない");
+    assert_eq!(state, S::Confirmed, "30 分の期限が評価されていない");
     let confirmed = log
         .events
         .iter()
@@ -1906,14 +1911,44 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
         .find(|stored| stored.event.kind == K::Confirmed)
         .expect("confirmed event");
     assert_eq!(confirmed.payload["outcome"], "red");
+    // 根拠は「期限切れ」ではなく過半数。9 人は 6 人に届いている
     assert_eq!(
-        confirmed.payload["decision_basis"], "report_window_elapsed",
+        confirmed.payload["decision_basis"], "majority_threshold",
         "{:?}",
         confirmed.payload
     );
-    println!("15 分経過で確定: {:?}", confirmed.payload);
+    println!("30 分経過、9 人一致で確定: {:?}", confirmed.payload);
 
-    // **閾値（7人）に届いていれば、割れていても確定する。**
+    // **期限が過ぎても、5 人の一致では確定しない（係争）。**
+    db.repo.create_formation(&formation(4)).await.unwrap();
+    for event in [
+        NewEvent::vc_assigned("3", 301, 302, started, "vc4"),
+        NewEvent::new(K::HostAssigned, Some(pid(1)), started, "host4"),
+        NewEvent::new(K::HostAccepted, Some(pid(1)), started, "accepted4"),
+        NewEvent::code_posted(pid(1), "1234", started, "code4"),
+    ] {
+        db.repo.append_event(fid(4), &event).await.unwrap();
+    }
+    for reporter in 1..=5u128 {
+        db.repo
+            .append_report(&NewReport {
+                formation_id: fid(4),
+                player_id: pid(reporter),
+                reported_at: first_report_at,
+                outcome: Outcome::Win(Team::Blue),
+                raw_result: serde_json::json!({ "source": "test" }),
+                supersedes_id: None,
+                idempotency_key: format!("five-{reporter}"),
+            })
+            .await
+            .unwrap();
+    }
+    adapter.resume_unfinished().await.unwrap();
+    let (_, state, _) = load(&db, fid(4)).await;
+    assert_eq!(state, S::Disputed, "5 人の一致で確定している");
+    println!("30 分経過、5 人一致は確定せず係争");
+
+    // **閾値（6 人）に届いていれば、割れていても確定する。**
     db.repo.create_formation(&formation(2)).await.unwrap();
     for event in [
         NewEvent::vc_assigned("1", 101, 102, started, "vc2"),
@@ -1929,7 +1964,7 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
                 formation_id: fid(2),
                 player_id: pid(reporter),
                 reported_at: first_report_at,
-                // 8 人が red、1 人が blue。8 >= 7 なので red で確定する
+                // 8 人が red、1 人が blue。8 >= 6 なので red で確定する
                 outcome: if reporter == 9 {
                     Outcome::Win(Team::Blue)
                 } else {
@@ -1959,7 +1994,8 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
     );
     println!("8 対 1 は閾値に届くので確定: {:?}", confirmed.payload);
 
-    // **閾値に届かなければ、従来どおり disputed。**6 対 4 はどちらも 7 に足りない
+    // **6 対 4 は 6 人側で確定する**（指示された例: 赤 5 人 + 青側 1 人が赤、青 4 人が青）。
+    // 5 対 5 なら係争
     db.repo.create_formation(&formation(3)).await.unwrap();
     for event in [
         NewEvent::vc_assigned("2", 201, 202, started, "vc3"),
@@ -1988,9 +2024,16 @@ async fn the_fifteen_minute_report_window_is_evaluated_by_the_resume_loop(owner:
             .unwrap();
     }
     adapter.resume_unfinished().await.unwrap();
-    let (_, state, _) = load(&db, fid(3)).await;
-    assert_eq!(state, S::Disputed, "6 対 4 が確定している");
-    println!("6 対 4 は閾値に届かないので disputed のまま");
+    let (log, state, _) = load(&db, fid(3)).await;
+    assert_eq!(state, S::Confirmed, "6 対 4 が確定していない");
+    let confirmed = log
+        .events
+        .iter()
+        .rev()
+        .find(|stored| stored.event.kind == K::Confirmed)
+        .expect("confirmed event");
+    assert_eq!(confirmed.payload["outcome"], "red");
+    println!("6 対 4 は 6 人側（red）で確定。5 対 5 は tests/match_screen.rs で係争になる");
 
     db.done().await;
 }

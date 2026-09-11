@@ -25,23 +25,25 @@ pub const REPORT_MAJORITY_THRESHOLD: &str = "REPORT_MAJORITY_THRESHOLD";
 pub const DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS: u64 = 180;
 /// 既定の候補上限（仕様 §1「上位3人まで」）。
 pub const DEFAULT_HOST_CANDIDATE_LIMIT: u32 = 3;
-/// 既定の報告受付時間（分）。
+/// 既定の報告受付時間（分）。**最初の報告から**数える。
 ///
-/// 30 分から **15 分**へ縮めてある。長いほど「報告しない1人」に9人が待たされる時間が
-/// 伸びる（レートが動くのは確定してから）。**確定条件そのものは変えていない** —
-/// `unanimous && (all_reported || report_window_elapsed)` のままで、window の長さだけ。
-pub const DEFAULT_REPORT_WINDOW_MINUTES: u64 = 15;
+/// 期限が来ても確定はしない——**閾値に届かないまま期限が来たら係争**になるだけ
+/// （`persistence::reporting`）。閾値（6 人）に届けば期限の前に確定するので、
+/// 期限が効くのは「6 人そろわない」試合だけで、その場合は待つのが正しい。
+///
+/// 15 分だと短すぎた。試合開始直後に誤って 1 人が報告すると、まだ試合中の 15 分後に
+/// 期限が来る（本番 2026-09-12 の match-c4389f1e）。試合は 10〜20 分なので、
+/// 最初の報告が開始直後でも、試合が終わって皆が報告するまで待てる長さにする。
+pub const DEFAULT_REPORT_WINDOW_MINUTES: u64 = 30;
 
-/// 既定の早期確定の閾値（人）。
+/// 既定の確定の閾値（人）。**過半数（10 人中 6 人）。**
 ///
-/// 同じ結果に 7 人以上が一致したら、残りを待たずに確定する。**従来の条件は残してある**
-/// ——これは経路の追加であって、全員一致の判定を置き換えるものではない。
+/// 同じ結果に 6 人以上が一致したら確定する。**これが唯一の確定条件**で、
+/// 期限が過ぎても 5 人以下では確定しない（少数の報告での確定を認めない）。
 ///
-/// 7 にした根拠は本番の実測である。2026-09-09 に係争になった 4 件は
-/// 8対2 / 9対1 / 9対1 / 9対1 で、いずれも 1〜2 人が「無効試合」を選んだために
-/// 全員一致が崩れ、15 分待たされたうえで係争になっていた。7 人ならこの 4 件すべてが
-/// 即確定する。
-pub const DEFAULT_REPORT_MAJORITY_THRESHOLD: usize = 7;
+/// 「赤 5 人が赤、青 5 人のうち 1 人が赤・4 人が青」は 6 対 4 で赤の勝ち。
+/// 5 対 5 は係争。以前の 7 だと 6 対 4 が係争になり、運営の手を煩わせていた。
+pub const DEFAULT_REPORT_MAJORITY_THRESHOLD: usize = 6;
 
 /// 早期確定の閾値の下限。**過半数（10 人中 6 人）。**
 ///
@@ -86,7 +88,7 @@ pub struct LifecycleConfig {
 }
 
 impl Default for LifecycleConfig {
-    /// 180秒 / 180秒 / 45分 / 15分 / 上位3人 / 一致7人。
+    /// 180秒 / 180秒 / 45分 / 30分 / 上位3人 / 一致6人（過半数）。
     fn default() -> Self {
         Self {
             host_accept_timeout: Duration::from_secs(DEFAULT_HOST_ACCEPT_TIMEOUT_SECONDS),
@@ -418,9 +420,9 @@ mod tests {
         assert_eq!(config.host_accept_timeout, Duration::from_secs(180));
         assert_eq!(config.code_post_timeout, Duration::from_secs(180));
         assert_eq!(config.no_report_timeout, Duration::from_secs(45 * 60));
-        assert_eq!(config.report_window, Duration::from_secs(15 * 60));
+        assert_eq!(config.report_window, Duration::from_secs(30 * 60));
         assert_eq!(config.max_host_candidates, 3);
-        assert_eq!(config.report_majority_threshold, 7);
+        assert_eq!(config.report_majority_threshold, 6, "過半数");
     }
 
     #[test]

@@ -17,7 +17,8 @@ use super::model::{
     ReportVote, RosterEntry, Team, UnfinishedFormation, VcAssignment,
 };
 use super::reporting::{
-    BASIS_WINDOW_ELAPSED, confirmation_from_latest_reports, first_report_agreement_counts,
+    BASIS_WINDOW_ELAPSED, confirmation_from_latest_reports,
+    confirmation_from_latest_reports_while_disputed, first_report_agreement_counts,
 };
 
 /// 終端状態を作る種別。[`FormationRepository::list_unfinished`] の SQL 側の絞り込みに使う。
@@ -518,16 +519,26 @@ impl FormationRepository {
         let mut tx = self.pool.begin().await?;
         let log = lock_and_load(&mut tx, formation_id).await?;
         let evidence = load_report_evidence(&mut tx, formation_id).await?;
-        if !matches!(log.snapshot().state, FormationState::InProgress { .. }) {
-            tx.commit().await?;
-            return Ok(ReportEvaluation {
-                decision: ReportDecision::Pending,
-                evidence,
-                event: None,
-            });
-        }
-        let confirmation =
-            confirmation_from_latest_reports(&evidence, report_window_elapsed, majority_threshold);
+        // 係争中も、**閾値に届いたときだけ**動かす（遅れて届いた報告で過半数がそろえば、
+        // 運営を待たずに確定する）。終端（confirmed など）に積まれた報告は評価しない
+        let confirmation = match log.snapshot().state {
+            FormationState::InProgress { .. } => confirmation_from_latest_reports(
+                &evidence,
+                report_window_elapsed,
+                majority_threshold,
+            ),
+            FormationState::Disputed => {
+                confirmation_from_latest_reports_while_disputed(&evidence, majority_threshold)
+            }
+            _ => {
+                tx.commit().await?;
+                return Ok(ReportEvaluation {
+                    decision: ReportDecision::Pending,
+                    evidence,
+                    event: None,
+                });
+            }
+        };
         let decision = confirmation.decision;
         // 根拠は判定側が決める（早期確定は `majority_threshold`）。ここで組み立て直さない
         let basis = confirmation.basis.unwrap_or(BASIS_WINDOW_ELAPSED);

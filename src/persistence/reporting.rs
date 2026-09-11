@@ -45,21 +45,25 @@ impl Confirmation {
     }
 }
 
-/// 最新報告だけで確定状態を決める。
+/// 最新報告だけで確定状態を決める。**各プレイヤーの最新の報告**だけを見る（訂正は反映される）。
 ///
-/// 経路は 2 つある。**どちらも「各プレイヤーの最新の報告」だけを見る**（訂正は反映される）。
+/// **結果を決められるのは、同じ結果に majority_threshold 人以上（既定 6 = 過半数）が
+/// 一致したときだけ。**それより少ない人数では、何人が一致していても、期限が過ぎても
+/// 確定しない。
 ///
-/// 1. **全員一致**（従来）: unanimous かつ (all_reported または report_window_elapsed)。
-///    この条件は変えていない。とくに**期限切れ時の判定は従来のまま**で、
-///    「報告した人の中での全員一致」で確定・不一致なら係争になる。
-/// 2. **早期確定**（追加）: 同じ結果に majority_threshold 人以上が一致したら即確定する。
+/// 以前は「期限切れ時に、報告した人の中で全員一致していれば確定」も許していた。
+/// これだと **1 人が試合開始直後に誤って（または故意に）報告し、15 分後の期限で
+/// その 1 票だけで確定する**——本番で実際に起きた（2026-09-12 の match-c4389f1e:
+/// 開始 1 分後の 1 票「青の勝ち」で確定し、その後の 8 票「赤の勝ち」は評価されなかった）。
+/// 少数の報告での確定は、どれだけ待っても認めない。
+///
+/// 1. **全員一致**: 全員が報告し、全員が同じ結果。根拠は `all_players_reported`。
+///    （10 人の一致は必ず閾値も満たすので、2 と結論は変わらない。根拠を分けているだけ）
+/// 2. **過半数**: 同じ結果に閾値以上が一致したら、期限の前後を問わず即確定する。
 ///    勝敗と無効試合を区別しない——非対称にする理由が無い。
-///
-/// 1 を先に見るのは、既存の経路の根拠（all_players_reported / report_window_elapsed）を
-/// 保つためである。全員一致は必ず閾値も満たすので、どちらを先に見ても結論は変わらない。
-///
-/// 早期確定は期限の前後を問わず効く。期限切れ時に閾値へ届いていなければ、
-/// 従来どおり 1 の判定に落ちる。
+/// 3. どの結果も閾値に届かないまま、**全員が報告した**か**期限が過ぎた**ら係争。
+///    全員が報告していれば、待っても届かないので待たない。
+///    それ以外は保留（次の報告で判定し直す）。
 pub(crate) fn confirmation_from_latest_reports(
     evidence: &ReportEvidence,
     report_window_elapsed: bool,
@@ -72,21 +76,32 @@ pub(crate) fn confirmation_from_latest_reports(
     let unanimous = latest.iter().all(|vote| vote.outcome == latest[0].outcome);
     let all_reported = latest.len() == evidence.participant_count;
 
-    if unanimous && (all_reported || report_window_elapsed) {
-        let basis = if all_reported {
-            BASIS_ALL_REPORTED
-        } else {
-            BASIS_WINDOW_ELAPSED
-        };
-        return Confirmation::settled(latest[0].outcome, basis);
+    if unanimous && all_reported {
+        return Confirmation::settled(latest[0].outcome, BASIS_ALL_REPORTED);
     }
     if let Some(outcome) = leading_outcome(evidence, majority_threshold) {
         return Confirmation::settled(outcome, BASIS_MAJORITY);
     }
-    if report_window_elapsed {
+    if all_reported || report_window_elapsed {
         Confirmation::disputed()
     } else {
         Confirmation::pending()
+    }
+}
+
+/// 係争中の試合に報告が増えたときの判定。**過半数に届いたときだけ動かす。**
+///
+/// 係争になった後も、未報告だった人は報告できる（報告ゲートが残っている）。
+/// 「5 人が赤・5 人が未報告」で期限切れ → 係争になった試合に 6 人目が赤で報告
+/// したら、運営を待たずに確定してよい——確定の条件（閾値）はいつ満たしても同じ。
+/// 届いていなければ何も積まない（係争のまま。`disputed` を重ねて積まない）。
+pub(crate) fn confirmation_from_latest_reports_while_disputed(
+    evidence: &ReportEvidence,
+    majority_threshold: usize,
+) -> Confirmation {
+    match leading_outcome(evidence, majority_threshold) {
+        Some(outcome) => Confirmation::settled(outcome, BASIS_MAJORITY),
+        None => Confirmation::pending(),
     }
 }
 
@@ -235,27 +250,28 @@ mod tests {
         assert_eq!(first_report_agreement_counts(&evidence, RED), (1, 2));
     }
 
-    /// 1. **7 人が同一結果 → 即確定。**期限前でも、残り 3 人を待たない。
+    /// 1. **6 人が同一結果 → 即確定。**期限前でも、残り 4 人を待たない。
     #[test]
-    fn seven_matching_reports_settle_immediately() {
-        let confirmation = decide(&same(RED, 7), false);
+    fn six_matching_reports_settle_immediately() {
+        assert_eq!(DEFAULT_REPORT_MAJORITY_THRESHOLD, 6, "既定は過半数");
+        let confirmation = decide(&same(RED, 6), false);
         assert_eq!(confirmation.decision, ReportDecision::Confirmed(RED));
         assert_eq!(confirmation.basis, Some(BASIS_MAJORITY));
     }
 
-    /// 2. **6 人では確定しない。**
+    /// 2. **5 人では確定しない。**
     #[test]
-    fn six_matching_reports_do_not_settle() {
+    fn five_matching_reports_do_not_settle() {
         assert_eq!(
-            decide(&same(RED, 6), false).decision,
+            decide(&same(RED, 5), false).decision,
             ReportDecision::Pending
         );
     }
 
-    /// 3. **7 人が「無効試合」で一致 → nullified。**勝敗と非対称にしない。
+    /// 3. **6 人が「無効試合」で一致 → nullified。**勝敗と非対称にしない。
     #[test]
-    fn seven_nullified_reports_settle_as_nullified() {
-        let confirmation = decide(&same(VOID, 7), false);
+    fn six_nullified_reports_settle_as_nullified() {
+        let confirmation = decide(&same(VOID, 6), false);
         assert_eq!(confirmation.decision, ReportDecision::Nullified);
         assert_eq!(confirmation.basis, Some(BASIS_MAJORITY));
     }
@@ -268,9 +284,26 @@ mod tests {
         assert_eq!(decide(&votes, false).decision, ReportDecision::Pending);
     }
 
-    /// 6. **5 人が割れたまま期限切れ → 従来どおり係争。**期限切れの判定は変えていない。
+    /// 5. **赤 5 人が赤、青 5 人のうち 1 人が赤・4 人が青 → 6 対 4 で赤の勝ち。**
+    ///
+    /// 指示された例そのもの。チームの内訳は関係なく、一致した数だけを数える。
     #[test]
-    fn a_split_at_the_deadline_is_still_disputed() {
+    fn six_against_four_settles_on_the_six() {
+        let mut votes = same(RED, 5); // 赤チーム 5 人
+        votes.push(RED); // 青チームの 1 人
+        votes.extend(same(BLUE, 4)); // 青チームの 4 人
+        let confirmation = decide(&votes, false);
+        assert_eq!(confirmation.decision, ReportDecision::Confirmed(RED));
+        assert_eq!(confirmation.basis, Some(BASIS_MAJORITY));
+        // 全員が報告しても割れたまま（5 対 5）なら、期限を待たずに係争
+        let mut split = same(RED, 5);
+        split.extend(same(BLUE, 5));
+        assert_eq!(decide(&split, false).decision, ReportDecision::Disputed);
+    }
+
+    /// 6. **5 人が割れたまま期限切れ → 係争。**
+    #[test]
+    fn a_split_at_the_deadline_is_disputed() {
         let mut votes = same(RED, 3);
         votes.extend(same(BLUE, 2));
         assert_eq!(decide(&votes, true).decision, ReportDecision::Disputed);
@@ -286,14 +319,60 @@ mod tests {
         assert_eq!(confirmation.basis, Some(BASIS_MAJORITY));
     }
 
-    /// **期限切れ時の従来の判定が回帰していないこと。**
+    /// **期限が過ぎても、閾値に届かない人数では確定しない。**
     ///
-    /// 報告した人の中で全員一致していれば、閾値に届いていなくても確定する。
+    /// 以前は「報告した人の中で全員一致」なら 1 人でも確定していた。本番で
+    /// 開始 1 分後の 1 票が 15 分後に確定し、その後の 8 票が無視された
+    /// （match-c4389f1e）。何人一致していようと、閾値未満なら係争に落とす。
     #[test]
-    fn the_deadline_still_settles_on_unanimity_below_the_threshold() {
-        let confirmation = decide(&same(RED, 5), true);
+    fn the_deadline_never_settles_below_the_threshold() {
+        for count in 1..DEFAULT_REPORT_MAJORITY_THRESHOLD {
+            let confirmation = decide(&same(BLUE, count), true);
+            assert_eq!(
+                confirmation.decision,
+                ReportDecision::Disputed,
+                "{count} 人の一致で確定してはいけない"
+            );
+            assert_eq!(confirmation.basis, None);
+        }
+        // 閾値ちょうどなら期限の前後を問わず確定
+        let confirmation = decide(&same(BLUE, DEFAULT_REPORT_MAJORITY_THRESHOLD), true);
+        assert_eq!(confirmation.decision, ReportDecision::Confirmed(BLUE));
+    }
+
+    /// **本番で起きた事故そのもの。**開始 1 分後の 1 票「青」、期限切れ、その後 8 票「赤」。
+    /// 新しい判定では、1 票の時点では係争にも確定にもならず（期限前は保留、期限後は係争）、
+    /// 9 票そろえば 8 票の赤で確定する。
+    #[test]
+    fn match_c4389f1e_would_have_settled_on_the_eight_red_reports() {
+        // 期限前、1 票だけ → 保留
+        assert_eq!(
+            decide(&same(BLUE, 1), false).decision,
+            ReportDecision::Pending
+        );
+        // 期限後、1 票だけ → 係争（**確定しない**）
+        assert_eq!(
+            decide(&same(BLUE, 1), true).decision,
+            ReportDecision::Disputed
+        );
+        // その後の 8 票（赤）が届いた形: 青 2 / 赤 8
+        let mut votes = same(BLUE, 2);
+        votes.extend(same(RED, 8));
+        let confirmation = decide(&votes, true);
         assert_eq!(confirmation.decision, ReportDecision::Confirmed(RED));
-        assert_eq!(confirmation.basis, Some(BASIS_WINDOW_ELAPSED));
+        // 係争になった後に届いた場合も、閾値に届けば確定する
+        let late = confirmation_from_latest_reports_while_disputed(
+            &evidence(&votes),
+            DEFAULT_REPORT_MAJORITY_THRESHOLD,
+        );
+        assert_eq!(late.decision, ReportDecision::Confirmed(RED));
+        assert_eq!(late.basis, Some(BASIS_MAJORITY));
+        // 届いていなければ係争のまま（何も積まない）
+        let still = confirmation_from_latest_reports_while_disputed(
+            &evidence(&same(RED, 5)),
+            DEFAULT_REPORT_MAJORITY_THRESHOLD,
+        );
+        assert_eq!(still.decision, ReportDecision::Pending);
     }
 
     /// **全員一致は従来の根拠のまま。**閾値も満たすが all_players_reported を保つ。
