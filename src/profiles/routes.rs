@@ -9,7 +9,7 @@
 //! - **公開ビューは [`PublicProfile`] しか返さない。**非公開の担当ロールは型に入らない
 //! - URL に `discord_user_id` を出さない（`players.id` の UUID を使う）
 
-use axum::extract::{FromRef, Path, Query, State};
+use axum::extract::{FromRef, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use axum_extra::extract::cookie::Key;
 use chrono::Utc;
 use serde::Deserialize;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::admin::AdminIds;
@@ -91,7 +91,132 @@ pub fn router(state: ProfileState) -> Router {
         .route("/players/{player_id}", get(show_public))
         .route("/profile", get(show_edit).post(save))
         .route("/profile/blocks", axum::routing::post(change_block))
+        // キャラプールの画像。**このルートだけ本体の上限を広げる**（既定 2MB < 3MB）
+        .route(
+            "/profile/pool-image",
+            axum::routing::post(save_pool_image)
+                .layer(axum::extract::DefaultBodyLimit::max(POOL_UPLOAD_LIMIT)),
+        )
+        .route("/players/{player_id}/pool.png", get(show_pool_image))
         .with_state(state)
+}
+
+// ----------------------------------------------------------------------
+// キャラプールの画像
+// ----------------------------------------------------------------------
+
+/// 受け付けるリクエスト全体の上限。**画像 3MB + multipart の枠**。
+///
+/// axum の既定は 2MB なので、このルートだけ広げる。広げるのはここだけで、
+/// ほかの経路は既定のままにする。
+const POOL_UPLOAD_LIMIT: usize = crate::profiles::pool::MAX_IMAGE_BYTES + 64 * 1024;
+
+/// 画像を保存する。**1 人 1 枚で、貼り直しは置き換え。**
+///
+/// アップロード（PNG）か URL のどちらか一方。どちらも空なら設定を消す。
+async fn save_pool_image(
+    State(app): State<ProfileState>,
+    session: Option<CurrentSession>,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(CurrentSession(current)) = session.as_ref() else {
+        return session_expired();
+    };
+    let player_id = current.player_id;
+    let mut upload: Option<Vec<u8>> = None;
+    let mut url = String::new();
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                // 上限を超えた本体もここに来る。理由は画面の文言で分ける
+                warn!(%error, "could not read the pool image upload");
+                return pool_failure(
+                    &app,
+                    session.as_ref(),
+                    player_id,
+                    "画像を読み取れませんでした。3MB 以内の PNG を選んでください。",
+                )
+                .await;
+            }
+        };
+        match field.name() {
+            Some("image") => match field.bytes().await {
+                Ok(bytes) => upload = Some(bytes.to_vec()),
+                Err(error) => {
+                    warn!(%error, "could not read the pool image bytes");
+                    return pool_failure(
+                        &app,
+                        session.as_ref(),
+                        player_id,
+                        "画像を読み取れませんでした。3MB 以内の PNG を選んでください。",
+                    )
+                    .await;
+                }
+            },
+            Some("image_url") => url = field.text().await.unwrap_or_default(),
+            _ => {}
+        }
+    }
+
+    let image = match crate::profiles::pool::parse(upload.as_deref(), &url) {
+        Ok(image) => image,
+        Err(error) => {
+            return pool_failure(&app, session.as_ref(), player_id, &error.to_string()).await;
+        }
+    };
+    if let Err(error) = app
+        .profiles
+        .save_pool_image(player_id, &image, Utc::now())
+        .await
+    {
+        error!(%error, "could not save the pool image");
+        return internal_error(true);
+    }
+    Redirect::to("/profile?saved=pool").into_response()
+}
+
+/// 受け付けられなかったときに、編集画面へ理由を書いて戻る。
+async fn pool_failure(
+    app: &ProfileState,
+    session: Option<&CurrentSession>,
+    player_id: PlayerId,
+    message: &str,
+) -> Response {
+    render_edit(app, session, player_id, Some(message), false, "").await
+}
+
+/// アップロードされた PNG を配信する。
+///
+/// **content-type を固定し、`nosniff` を付ける。**中身が PNG であることは
+/// 受け取るときに検査しているが、配信側でも型を推測させない。
+async fn show_pool_image(
+    State(app): State<ProfileState>,
+    Path(player_id): Path<String>,
+) -> Response {
+    let Ok(player_id) = Uuid::parse_str(&player_id) else {
+        return not_found(false);
+    };
+    match app.profiles.pool_image_bytes(PlayerId(player_id)).await {
+        Ok(Some(bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CONTENT_DISPOSITION, "inline"),
+                // 貼り直しがすぐ反映されてほしいので長くしない
+                (header::CACHE_CONTROL, "private, max-age=60"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(None) => not_found(false),
+        Err(error) => {
+            error!(%error, "could not read the pool image");
+            internal_error(false)
+        }
+    }
 }
 
 /// 共通ヘッダーの見ている人。読めなければ導線を出さない側へ倒す。

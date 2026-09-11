@@ -28,6 +28,8 @@ pub struct OwnProfile {
     pub main_roles: Vec<String>,
     /// **本人にだけ見せる。**公開ビューには載せない。
     pub main_roles_public: bool,
+    /// いま設定されているキャラプール画像。未設定なら `None`。
+    pub pool_image: Option<crate::profiles::repository::PoolImageSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,13 +147,18 @@ impl ProfileRepository {
         .fetch_optional(&self.pool)
         .await?
         else {
-            return Ok(OwnProfile::default());
+            // プロフィールを 1 度も保存していなくても、画像だけ置いている場合がある
+            return Ok(OwnProfile {
+                pool_image: self.pool_image_source(player_id).await?,
+                ..OwnProfile::default()
+            });
         };
         Ok(OwnProfile {
             bio: row.bio,
             x_id: row.x_id,
             main_roles: serde_json::from_value(row.main_roles).unwrap_or_default(),
             main_roles_public: row.main_roles_public,
+            pool_image: self.pool_image_source(player_id).await?,
         })
     }
 
@@ -197,6 +204,14 @@ impl ProfileRepository {
             // 非公開と未設定はどちらも None（キーごと消える）
             main_roles: (own.main_roles_public && !own.main_roles.is_empty())
                 .then_some(own.main_roles),
+            // **担当ロールの公開設定とは独立。**画像を置いていれば出す
+            pool_image_url: match self.pool_image_source(player_id).await? {
+                Some(PoolImageSource::Uploaded) => {
+                    Some(format!("/players/{}/pool.png", player_id.0))
+                }
+                Some(PoolImageSource::Url(url)) => Some(url),
+                None => None,
+            },
         }))
     }
 
@@ -214,5 +229,88 @@ impl ProfileRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|row| PlayerId(row.id)))
+    }
+}
+
+// ----------------------------------------------------------------------
+// キャラプールの画像
+// ----------------------------------------------------------------------
+//
+// **この表だけ追記専用ではない。**1 人 1 行で、貼り直しは置き換え。
+// `players.trainer_name` と同じ可変の参照データで、試合のログでもレートの
+// 入力でもない（`ops/app_privileges.sql` に update を明示してある）。
+
+/// 公開プロフィールに出すキャラプール画像の出どころ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PoolImageSource {
+    /// アップロードされた PNG。`/players/{id}/pool.png` から配信する。
+    Uploaded,
+    /// 貼り付けられた URL。そのまま `<img src>` に入れる。
+    Url(String),
+}
+
+impl ProfileRepository {
+    /// 画像を置き換える。**追記ではなく 1 行の入れ替え。**
+    pub async fn save_pool_image(
+        &self,
+        player_id: PlayerId,
+        image: &crate::profiles::pool::PoolImage,
+        now: crate::lifecycle::Timestamp,
+    ) -> Result<(), sqlx::Error> {
+        use crate::profiles::pool::PoolImage;
+        let (bytes, url) = match image {
+            PoolImage::Upload(bytes) => (Some(bytes.as_slice()), None),
+            PoolImage::Url(url) => (None, Some(url.as_str())),
+            // 両方 null が「設定していない」。行は残すので DELETE の権限は要らない
+            PoolImage::Cleared => (None, None),
+        };
+        sqlx::query!(
+            "insert into player_pool_images (player_id, image, image_url, updated_at) \
+             values ($1, $2, $3, $4) \
+             on conflict (player_id) do update \
+                 set image = excluded.image, \
+                     image_url = excluded.image_url, \
+                     updated_at = excluded.updated_at",
+            player_id.0,
+            bytes,
+            url,
+            now,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 公開プロフィールに出す出どころ。**バイト列は読まない**（一覧で 3MB を引かない）。
+    pub async fn pool_image_source(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Option<PoolImageSource>, sqlx::Error> {
+        let row = sqlx::query!(
+            "select image_url, image is not null as \"uploaded!\" \
+             from player_pool_images where player_id = $1",
+            player_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|row| match (row.uploaded, row.image_url) {
+            (true, _) => Some(PoolImageSource::Uploaded),
+            (false, Some(url)) => Some(PoolImageSource::Url(url)),
+            (false, None) => None,
+        }))
+    }
+
+    /// 配信するバイト列。**ここだけが 3MB を読む。**
+    pub async fn pool_image_bytes(
+        &self,
+        player_id: PlayerId,
+    ) -> Result<Option<Vec<u8>>, sqlx::Error> {
+        let row = sqlx::query_scalar!(
+            "select image from player_pool_images where player_id = $1",
+            player_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.flatten())
     }
 }

@@ -30,6 +30,8 @@ grant update, delete on roles to assay_app;
 grant update, delete on queue_entries to assay_app;
 -- queue_entry_roles: dependent rows of queue_entries. Role preferences are rewritten in place and cascade away on leave.
 grant update, delete on queue_entry_roles to assay_app;
+-- player_pool_images: mutable reference data, one row per player. Re-uploading replaces the image in place; it is not a log and nothing is derived from it.
+grant update on player_pool_images to assay_app;
 revoke all on all sequences in schema public from public, assay_app;
 grant usage, select on all sequences in schema public to assay_app;
 

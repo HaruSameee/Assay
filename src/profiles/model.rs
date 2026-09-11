@@ -186,6 +186,13 @@ pub struct PublicProfile {
     /// 未設定と非公開は、どちらもキーが無い状態で区別できない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub main_roles: Option<Vec<String>>,
+    /// キャラプール画像の URL。未設定なら**キーごと消える**。
+    ///
+    /// アップロードした場合は `/players/{id}/pool.png`、URL を貼った場合は
+    /// そのままの URL。**担当ロールの公開設定とは独立**で、画像を置いた人は出る
+    /// （ロールを隠したい人と、絵を見せたい人は別）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_image_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -304,6 +311,7 @@ mod tests {
             bio: String::new(),
             x_id: None,
             main_roles: None,
+            pool_image_url: None,
         };
         let hidden = serde_json::to_value(&base).unwrap();
         assert!(hidden.get("main_roles").is_none(), "{hidden}");

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into player_pool_images (player_id, image, image_url, updated_at) values ($1, $2, $3, $4) on conflict (player_id) do update set image = excluded.image, image_url = excluded.image_url, updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "70eb01278afe03edfccdc8a81525cb72972df78140b4f4897fe85c635b63b879"
+}

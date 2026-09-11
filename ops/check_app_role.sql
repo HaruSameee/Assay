@@ -2,6 +2,8 @@
 with tables as (
     select c.oid, c.relname,
         c.relname in ('players', 'roles', 'queue_entries', 'queue_entry_roles') as mutable,
+        -- Replace-in-place: one row per owner, rewritten on save. UPDATE only; never DELETE.
+        c.relname in ('player_pool_images') as replace_in_place,
         has_table_privilege('assay_app', c.oid, 'SELECT') as can_select,
         has_table_privilege('assay_app', c.oid, 'INSERT') as can_insert,
         has_table_privilege('assay_app', c.oid, 'UPDATE') as can_update,
@@ -23,7 +25,9 @@ with tables as (
 select relname::text as violation from tables
 where not can_select or not can_insert or can_truncate
     or (mutable and (not can_update or not can_delete or protected))
-    or (not mutable and (can_update_column or can_delete or not protected))
+    or (replace_in_place and (not can_update or can_delete or protected))
+    or (not mutable and not replace_in_place
+        and (can_update_column or can_delete or not protected))
 union all
 select 'assay_app: elevated role or schema ownership'
 from pg_roles r where r.rolname = 'assay_app'
