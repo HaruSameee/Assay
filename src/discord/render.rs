@@ -17,7 +17,7 @@ use serenity::model::id::UserId;
 
 use crate::host::HostResources;
 use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
-use crate::matchmaker::{MatchmakerSummary, RunOutcome, ScanDirection};
+use crate::matchmaker::{MatchmakerSummary, RunOutcome};
 use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
 
 use super::gateway::OutgoingMessage;
@@ -111,16 +111,15 @@ fn plain_discord_text(value: &str) -> String {
 }
 
 /// 成立があった1回分のマッチメイカ運用ログ。
+///
+/// **走査の方向（上から / 下から）は出さない。**周期が読めると「下からの回」を
+/// 狙ってキューに入れてしまう。サーバのログ（journal）にだけ残る。
 pub fn matchmaker_run_log(outcome: &RunOutcome, at: Timestamp) -> OutgoingMessage {
     let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
     let mut content = format!(
-        "**マッチメイカ実行 {} JST**\nキュー中: {}人\n走査: {}\n成立: {}組\n",
+        "**マッチメイカ実行 {} JST**\nキュー中: {}人\n成立: {}組\n",
         at.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
         outcome.candidates,
-        match outcome.direction {
-            ScanDirection::TopDown => "上から（高レート帯を先に組む回）",
-            ScanDirection::BottomUp => "下から（低レート帯を先に組む回）",
-        },
         outcome.assignments.len()
     );
     for assigned in &outcome.assignments {
@@ -822,7 +821,7 @@ mod tests {
     fn matchmaker_logs_use_aggregate_selection_metrics_without_player_details() {
         use crate::matchmaker::{
             ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerSummary,
-            RecentCompletionCounts, RunOutcome, SelectionMetrics,
+            RecentCompletionCounts, RunOutcome, ScanDirection, SelectionMetrics,
         };
         use crate::persistence::VcAssignment;
 
@@ -894,12 +893,11 @@ mod tests {
         );
         assert!(run.content.contains("vc3 (<#31> / <#32>)"));
         assert!(run.content.contains("レート帯"));
-        assert!(
-            run.content
-                .contains("走査: 下から（低レート帯を先に組む回）"),
-            "{}",
-            run.content
-        );
+        // **走査の方向は出さない。**周期が読めると「下からの回」を狙って
+        // キューに入れてしまう（select.rs の ScanDirection を見よ）
+        for hidden in ["走査", "上から", "下から", "top_down", "bottom_up"] {
+            assert!(!run.content.contains(hidden), "{hidden}: {}", run.content);
+        }
         assert!(
             run.content
                 .contains("希望順位: 第1 7人 / 第2 2人 / 第3 1人")
@@ -933,7 +931,7 @@ mod tests {
     fn dump_discord_tuning_messages_for_review() {
         use crate::matchmaker::{
             ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerSummary,
-            RecentCompletionCounts, RunOutcome, SelectionMetrics,
+            RecentCompletionCounts, RunOutcome, ScanDirection, SelectionMetrics,
         };
         use crate::persistence::VcAssignment;
 

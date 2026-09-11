@@ -357,7 +357,7 @@ async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
             unmatched: 9,
             longest_unmatched_wait_seconds: Some(600),
             paused: false,
-            direction: ScanDirection::for_scan(at(600), db.matchmaker(2).interval()),
+            direction: outcome.direction, // 方向はランダム（どちらでも同じ結果）
         }
     );
     assert_eq!(count(&db, "formations").await, 0);
@@ -531,13 +531,13 @@ async fn twenty_queued_players_form_two_matches_in_one_run(owner: PgPool) {
 }
 
 // ----------------------------------------------------------------------
-// 走査の方向（1 回おきに下から）
+// 走査の方向（ランダムに下から）
 // ----------------------------------------------------------------------
 
 /// 5 人ずつ 3 段（+110 / +75 / +50）。幅 50 なので上 2 段か下 2 段しか組めない。
-/// **上からの回は上 2 段、下からの回は下 2 段が組まれ、方向は 3 分ごとに入れ替わる。**
+/// **上からの回は上 2 段、下からの回は下 2 段が組まれる。**本番と同じ DB 経路で確かめる。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn every_other_run_scans_from_the_bottom_band(owner: PgPool) {
+async fn a_bottom_up_run_forms_the_lowest_band_first(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 15).await;
     // player 1〜5 が最上段、6〜10 が中段、11〜15 が最下段
@@ -551,19 +551,12 @@ async fn every_other_run_scans_from_the_bottom_band(owner: PgPool) {
     }
     enqueue_full_rosters(&db, 15, at(0)).await;
     let matchmaker = db.matchmaker(3);
-    let interval = matchmaker.interval().as_secs() as i64;
 
-    // 連続する 2 ティックで方向が違うことを時計から確かめる
-    let (first, second) = (at(600), at(600 + interval));
-    let first_direction = ScanDirection::for_scan(first, matchmaker.interval());
-    assert_ne!(
-        first_direction,
-        ScanDirection::for_scan(second, matchmaker.interval()),
-        "隣のティックは必ず逆方向"
-    );
-
-    let outcome = matchmaker.run_once(first).await.unwrap();
-    assert_eq!(outcome.direction, first_direction);
+    let outcome = matchmaker
+        .run_once_scanning(at(600), ScanDirection::BottomUp)
+        .await
+        .unwrap();
+    assert_eq!(outcome.direction, ScanDirection::BottomUp);
     assert_eq!(outcome.created.len(), 1, "{outcome:?}");
     let roster = db.formations.load_roster(outcome.created[0]).await.unwrap();
     let mut ids: Vec<u128> = roster
@@ -571,18 +564,40 @@ async fn every_other_run_scans_from_the_bottom_band(owner: PgPool) {
         .map(|entry| entry.player_id.0.as_u128())
         .collect();
     ids.sort_unstable();
-    let (expected, band): (Vec<u128>, &str) = match first_direction {
-        ScanDirection::TopDown => ((1..=10).collect(), "上 2 段"),
-        ScanDirection::BottomUp => ((6..=15).collect(), "下 2 段"),
-    };
-    assert_eq!(ids, expected, "{first_direction:?} の回は{band}が組まれる");
-    println!("{} の回 → {band}（{ids:?}）", first_direction.as_str());
+    assert_eq!(ids, (6..=15).collect::<Vec<u128>>(), "下からの回は下 2 段");
+    println!("下からの回 → 下 2 段（{ids:?}）");
 
-    // 残った 5 人は次の回でも組めない（幅 50 に 10 人いない）が、方向は逆になる
-    let outcome = matchmaker.run_once(second).await.unwrap();
-    assert_ne!(outcome.direction, first_direction);
+    // 残った最上段の 5 人は、上からでも組めない（幅 50 に 10 人いない）
+    let outcome = matchmaker
+        .run_once_scanning(at(780), ScanDirection::TopDown)
+        .await
+        .unwrap();
     assert!(outcome.created.is_empty());
     assert_eq!(count(&db, "queue_entries").await, 5);
+    db.done().await;
+}
+
+/// **本番の入口（`run_once`）は方向をランダムに引く。**時刻にも回数にも依らない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_production_entry_point_draws_the_direction_at_random(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    // 10 人揃わないので何も組まれず、方向だけが返る
+    seed_players(&db, 3).await;
+    enqueue_full_rosters(&db, 3, at(0)).await;
+    let matchmaker = db.matchmaker(1);
+
+    // **同じ時刻**で何度も呼んで、両方の方向が出る（時刻で決まっていない）
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..60 {
+        let outcome = matchmaker.run_once(at(600)).await.unwrap();
+        assert!(outcome.created.is_empty());
+        seen.insert(outcome.direction.as_str());
+        if seen.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 2, "同じ時刻でも両方の方向が出るはず: {seen:?}");
+    println!("同じ時刻で 60 回以内に両方の方向が出た: {seen:?}");
     db.done().await;
 }
 
