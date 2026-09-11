@@ -43,8 +43,13 @@ pub const DEFAULT_REPORT_WINDOW_MINUTES: u64 = 15;
 /// 即確定する。
 pub const DEFAULT_REPORT_MAJORITY_THRESHOLD: usize = 7;
 
-/// 早期確定の閾値の下限。1 人で確定できてしまうと報告の意味が無くなる。
-const MIN_REPORT_MAJORITY_THRESHOLD: usize = 2;
+/// 早期確定の閾値の下限。**過半数（10 人中 6 人）。**
+///
+/// 5 以下を許すと、10 人しかいないので**2 つの結果が同時に閾値へ届く**
+/// （5 対 5 なら赤も青も 5 票）。そのとき `leading_outcome` は先に見つけた方を
+/// 返すので、同じ報告でも並び順で結論が変わる。6 以上なら 6 × 2 = 12 > 10 で、
+/// 2 つが同時に届くことはない。
+const MIN_REPORT_MAJORITY_THRESHOLD: usize = crate::matchmaker::MATCH_SIZE / 2 + 1;
 /// 早期確定の閾値の上限。試合の人数（10 人）を超える閾値は決して満たせない。
 const MAX_REPORT_MAJORITY_THRESHOLD: usize = 10;
 
@@ -353,9 +358,12 @@ mod tests {
     }
 
     /// 早期確定の閾値は環境変数で変えられる。**当日の校正対象。**
+    ///
+    /// **下限は過半数（6）。**5 以下は 5 対 5 で 2 つの結果が同時に届き、
+    /// 結論が報告の並び順に依存してしまうので設定させない。
     #[test]
     fn the_majority_threshold_comes_from_the_environment() {
-        for raw in ["2", "6", "8", "10"] {
+        for raw in ["6", "7", "8", "10"] {
             let config = LifecycleConfig::parse(None, None, None, Some(raw)).unwrap();
             assert_eq!(
                 config.report_majority_threshold,
@@ -367,6 +375,28 @@ mod tests {
             assert_eq!(config.host_accept_timeout, defaults.host_accept_timeout);
             assert_eq!(config.max_host_candidates, defaults.max_host_candidates);
         }
+    }
+
+    /// **過半数に満たない閾値は設定できない。**
+    ///
+    /// 10 人しかいないので、5 以下だと 5 対 5 で赤も青も閾値に届く。
+    /// どちらを採るかが報告の並び順で決まってしまうため、設定の時点で断る。
+    #[test]
+    fn a_threshold_below_a_majority_is_refused() {
+        for raw in ["1", "2", "3", "4", "5"] {
+            let error = LifecycleConfig::parse(None, None, None, Some(raw)).unwrap_err();
+            assert!(
+                error.to_string().contains(REPORT_MAJORITY_THRESHOLD),
+                "{raw} が通ってしまう"
+            );
+        }
+        // 6（＝10 人の過半数）から通る
+        assert_eq!(
+            LifecycleConfig::parse(None, None, None, Some("6"))
+                .unwrap()
+                .report_majority_threshold,
+            6
+        );
     }
 
     /// 報告の受付時間は環境変数で変えられる。**当日に戻せること**が目的。
