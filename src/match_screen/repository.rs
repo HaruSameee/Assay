@@ -42,6 +42,8 @@ pub struct MatchPlayer {
     pub discord_name: Option<String>,
     /// アバターの URL。**未設定でも既定アバターの URL が入る。**
     pub avatar_url: String,
+    /// 成立時点で配信中と申告していたか。**相手チームにも見せる**（配信の明示が目的）。
+    pub streaming: bool,
 }
 
 /// `vc_assigned` から読んだ VC の組。
@@ -145,7 +147,7 @@ impl MatchRepository {
                     (select s.avatar_hash from player_discord_snapshots s \
                      where s.player_id = fp.player_id order by s.id desc limit 1) as avatar_hash, \
                     r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", \
-                    v.rating as \"rating!\" \
+                    v.rating as \"rating!\", fp.streaming \
              from formation_players fp \
              join players p on p.id = fp.player_id \
              join roles r on r.id = fp.role \
@@ -170,6 +172,7 @@ impl MatchRepository {
                     row.discord_user_id,
                     row.avatar_hash.as_deref(),
                 ),
+                streaming: row.streaming,
             })
             .collect())
     }

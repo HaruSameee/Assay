@@ -151,6 +151,8 @@ pub struct NewFormationPlayer {
     pub role: String,
     /// フレックスで埋められたか。
     pub role_was_flexed: bool,
+    /// 成立時点で配信中と申告していたか（`queue_entries.streaming` のスナップショット）。
+    pub streaming: bool,
     /// マッチング時点の μ。
     pub mu_at_match: f64,
     /// マッチング時点の σ。

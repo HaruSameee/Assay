@@ -157,6 +157,7 @@ fn formation(n: u128) -> NewFormation {
                 team: if i <= 5 { Team::Red } else { Team::Blue },
                 role: ROLES[(i as usize - 1) % 5].to_owned(),
                 role_was_flexed: false,
+                streaming: false,
                 mu_at_match: 25.0,
                 sigma_at_match: 8.33,
             })
@@ -365,6 +366,57 @@ async fn each_side_only_sees_its_own_roles(owner: PgPool) {
         .map(|entry| entry["trainer_name"].as_str().unwrap())
         .collect();
     assert_eq!(names.len(), 5);
+    db.done().await;
+}
+
+/// **配信中の印は両チームに出る。**配信していることの明示が目的なので、相手にも見せる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_streaming_player_is_marked_for_both_teams(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    // player 2（red）だけが配信中
+    let mut formation = formation(1);
+    formation.players[1].streaming = true;
+    db.formations.create_formation(&formation).await.unwrap();
+    let app = db.router();
+
+    // 味方（red の player 1）から
+    let (_, red) = get_json(&app, 1, player(1)).await;
+    let teammate = red["teammates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["player_id"] == json!(player(2).0.to_string()))
+        .expect("player 2");
+    assert_eq!(teammate["streaming"], json!(true));
+    let others = red["teammates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["streaming"] == json!(true))
+        .count();
+    assert_eq!(others, 1, "配信中は 1 人だけ");
+
+    // **相手（blue の player 6）からも見える**
+    let (_, blue) = get_json(&app, 1, player(6)).await;
+    let opponent = blue["opponents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["player_id"] == json!(player(2).0.to_string()))
+        .expect("player 2");
+    assert_eq!(opponent["streaming"], json!(true));
+    assert!(opponent.get("role").is_none(), "ロールは相変わらず出ない");
+
+    // HTML の印。両チームの画面に 1 つずつ
+    for who in [1u128, 6] {
+        let (_, html) = get_html(&app, 1, player(who)).await;
+        assert_eq!(html.matches("class=\"stream-tag\"").count(), 1, "{html}");
+        assert!(html.contains("配信中"), "{html}");
+    }
+    println!("player 2 の「配信中」が味方にも相手にも 1 つずつ出る");
     db.done().await;
 }
 

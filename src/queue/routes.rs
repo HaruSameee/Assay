@@ -121,6 +121,9 @@ struct JoinRequest {
     /// 希望ロール。1〜3、優先度付き。
     #[serde(default)]
     roles: Vec<RolePreference>,
+    /// 配信中として申告するか（チェックボックス 1 つ）。
+    #[serde(default)]
+    streaming: bool,
 }
 
 /// 登録ゲートの理由。**報告ゲートとは別のフィールドで返す。**
@@ -195,6 +198,8 @@ pub(super) struct EntryView {
     pub(super) up_range: i32,
     /// 希望ロール。`priority` の昇順。
     pub(super) roles: Vec<RolePreference>,
+    /// 配信中として申告しているか。
+    pub(super) streaming: bool,
 }
 
 impl From<QueueEntry> for EntryView {
@@ -207,6 +212,7 @@ impl From<QueueEntry> for EntryView {
             down_range: entry.down_range,
             up_range: entry.up_range,
             roles: entry.roles,
+            streaming: entry.streaming,
         }
     }
 }
@@ -399,10 +405,11 @@ async fn join_queue(
     };
 
     // 検証は DB を触る前に済ませる（純粋関数）
-    let validated = match validate_request(&request.roles) {
+    let mut validated = match validate_request(&request.roles) {
         Ok(validated) => validated,
         Err(error) => return invalid_request(&error),
     };
+    validated.streaming = request.streaming;
 
     // 3つのゲート。どれかに引っかかっていれば投入しない
     let eligibility = match app.registration.queue_eligibility(player_id).await {

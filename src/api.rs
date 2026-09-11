@@ -67,6 +67,9 @@ pub struct PlayerSpec {
     /// フレックスで埋められたか。無ければ false。
     #[serde(default)]
     pub role_was_flexed: bool,
+    /// 配信中として申告しているか。無ければ false。
+    #[serde(default)]
+    pub streaming: bool,
     /// マッチング時点の μ。無ければ 25.0。
     #[serde(default = "default_mu")]
     pub mu_at_match: f64,
@@ -191,6 +194,7 @@ async fn create_formation(
             team,
             role: spec.role.clone(),
             role_was_flexed: spec.role_was_flexed,
+            streaming: spec.streaming,
             mu_at_match: spec.mu_at_match,
             sigma_at_match: spec.sigma_at_match,
         });

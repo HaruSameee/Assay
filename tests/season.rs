@@ -154,6 +154,7 @@ fn formation_at(n: u128, created_at: Timestamp) -> NewFormation {
                 team: if i <= 5 { Team::Red } else { Team::Blue },
                 role: ROLES[(i as usize - 1) % ROLES.len()].to_owned(),
                 role_was_flexed: false,
+                streaming: false,
                 mu_at_match: 25.0,
                 sigma_at_match: 500.0 / 60.0,
             })
@@ -354,6 +355,7 @@ async fn a_boundary_moves_the_origin_without_deleting_anything(owner: PgPool) {
                     role: "jungle".to_owned(),
                     priority: 1,
                 }],
+                streaming: false,
             },
             after(0),
         )

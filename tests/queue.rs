@@ -246,6 +246,7 @@ fn formation(n: u128, subject: PlayerId) -> NewFormation {
             team: if i <= 5 { Team::Red } else { Team::Blue },
             role: ROLES[(i as usize - 1) % 5].to_owned(),
             role_was_flexed: false,
+            streaming: false,
             mu_at_match: 25.0,
             sigma_at_match: 8.33,
         })
@@ -257,6 +258,7 @@ fn formation(n: u128, subject: PlayerId) -> NewFormation {
             team: Team::Red,
             role: ROLES[0].to_owned(),
             role_was_flexed: false,
+            streaming: false,
             mu_at_match: 25.0,
             sigma_at_match: 8.33,
         },
@@ -918,7 +920,10 @@ async fn queueing_again_updates_the_settings_without_resetting_the_wait(owner: P
 async fn a_failed_update_leaves_the_entry_and_its_roles_untouched(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     let me = player(1);
-    let request = |roles: Vec<RolePreference>| QueueRequest { roles };
+    let request = |roles: Vec<RolePreference>| QueueRequest {
+        roles,
+        streaming: false,
+    };
 
     db.queue
         .enqueue(
@@ -1594,5 +1599,63 @@ async fn the_report_gate_opens_within_the_same_request(owner: PgPool) {
     println!("報告の追記: {append_elapsed:?}");
     println!("報告 → キュー再投入が通るまで: {gate_elapsed:?}");
     println!("この時点の formation の状態: {state:?}（未確定）");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 配信中の申告
+// ----------------------------------------------------------------------
+
+/// **チェックボックス 1 つで「配信中」を申告できる。**未指定は false。
+/// 設定の更新で付け外しでき、キュー画面にも出る。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_player_can_declare_that_they_are_streaming(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let me = player(1);
+    register(&db, me, Rank::Legend).await;
+
+    // 画面にチェックボックスがある
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(page.contains("id=\"streaming\""), "{page}");
+    assert!(page.contains("配信中（YouTube など）"), "{page}");
+
+    // 指定しなければ false
+    let (status, joined) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
+    assert_eq!(status, StatusCode::OK, "{joined}");
+    assert_eq!(joined["entry"]["streaming"], false);
+
+    // 設定の更新で申告する
+    let (status, updated) = post_queue(
+        &app,
+        me,
+        json!({ "roles": [wish("jungle", 1)], "streaming": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["entry"]["streaming"], true);
+    let stored: bool =
+        sqlx::query_scalar("select streaming from queue_entries where player_id = $1")
+            .bind(me.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(stored, "DB に書かれていない");
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(page.contains("配信中として登録しています"), "{page}");
+
+    // 外すこともできる
+    let (_, cleared) = post_queue(
+        &app,
+        me,
+        json!({ "roles": [wish("jungle", 1)], "streaming": false }),
+    )
+    .await;
+    assert_eq!(cleared["entry"]["streaming"], false);
+    println!("配信中: 未指定 false → true → false。画面にも出る");
+
     db.done().await;
 }

@@ -145,6 +145,7 @@ async fn enqueue_full_rosters(db: &AppDb, count: u128, enqueued_at: Timestamp) {
                         role: role.to_owned(),
                         priority: 1,
                     }],
+                    streaming: false,
                 },
                 enqueued_at,
             )
@@ -180,6 +181,7 @@ async fn create_formation(db: &AppDb, formation: u128, created_at: Timestamp) {
             team: if n <= 5 { Team::Red } else { Team::Blue },
             role: ROLES[(n as usize - 1) % ROLES.len()].to_owned(),
             role_was_flexed: false,
+            streaming: false,
             mu_at_match: 25.0,
             sigma_at_match: 8.33,
         })
@@ -339,6 +341,45 @@ async fn a_run_forms_a_match_assigns_a_vc_and_clears_the_queue(owner: PgPool) {
     db.done().await;
 }
 
+/// **配信中の申告は成立時に formation へ写る。**キューの行は消えるので、ここで写さないと失われる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_streaming_flag_is_copied_from_the_queue_into_the_formation(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    enqueue_full_rosters(&db, 10, at(0)).await;
+    // player 3 と 7 だけが配信中と申告（設定の更新として上書き）
+    for n in [3u128, 7] {
+        db.queue
+            .enqueue(
+                player(n),
+                &QueueRequest {
+                    roles: vec![RolePreference {
+                        role: ROLES[(n as usize - 1) % ROLES.len()].to_owned(),
+                        priority: 1,
+                    }],
+                    streaming: true,
+                },
+                at(0),
+            )
+            .await
+            .expect("update");
+    }
+
+    let outcome = db.matchmaker(2).run_once(at(600)).await.unwrap();
+    assert_eq!(outcome.created.len(), 1);
+    let streaming: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "select player_id from formation_players where formation_id = $1 and streaming order by player_id",
+    )
+    .bind(outcome.created[0].0)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(streaming, vec![player(3).0, player(7).0]);
+    assert_eq!(count(&db, "queue_entries").await, 0);
+    println!("配信中の 2 人が formation_players.streaming に写った: {streaming:?}");
+    db.done().await;
+}
+
 /// 10 人揃わなければ何も起きない。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
 async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
@@ -389,6 +430,7 @@ async fn summary_uses_the_persisted_queue_and_last_fifteen_minutes(owner: PgPool
                         role: role.to_owned(),
                         priority: 1,
                     }],
+                    streaming: false,
                 },
                 enqueued_at,
             )
@@ -440,6 +482,7 @@ async fn summary_includes_operational_state_and_recent_outcomes(owner: PgPool) {
                         role: role.to_owned(),
                         priority: 1,
                     }],
+                    streaming: false,
                 },
                 enqueued_at,
             )
@@ -706,6 +749,7 @@ async fn flex_compensation_is_derived_from_the_last_formation(owner: PgPool) {
             team: if n <= 5 { Team::Red } else { Team::Blue },
             role: ROLES[(n as usize - 1) % ROLES.len()].to_owned(),
             role_was_flexed: player(n) == compensated,
+            streaming: false,
             mu_at_match: 25.0,
             sigma_at_match: 8.33,
         })
@@ -758,6 +802,7 @@ async fn flex_compensation_is_derived_from_the_last_formation(owner: PgPool) {
                             priority: index as i16 + 1,
                         })
                         .collect(),
+                    streaming: false,
                 },
                 at(0),
             )

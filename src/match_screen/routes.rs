@@ -700,6 +700,7 @@ async fn build_view(
                 avatar_url: entry.avatar_url.clone(),
                 is_me: entry.player_id == me,
                 is_host,
+                streaming: entry.streaming,
             });
         } else {
             // ロールを写す場所が無い。相手の構成は部屋に入るまで分からない
@@ -710,6 +711,7 @@ async fn build_view(
                 discord_name: entry.discord_name.clone(),
                 avatar_url: entry.avatar_url.clone(),
                 is_host,
+                streaming: entry.streaming,
             });
         }
     }

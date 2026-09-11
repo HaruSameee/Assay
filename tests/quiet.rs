@@ -156,6 +156,7 @@ fn formation(n: u128) -> NewFormation {
                 team: if i <= 5 { Team::Red } else { Team::Blue },
                 role: ROLES[(i as usize - 1) % 5].to_owned(),
                 role_was_flexed: false,
+                streaming: false,
                 mu_at_match: 25.0,
                 sigma_at_match: 8.33,
             })

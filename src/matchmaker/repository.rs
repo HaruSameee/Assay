@@ -347,7 +347,10 @@ impl MatchmakerRepository {
             occupied.insert(assignment.label.clone());
 
             let formation_id = next_id();
-            let formation = to_new_formation(formation_id, now, proposal);
+            // 配信中の申告は**キューの行から formation へ写す**（同じトランザクション。
+            // 直後にキューの行は消えるので、ここで写さないと失われる）
+            let streaming = streaming_players(&mut tx, proposal).await?;
+            let formation = to_new_formation(formation_id, now, proposal, &streaming);
             crate::persistence::repository::insert_formation(&mut tx, &formation).await?;
 
             // 新しい formation なのでイベントは空。apply() を通して検証してから追記する
@@ -663,7 +666,15 @@ pub fn teams_are_swapped(formation_id: FormationId) -> bool {
 ///
 /// **red / blue のラベルはここで決まる。**探索の出力は「最高レートの人が red」に
 /// 固定されているので、`formation_id` から導いた向きで入れ替える。
-fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -> NewFormation {
+///
+/// `streaming` は成立時点で配信中と申告している人（`queue_entries.streaming`）。
+/// 選抜には関与しないので `ProposedPlayer` には持たせず、ここで写すだけ。
+fn to_new_formation(
+    id: FormationId,
+    now: Timestamp,
+    proposal: &ProposedMatch,
+    streaming: &HashSet<PlayerId>,
+) -> NewFormation {
     let swapped = teams_are_swapped(id);
     NewFormation {
         id,
@@ -682,12 +693,32 @@ fn to_new_formation(id: FormationId, now: Timestamp, proposal: &ProposedMatch) -
                 },
                 role: player.role.clone(),
                 role_was_flexed: player.role_was_flexed,
+                streaming: streaming.contains(&player.player_id),
                 // 凍結値は内部スケール（rating::DISPLAY_SCALE で割る）
                 mu_at_match: player.rating / DISPLAY_SCALE,
                 sigma_at_match: player.sigma / DISPLAY_SCALE,
             })
             .collect(),
     }
+}
+
+/// 成立した 10 人のうち、配信中と申告している人。**キューの行が消える前に読む。**
+async fn streaming_players(
+    conn: &mut PgConnection,
+    proposal: &ProposedMatch,
+) -> Result<HashSet<PlayerId>, sqlx::Error> {
+    let ids: Vec<uuid::Uuid> = proposal
+        .players
+        .iter()
+        .map(|player| player.player_id.0)
+        .collect();
+    let rows = sqlx::query_scalar!(
+        "select player_id from queue_entries where player_id = any($1) and streaming",
+        &ids,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().map(PlayerId).collect())
 }
 
 /// キュー中の全員を、マッチメイカの入力の形で読む。
@@ -891,8 +922,8 @@ mod tests {
             .find(|id| teams_are_swapped(*id))
             .expect("入れ替える ID");
 
-        let a = to_new_formation(plain, now(), &proposal);
-        let b = to_new_formation(swapped, now(), &proposal);
+        let a = to_new_formation(plain, now(), &proposal, &HashSet::new());
+        let b = to_new_formation(swapped, now(), &proposal, &HashSet::new());
 
         // 凍結値は 1 ミリも動かない
         for (left, right) in a.players.iter().zip(&b.players) {
@@ -929,7 +960,7 @@ mod tests {
         for trial in 0..20u64 {
             let proposal = select_matches(&roster(trial), now()).remove(0);
             let id = formation_id(trial);
-            let formation = to_new_formation(id, now(), &proposal);
+            let formation = to_new_formation(id, now(), &proposal, &HashSet::new());
 
             let mean = |team: Team| {
                 let picked: Vec<f64> = formation
