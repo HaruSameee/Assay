@@ -173,7 +173,8 @@ fn unqueued_page(
         " disabled"
     };
     let body = format!(
-        "<section id=\"queue-app\" data-view=\"unqueued\" aria-labelledby=\"queue-title\">\n\
+        "<section id=\"queue-app\" data-view=\"unqueued\" data-queue-open=\"{queue_open}\" \
+         aria-labelledby=\"queue-title\">\n\
          <div class=\"form-header\">\n<p class=\"eyebrow\">Match queue</p>\n\
          <h1 id=\"queue-title\">キューに参加</h1>\n\
          <p class=\"lead\">希望ロールを選びます。</p>\n</div>\n\
@@ -194,18 +195,46 @@ fn unqueued_page(
          現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p>\n\
          {breakdown}</div>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
-         <div class=\"actions\"><button type=\"submit\">キューに入る</button></div>\n\
+         <div class=\"actions\"><button type=\"submit\"{submit_disabled}>キューに入る</button></div>\n\
          </form>\n<p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
          <script>{script}</script>\n",
         up = status.up_range,
         down = status.down_range,
-        stopped = matchmaker_notice(status),
+        queue_open = if status.queue_open { "1" } else { "0" },
+        // 受付時間外はボタンを押せなくする（押しても 403 で戻ってくるだけ）
+        submit_disabled = if status.queue_open { "" } else { " disabled" },
+        stopped = queue_notice(status),
         reported = reported_notice(reported),
         breakdown = first_choice_breakdown(status),
         removal = removal_notice(status),
         script = UNQUEUED_SCRIPT,
     );
     page_with_styles(viewer, "キュー", &body, QUEUE_STYLES)
+}
+
+/// キューに入る前の画面の告知。**受付時間外ならそちらを出し、マッチメイカの停止は
+/// 重ねて出さない**（受付が閉じている時間は稼働時間でもないので、2 つ並ぶと冗長）。
+///
+/// 受付は開いているが稼働はまだ（20:45〜21:00）のときは、止まっている旨と
+/// 「入ったままでよい」を出す（[`matchmaker_notice`]）。
+fn queue_notice(status: &StatusView) -> String {
+    if status.queue_open {
+        return matchmaker_notice(status);
+    }
+    let when = status.queue_window.as_deref().map_or_else(
+        || String::from("受付が始まるまでお待ちください。"),
+        |window| {
+            format!(
+                "受付時間は <strong>{}</strong>（日本時間）です。",
+                escape(window)
+            )
+        },
+    );
+    format!(
+        "<div class=\"notice\" data-notice=\"queue-closed\" aria-live=\"polite\">\
+         <p><strong>いまはキューの受付時間外です。</strong>{when}</p>\n\
+         <p class=\"fine-print\">受付が始まるとこの画面がそのまま切り替わります。</p></div>\n"
+    )
 }
 
 /// マッチメイカが止まっているときの告知。**動いていれば何も出さない。**
@@ -448,6 +477,7 @@ fn format_wait(now: Timestamp, enqueued_at: &str) -> String {
 
 const UNQUEUED_SCRIPT: &str = r#"
 (() => {
+  const root = document.getElementById('queue-app');
   const form = document.getElementById('queue-form');
   const inRange = document.getElementById('in-range');
   const pollStatus = document.getElementById('poll-status');
@@ -479,6 +509,8 @@ const UNQUEUED_SCRIPT: &str = r#"
       if (!response.ok) throw new Error('preview failed');
       const state = await response.json();
       if (blocked(state) || state.queued) return window.location.reload();
+      // 受付が開いた / 閉じたら画面ごと切り替える（ボタンと告知はサーバが描く）
+      if ((state.queue_open ? '1' : '0') !== root.dataset.queueOpen) return window.location.reload();
       inRange.textContent = `${state.in_range ?? 0}人`;
       for (const entry of state.in_range_by_first_choice ?? []) {
         const cell = document.querySelector(`[data-count="${entry.role}"]`);
@@ -626,6 +658,8 @@ mod tests {
             down_range: 50,
             matchmaker_open: true,
             matchmaker_window: None,
+            queue_open: true,
+            queue_window: None,
             entry: None,
             queue_total: Some(9),
             in_range: Some(4),
@@ -735,6 +769,67 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("data-view=\"queued\""), "{rendered}");
+    }
+
+    /// **受付時間外は、その旨と受付枠を出してボタンを押せなくする。**
+    ///
+    /// マッチメイカの停止告知は重ねない（受付が閉じている時間は稼働時間でもない）。
+    #[test]
+    fn a_closed_queue_is_announced_and_the_button_is_disabled() {
+        let closed = StatusView {
+            queue_open: false,
+            queue_window: Some("水金土日 20:45〜翌02:00".to_owned()),
+            matchmaker_open: false,
+            matchmaker_window: Some("水金土日 21:00〜翌02:00".to_owned()),
+            ..status()
+        };
+        let rendered = queue_page(Viewer::MEMBER, &closed, Utc::now(), None, &[]);
+        assert!(
+            rendered.contains("data-notice=\"queue-closed\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("いまはキューの受付時間外です"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("水金土日 20:45〜翌02:00"), "{rendered}");
+        assert!(
+            rendered.contains("<button type=\"submit\" disabled>キューに入る</button>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("data-queue-open=\"0\""), "{rendered}");
+        assert!(
+            !rendered.contains("matchmaker-stopped"),
+            "停止の告知を重ねない: {rendered}"
+        );
+
+        // 受付は開いたが稼働はまだ（20:45〜21:00）: 停止の告知だけが出て、ボタンは押せる
+        let early = StatusView {
+            queue_open: true,
+            queue_window: Some("水金土日 20:45〜翌02:00".to_owned()),
+            matchmaker_open: false,
+            matchmaker_window: Some("水金土日 21:00〜翌02:00".to_owned()),
+            ..status()
+        };
+        let rendered = queue_page(Viewer::MEMBER, &early, Utc::now(), None, &[]);
+        assert!(!rendered.contains("queue-closed"), "{rendered}");
+        assert!(rendered.contains("matchmaker-stopped"), "{rendered}");
+        assert!(
+            rendered.contains("<button type=\"submit\">キューに入る</button>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("data-queue-open=\"1\""), "{rendered}");
+        // スケジュールを使っていない（枠が無い）ときの文言
+        let unscheduled = StatusView {
+            queue_open: false,
+            queue_window: None,
+            ..status()
+        };
+        let rendered = queue_page(Viewer::MEMBER, &unscheduled, Utc::now(), None, &[]);
+        assert!(
+            rendered.contains("受付が始まるまでお待ちください"),
+            "{rendered}"
+        );
     }
 
     #[test]

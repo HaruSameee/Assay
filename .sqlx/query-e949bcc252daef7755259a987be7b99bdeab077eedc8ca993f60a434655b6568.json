@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select enabled as \"enabled!\", days_mask as \"days_mask!\", start_minute as \"start_minute!\", end_minute as \"end_minute!\" from current_matchmaker_schedule",
+  "query": "select enabled as \"enabled!\", days_mask as \"days_mask!\", start_minute as \"start_minute!\", end_minute as \"end_minute!\", queue_open_minute as \"queue_open_minute!\" from current_matchmaker_schedule",
   "describe": {
     "columns": [
       {
@@ -46,6 +46,17 @@
             "name": "end_minute"
           }
         }
+      },
+      {
+        "ordinal": 4,
+        "name": "queue_open_minute!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_matchmaker_schedule",
+            "name": "queue_open_minute"
+          }
+        }
       }
     ],
     "parameters": {
@@ -55,8 +66,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "ffbb8fe25fbf3d636b926130c51ac6fb8e5ee20b3fce47f8a6fe9434e788fe08"
+  "hash": "e949bcc252daef7755259a987be7b99bdeab077eedc8ca993f60a434655b6568"
 }

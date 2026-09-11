@@ -559,7 +559,8 @@ fn schedule_section(view: &ScheduleView<'_>) -> String {
         };
         format!(
             "<p class=\"fine-print\">現在の枠: <strong>{days}</strong> の \
-             <strong>{start}</strong> 〜 <strong>{wraps}{end}</strong>（JST）。\
+             <strong>{start}</strong> 〜 <strong>{wraps}{end}</strong>（JST）、\
+             キュー受付は <strong>{queue_open}</strong> から。\
              いまは<strong>{open}</strong>です。</p>\n",
             days = escape(&if days.is_empty() {
                 String::from("（曜日なし）")
@@ -568,6 +569,7 @@ fn schedule_section(view: &ScheduleView<'_>) -> String {
             }),
             start = escape(&schedule.start_text()),
             end = escape(&schedule.end_text()),
+            queue_open = escape(&schedule.queue_open_text()),
             open = if view.open {
                 "稼働時間内"
             } else {
@@ -600,6 +602,10 @@ fn schedule_section(view: &ScheduleView<'_>) -> String {
          <input id=\"start\" name=\"start\" type=\"time\" value=\"{start}\" required></div>\
          <div class=\"field\"><label for=\"end\">終了（JST。開始より早ければ翌日）</label>\
          <input id=\"end\" name=\"end\" type=\"time\" value=\"{end}\" required></div>\
+         <div class=\"field\"><label for=\"queue-open\">キュー受付開始（JST。開始と同じか、その前 12 時間以内）</label>\
+         <input id=\"queue-open\" name=\"queue_open\" type=\"time\" value=\"{queue_open}\" required>\
+         <p class=\"fine-print\">受付は稼働の終了と同時に閉じます。稼働時間外でも、\
+         受付が開いていればキューには入れます（組まれるのは稼働開始から）。</p></div>\
          <label for=\"schedule-reason\">理由（記録に残ります）</label>\
          <input id=\"schedule-reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
          <div class=\"actions\">\
@@ -609,6 +615,7 @@ fn schedule_section(view: &ScheduleView<'_>) -> String {
         enabled = if schedule.enabled { " checked" } else { "" },
         start = escape(&schedule.start_text()),
         end = escape(&schedule.end_text()),
+        queue_open = escape(&schedule.queue_open_text()),
     )
 }
 
@@ -1832,6 +1839,7 @@ mod tests {
         days_mask: 0,
         start_minute: 0,
         end_minute: 1,
+        queue_open_minute: 0,
     };
 
     fn queue_view<'a>(
@@ -2092,6 +2100,8 @@ mod tests {
         // 時刻も入っている
         assert!(rendered.contains("name=\"start\" type=\"time\" value=\"21:00\""));
         assert!(rendered.contains("name=\"end\" type=\"time\" value=\"02:00\""));
+        assert!(rendered.contains("name=\"queue_open\" type=\"time\" value=\"20:45\""));
+        assert!(rendered.contains("キュー受付は <strong>20:45</strong> から"));
         // 使う設定なので現在の枠が出る
         assert!(rendered.contains("現在の枠"), "{rendered}");
         assert!(rendered.contains("水金土日"), "{rendered}");

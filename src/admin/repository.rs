@@ -657,7 +657,8 @@ pub(crate) async fn matchmaker_schedule_on(
 ) -> Result<MatchmakerSchedule, sqlx::Error> {
     let row = sqlx::query!(
         "select enabled as \"enabled!\", days_mask as \"days_mask!\", \
-                start_minute as \"start_minute!\", end_minute as \"end_minute!\" \
+                start_minute as \"start_minute!\", end_minute as \"end_minute!\", \
+                queue_open_minute as \"queue_open_minute!\" \
          from current_matchmaker_schedule"
     )
     .fetch_one(&mut *conn)
@@ -667,6 +668,7 @@ pub(crate) async fn matchmaker_schedule_on(
         days_mask: row.days_mask,
         start_minute: row.start_minute,
         end_minute: row.end_minute,
+        queue_open_minute: row.queue_open_minute,
     })
 }
 
@@ -1983,15 +1985,16 @@ impl AdminRepository {
 
         let inserted = sqlx::query_scalar!(
             "insert into matchmaker_schedule_changes \
-             (enabled, days_mask, start_minute, end_minute, reason, created_by, \
-              idempotency_key, created_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8) \
+             (enabled, days_mask, start_minute, end_minute, queue_open_minute, reason, \
+              created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              on conflict (idempotency_key) do nothing \
              returning id",
             input.schedule.enabled,
             input.schedule.days_mask,
             input.schedule.start_minute,
             input.schedule.end_minute,
+            input.schedule.queue_open_minute,
             input.reason,
             format!("discord:{}", input.actor_discord_user_id),
             input.idempotency_key,
@@ -2017,6 +2020,7 @@ impl AdminRepository {
                     "days_mask": input.schedule.days_mask,
                     "start_minute": input.schedule.start_minute,
                     "end_minute": input.schedule.end_minute,
+                    "queue_open_minute": input.schedule.queue_open_minute,
                 }),
                 occurred_at: input.created_at,
                 idempotency_key: format!("matchmaker_schedule:{}", input.idempotency_key),

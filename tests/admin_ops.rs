@@ -2052,18 +2052,25 @@ async fn the_schedule_can_be_set_from_the_panel(owner: PgPool) {
 
     let (status, page) = save_schedule(
         &app,
-        "enabled=on&day_wed=on&day_fri=on&day_sat=on&day_sun=on&start=21%3A00&end=02%3A00&reason=weekly",
+        "enabled=on&day_wed=on&day_fri=on&day_sat=on&day_sun=on&start=21%3A00&end=02%3A00\
+         &queue_open=20%3A30&reason=weekly",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(page.contains("スケジュールを保存しました"), "{page}");
     assert!(page.contains("水金土日"), "{page}");
+    assert!(page.contains("キュー受付は 20:30 から"), "{page}");
 
     let saved = db.admin.matchmaker_schedule().await.unwrap();
     assert!(saved.enabled);
     assert_eq!(saved.day_labels(), vec!["水", "金", "土", "日"]);
     assert_eq!(saved.start_text(), "21:00");
     assert_eq!(saved.end_text(), "02:00");
+    assert_eq!(saved.queue_open_text(), "20:30");
+    // 受付は 20:30 から。稼働はまだ
+    assert!(saved.queue_is_open(jst(2026, 9, 16, 20, 30)));
+    assert!(!saved.is_open(jst(2026, 9, 16, 20, 30)));
+    assert!(!saved.queue_is_open(jst(2026, 9, 16, 20, 29)));
     // 2026-09-16 は水曜
     assert!(saved.is_open(jst(2026, 9, 16, 21, 0)));
     assert!(saved.is_open(jst(2026, 9, 17, 1, 59)), "日をまたぐ");
@@ -2086,6 +2093,59 @@ async fn the_schedule_can_be_set_from_the_panel(owner: PgPool) {
     assert_eq!(logged.len(), 1);
     assert_eq!(logged[0].payload["enabled"], json!(true));
     assert_eq!(logged[0].payload["start_minute"], json!(1260));
+    assert_eq!(logged[0].payload["queue_open_minute"], json!(1230));
+
+    db.done().await;
+}
+
+/// **キュー受付開始は稼働開始と同じか、その前 12 時間以内。**後ろなら断る。
+/// 空欄は「稼働開始と同時」。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_queue_opening_must_not_come_after_the_start(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (_, after) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&queue_open=21%3A01&reason=oops",
+    )
+    .await;
+    assert!(
+        after.contains("キュー受付開始は稼働開始（21:00）と同じか"),
+        "{after}"
+    );
+    let (_, too_early) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&queue_open=08%3A00&reason=oops",
+    )
+    .await;
+    assert!(
+        too_early.contains("その前 12 時間以内にしてください"),
+        "{too_early}"
+    );
+    let (_, malformed) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&queue_open=abc&reason=oops",
+    )
+    .await;
+    assert!(
+        malformed.contains("キュー受付開始の時刻が不正です"),
+        "{malformed}"
+    );
+    assert_eq!(count(&db, "matchmaker_schedule_changes").await, 0);
+
+    // 空欄なら稼働開始と同時
+    let (_, page) = save_schedule(
+        &app,
+        "enabled=on&day_wed=on&start=21%3A00&end=02%3A00&queue_open=&reason=same",
+    )
+    .await;
+    assert!(page.contains("キュー受付は 21:00 から"), "{page}");
+    let saved = db.admin.matchmaker_schedule().await.unwrap();
+    assert_eq!(saved.queue_open_text(), "21:00");
+    assert_eq!(saved.queue_lead_minutes(), 0);
+    println!("受付開始: 後ろ / 12 時間超 / 不正 は拒否、空欄は開始と同時");
 
     db.done().await;
 }
@@ -2277,6 +2337,8 @@ async fn the_default_schedule_is_the_nightly_window(owner: PgPool) {
     assert_eq!(schedule.day_labels(), vec!["水", "金", "土", "日"]);
     assert_eq!(schedule.start_text(), "21:00");
     assert_eq!(schedule.end_text(), "02:00");
+    // **キュー受付は開催日の 20:45 から**（設定していなくても）
+    assert_eq!(schedule.queue_open_text(), "20:45");
     println!(
         "既定: {} {} 〜 {}（翌日）",
         schedule.day_labels().join(""),

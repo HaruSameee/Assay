@@ -21,7 +21,7 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum_extra::extract::SignedCookieJar;
-use chrono::{TimeZone, Utc};
+use chrono::{TimeZone, Timelike, Utc};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -97,6 +97,11 @@ impl AppDb {
             .connect_with(options)
             .await
             .expect("connect as the app role");
+        // **既定の受付枠（開催日の 20:45〜翌 2:00）を外す。**`POST /queue` は壁時計で
+        // 受付時間を見るので、そのままだとテストの結果が実行時刻で変わる。
+        // 受付枠そのものは `the_queue_only_accepts_entries_during_its_window` が
+        // 「いまの時刻」からの相対で枠を置いて確かめる
+        set_schedule(&pool, false, 0, 1, 0, "tests-ignore-the-clock").await;
         Self {
             queue: QueueRepository::new(pool.clone()),
             registration: RegistrationRepository::new(pool.clone()),
@@ -116,6 +121,39 @@ impl AppDb {
     async fn done(self) {
         self.pool.close().await;
     }
+}
+
+/// スケジュールを 1 行追記する（運営パネルが書くのと同じ行）。曜日は月〜日すべて。
+async fn set_schedule(
+    pool: &PgPool,
+    enabled: bool,
+    start_minute: i32,
+    end_minute: i32,
+    queue_open_minute: i32,
+    key: &str,
+) {
+    sqlx::query(
+        "insert into matchmaker_schedule_changes \
+         (enabled, days_mask, start_minute, end_minute, queue_open_minute, reason, \
+          created_by, idempotency_key, created_at) \
+         values ($1, 127, $2, $3, $4, 'test', 'test', $5, now())",
+    )
+    .bind(enabled)
+    .bind(start_minute)
+    .bind(end_minute)
+    .bind(queue_open_minute)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("append a schedule row");
+}
+
+async fn count_rows(db: &AppDb, table: &str) -> i64 {
+    let sql = format!("select count(*) from {table}");
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(&db.pool)
+        .await
+        .expect("count rows")
 }
 
 /// 署名済みのセッション Cookie（`<名前>=<値>`）を作る。
@@ -1599,6 +1637,121 @@ async fn the_report_gate_opens_within_the_same_request(owner: PgPool) {
     println!("報告の追記: {append_elapsed:?}");
     println!("報告 → キュー再投入が通るまで: {gate_elapsed:?}");
     println!("この時点の formation の状態: {state:?}（未確定）");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 受付時間
+// ----------------------------------------------------------------------
+
+/// **キューは受付時間内にしか入れない。**受付は稼働開始より前に開き、
+/// 稼働の終了と同時に閉じる。
+///
+/// `POST /queue` は壁時計で判定するので、枠は「いまの JST 時刻」からの相対で置く
+/// （曜日は全部）。1 時間の余裕を取っているので、テストが分をまたいでも結果は変わらない。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_queue_only_accepts_entries_during_its_window(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let me = player(1);
+    register(&db, me, Rank::Legend).await;
+
+    let jst_now = Utc::now().with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap());
+    let minute_now = i32::try_from(jst_now.hour() * 60 + jst_now.minute()).unwrap();
+    let minute_at = |offset: i32| (minute_now + offset).rem_euclid(24 * 60);
+
+    // 受付は 1 時間後、稼働は 2 時間後から 3 時間後まで → いまは受付時間外
+    set_schedule(
+        &db.pool,
+        true,
+        minute_at(120),
+        minute_at(180),
+        minute_at(60),
+        "closed",
+    )
+    .await;
+    let (status, closed) = get_queue(&app, Some(me)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(closed["queue_open"], false, "{closed}");
+    assert_eq!(closed["matchmaker_open"], false, "{closed}");
+    assert!(
+        closed["queue_window"]
+            .as_str()
+            .is_some_and(|window| window.starts_with("月火水木金土日 ")),
+        "{closed}"
+    );
+    let (status, refused) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["error"], "queue_closed");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("受付時間外")),
+        "{refused}"
+    );
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(page.contains("data-notice=\"queue-closed\""), "{page}");
+    assert!(page.contains("いまはキューの受付時間外です"), "{page}");
+    assert!(
+        page.contains("<button type=\"submit\" disabled>キューに入る</button>"),
+        "{page}"
+    );
+    assert!(!page.contains("matchmaker-stopped"), "{page}");
+    assert_eq!(count_rows(&db, "queue_entries").await, 0);
+
+    // 受付は 1 時間前から、稼働は 1 時間後から → 受付中だがマッチメイカはまだ
+    set_schedule(
+        &db.pool,
+        true,
+        minute_at(60),
+        minute_at(180),
+        minute_at(-60),
+        "open",
+    )
+    .await;
+    let (_, early) = get_queue(&app, Some(me)).await;
+    assert_eq!(early["queue_open"], true, "{early}");
+    assert_eq!(early["matchmaker_open"], false, "{early}");
+    let (_, page) = get_queue_html(&app, me, "/queue").await;
+    assert!(!page.contains("queue-closed"), "{page}");
+    assert!(page.contains("matchmaker-stopped"), "稼働前の告知: {page}");
+    assert!(
+        page.contains("<button type=\"submit\">キューに入る</button>"),
+        "{page}"
+    );
+    let (status, joined) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
+    assert_eq!(status, StatusCode::OK, "{joined}");
+    assert_eq!(joined["queued"], true);
+    assert_eq!(joined["queue_open"], true);
+
+    // 受付が閉じても、入っている人はそのまま（外さない）
+    set_schedule(
+        &db.pool,
+        true,
+        minute_at(120),
+        minute_at(180),
+        minute_at(60),
+        "closed-again",
+    )
+    .await;
+    let (_, still) = get_queue(&app, Some(me)).await;
+    assert_eq!(still["queued"], true, "{still}");
+    assert_eq!(still["queue_open"], false, "{still}");
+    assert_eq!(count_rows(&db, "queue_entries").await, 1);
+
+    // スケジュールを外せばいつでも入れる
+    delete_queue(&app, me).await;
+    set_schedule(&db.pool, false, 0, 1, 0, "manual-only").await;
+    let (_, unscheduled) = get_queue(&app, Some(me)).await;
+    assert_eq!(unscheduled["queue_open"], true, "{unscheduled}");
+    assert_eq!(unscheduled["queue_window"], Value::Null, "{unscheduled}");
+    let (status, _) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
+    assert_eq!(status, StatusCode::OK);
+    println!("受付時間外: 403 queue_closed / 受付中（稼働前）: 200 / スケジュールなし: 200");
+
     db.done().await;
 }
 

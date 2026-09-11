@@ -737,6 +737,9 @@ struct ScheduleForm {
     start: String,
     #[serde(default)]
     end: String,
+    /// キュー受付開始（`HH:MM`）。空なら「開始と同時」。
+    #[serde(default)]
+    queue_open: String,
     #[serde(default)]
     reason: String,
     #[serde(default)]
@@ -787,6 +790,19 @@ async fn set_matchmaker_schedule(
         );
         return render_queue(&app, Some(notice)).await;
     }
+    // 空欄は「稼働開始と同時に受付」
+    let queue_open_minute = if form.queue_open.trim().is_empty() {
+        start_minute
+    } else {
+        let Some(minute) = parse_time(&form.queue_open) else {
+            return render_queue(
+                &app,
+                Some(fail("キュー受付開始の時刻が不正です。".to_owned())),
+            )
+            .await;
+        };
+        minute
+    };
     let enabled = form.enabled.is_some();
     let days_mask = parse_days(&form.days());
     if enabled && days_mask == 0 {
@@ -804,7 +820,15 @@ async fn set_matchmaker_schedule(
         days_mask,
         start_minute,
         end_minute,
+        queue_open_minute,
     };
+    if !schedule.queue_open_is_valid() {
+        let notice = fail(format!(
+            "キュー受付開始は稼働開始（{start}）と同じか、その前 12 時間以内にしてください。",
+            start = schedule.start_text(),
+        ));
+        return render_queue(&app, Some(notice)).await;
+    }
     let input = NewMatchmakerSchedule {
         schedule,
         reason,
@@ -814,11 +838,13 @@ async fn set_matchmaker_schedule(
     };
     let notice = match app.store.change_matchmaker_schedule(&input).await {
         Ok(ScheduleOutcome::Changed { id }) if enabled => info(format!(
-            "スケジュールを保存しました（#{id}）。{days} の {start} 〜 {end}（JST）。\
+            "スケジュールを保存しました（#{id}）。{days} の {start} 〜 {end}（JST）、\
+             キュー受付は {queue_open} から。\
              手動で停止しているあいだは、稼働時間になっても再開しません。",
             days = schedule.day_labels().join(""),
             start = schedule.start_text(),
             end = schedule.end_text(),
+            queue_open = schedule.queue_open_text(),
         )),
         Ok(ScheduleOutcome::Changed { id }) => info(format!(
             "スケジュールを外しました（#{id}）。手動の停止・再開だけが効きます。"

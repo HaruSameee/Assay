@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into matchmaker_schedule_changes (enabled, days_mask, start_minute, end_minute, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (idempotency_key) do nothing returning id",
+  "query": "insert into matchmaker_schedule_changes (enabled, days_mask, start_minute, end_minute, queue_open_minute, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9) on conflict (idempotency_key) do nothing returning id",
   "describe": {
     "columns": [
       {
@@ -21,6 +21,7 @@
         "Int4",
         "Int4",
         "Int4",
+        "Int4",
         "Text",
         "Text",
         "Text",
@@ -31,5 +32,5 @@
       false
     ]
   },
-  "hash": "6cd3cdf5ac0887c5df1f9560ec27e8db023975efc2384696e39a521895ec7a5f"
+  "hash": "f8659cee28aacc6d76e49ed467aee9061ffa201255cc5c9bafc199890f8a0a46"
 }

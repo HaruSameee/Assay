@@ -27,7 +27,7 @@ use tracing::error;
 
 use uuid::Uuid;
 
-use crate::admin::AdminIds;
+use crate::admin::{AdminIds, MatchmakerSchedule};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::registration::{
     Audience, AuthConfig, CurrentSession, QueueEligibility, RegistrationBlock,
@@ -235,6 +235,14 @@ pub(super) struct StatusView {
     /// 稼働枠（`水金土日 21:00〜翌02:00` の形）。スケジュールを使っていなければ `null`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) matchmaker_window: Option<String>,
+    /// **いまキューに入れるか。**受付時間外なら投入は 403 で断られ、画面はボタンを出さない。
+    ///
+    /// 受付は稼働開始の少し前（既定 20:45）から開き、稼働の終了と同時に閉じる。
+    /// 手動の停止は関係ない（止まっていてもキューには入れる）。
+    pub(super) queue_open: bool,
+    /// 受付枠（`水金土日 20:45〜翌02:00` の形）。スケジュールを使っていなければ `null`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) queue_window: Option<String>,
     /// 自分のエントリ。キュー中でなければ `null`。
     pub(super) entry: Option<EntryView>,
     /// 自分の範囲内でキュー中の人数（相互条件、07 §3-1）。
@@ -435,7 +443,31 @@ async fn join_queue(
             .into_response();
     }
 
-    match app.queue.enqueue(player_id, &validated, Utc::now()).await {
+    // 受付時間。**ゲートの後ろ**に置く（登録や未報告の理由が先に出る方が本人に有用）。
+    // スケジュールが読めなければ入れる側に倒す（読み取り失敗で夜の受付を止めない）
+    let now = Utc::now();
+    match app.queue.schedule().await {
+        Ok(schedule) if !schedule.queue_is_open(now) => {
+            let window = window_text(
+                &schedule,
+                &schedule.queue_open_text(),
+                schedule.queue_window_crosses_midnight(),
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "queue_closed",
+                    "message": format!("キューの受付時間外です。受付は {window}（日本時間）です。"),
+                    "queue_window": window,
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(error) => error!(%error, "could not read the schedule; letting the player in"),
+    }
+
+    match app.queue.enqueue(player_id, &validated, now).await {
         Ok(_) => {}
         Err(QueueError::UnknownRole) => {
             return bad_request("unknown_role", "選べないロールが含まれています。");
@@ -552,31 +584,42 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
     // （読み取り失敗で余計な警告を出して混乱させない）
     let now = Utc::now();
     let stop = app.queue.matchmaker_stop(now).await.unwrap_or(None);
-    let matchmaker_window = app
+    // 受付の判定と「いつ開くか」の文言は**同じ 1 回の読み取り**から作る。
+    // 読めなければ「入れる」側に倒す（読み取り失敗で受付を閉じない）
+    let schedule = app
         .queue
         .schedule()
         .await
-        .ok()
+        .inspect_err(|error| error!(%error, "could not read the schedule"))
+        .ok();
+    let queue_open = schedule
+        .as_ref()
+        .is_none_or(|schedule| schedule.queue_is_open(now));
+    let (matchmaker_window, queue_window) = schedule
         .filter(|schedule| schedule.enabled)
         .map(|schedule| {
-            format!(
-                "{days} {start}〜{wrap}{end}",
-                days = schedule.day_labels().join(""),
-                start = schedule.start_text(),
-                wrap = if schedule.crosses_midnight() {
-                    "翌"
-                } else {
-                    ""
-                },
-                end = schedule.end_text(),
+            (
+                Some(window_text(
+                    &schedule,
+                    &schedule.start_text(),
+                    schedule.crosses_midnight(),
+                )),
+                Some(window_text(
+                    &schedule,
+                    &schedule.queue_open_text(),
+                    schedule.queue_window_crosses_midnight(),
+                )),
             )
-        });
+        })
+        .unwrap_or_default();
     Some(StatusView {
         queued: entry.is_some(),
         up_range: ranges.up,
         down_range: ranges.down,
         matchmaker_open: stop.is_none(),
         matchmaker_window,
+        queue_open,
+        queue_window,
         entry: entry.map(EntryView::from),
         in_range: in_range.as_ref().map(|summary| summary.total),
         queue_total: in_range.as_ref().map(|summary| summary.queue_total),
@@ -585,6 +628,16 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
         destination,
         removed_by_staff,
     })
+}
+
+/// 枠の文言（`水金土日 21:00〜翌02:00`）。稼働枠と受付枠で開始だけが違う。
+fn window_text(schedule: &MatchmakerSchedule, start: &str, crosses_midnight: bool) -> String {
+    format!(
+        "{days} {start}〜{wrap}{end}",
+        days = schedule.day_labels().join(""),
+        wrap = if crosses_midnight { "翌" } else { "" },
+        end = schedule.end_text(),
+    )
 }
 
 /// Browser navigation asks for HTML; fetch/tests without that Accept value keep the JSON API.

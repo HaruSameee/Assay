@@ -22,9 +22,16 @@ pub struct MatchmakerSchedule {
     pub start_minute: i32,
     /// 稼働終了（JST の 0 時からの分）。**`start` より小さければ日をまたぐ。**
     pub end_minute: i32,
+    /// キュー受付開始（JST の 0 時からの分）。**稼働開始と同じか、その前 12 時間以内。**
+    ///
+    /// 受付枠は「稼働枠を、稼働開始との差ぶん前に伸ばしたもの」。終わりは稼働枠と同じ。
+    pub queue_open_minute: i32,
 }
 
-/// 稼働枠の既定値: **水金土日 21:00〜翌 2:00（JST）。**
+/// 受付開始が稼働開始より前に取れる最大の幅（分）。**SQL の CHECK と同じ値。**
+pub const MAX_QUEUE_LEAD_MINUTES: i32 = 12 * 60;
+
+/// 稼働枠の既定値: **水金土日 21:00〜翌 2:00（JST）、キュー受付は 20:45 から。**
 ///
 /// `current_matchmaker_schedule` が「1 行も無いとき」に返す値と同じ。
 /// 実際の開催枠なので、何も設定していない状態でそのまま動く。
@@ -38,6 +45,7 @@ impl Default for MatchmakerSchedule {
             days_mask: 0b111_0100,
             start_minute: 21 * 60,
             end_minute: 2 * 60,
+            queue_open_minute: 20 * 60 + 45,
         }
     }
 }
@@ -74,6 +82,38 @@ impl MatchmakerSchedule {
         }
         let yesterday = (today + 6) % 7;
         self.day_selected(yesterday) && minute < self.end_minute
+    }
+
+    /// **いまキューに入れるか。**稼働枠を受付開始のぶんだけ前に伸ばした枠で判定する。
+    ///
+    /// 「20:45 に受付開始、21:00 に稼働開始」なら、20:45 の時点で「15 分後は稼働時間内か」
+    /// を見るのと同じ。稼働時間内はそのまま受付中（終わりは稼働枠と同じ）。
+    /// 曜日の解釈や日またぎの扱いは [`Self::is_open`] と 1 か所に揃う
+    /// （受付側だけ別の曜日計算を持たない）。無効なら常に入れる。
+    pub fn queue_is_open(&self, now: DateTime<Utc>) -> bool {
+        self.is_open(now)
+            || self.is_open(now + chrono::Duration::minutes(i64::from(self.queue_lead_minutes())))
+    }
+
+    /// 受付開始が稼働開始の何分前か（0 なら同時）。
+    pub fn queue_lead_minutes(&self) -> i32 {
+        (self.start_minute - self.queue_open_minute).rem_euclid(24 * 60)
+    }
+
+    /// 受付開始が「稼働開始と同じか、その前 12 時間以内」に収まっているか。
+    /// **フォームと SQL の CHECK の両方で同じ条件。**
+    pub fn queue_open_is_valid(&self) -> bool {
+        (0..=MAX_QUEUE_LEAD_MINUTES).contains(&self.queue_lead_minutes())
+    }
+
+    /// 画面に出すキュー受付開始（`20:45`）。
+    pub fn queue_open_text(&self) -> String {
+        minute_text(self.queue_open_minute)
+    }
+
+    /// 受付枠（受付開始〜稼働終了）が日をまたぐか。画面の「翌」の有無に使う。
+    pub fn queue_window_crosses_midnight(&self) -> bool {
+        self.queue_open_minute >= self.end_minute
     }
 
     fn day_selected(&self, day: i32) -> bool {
@@ -175,6 +215,7 @@ mod tests {
             ]),
             start_minute: parse_time("21:00").unwrap(),
             end_minute: parse_time("02:00").unwrap(),
+            queue_open_minute: parse_time("20:45").unwrap(),
         }
     }
 
@@ -242,6 +283,7 @@ mod tests {
             days_mask: parse_days(&["sat".to_owned()]),
             start_minute: parse_time("13:00").unwrap(),
             end_minute: parse_time("17:00").unwrap(),
+            queue_open_minute: parse_time("12:30").unwrap(),
         };
         assert!(!schedule.crosses_midnight());
         // 2026-09-19 は土曜
@@ -279,6 +321,9 @@ mod tests {
         assert_eq!(defaults.day_labels(), vec!["水", "金", "土", "日"]);
         assert_eq!(defaults.start_text(), "21:00");
         assert_eq!(defaults.end_text(), "02:00");
+        assert_eq!(defaults.queue_open_text(), "20:45");
+        assert_eq!(defaults.queue_lead_minutes(), 15);
+        assert!(defaults.queue_open_is_valid());
         assert!(defaults.crosses_midnight());
         // 月曜の昼は閉じている（枠の外）
         assert!(!defaults.is_open(jst(2026, 9, 14, 12, 0)));
@@ -296,6 +341,88 @@ mod tests {
         };
         for hour in 0..24 {
             assert!(!schedule.is_open(jst(2026, 9, 16, hour, 0)));
+        }
+    }
+
+    /// **キューは 20:45 から入れて、稼働枠と同じ 2:00 に閉じる。**
+    #[test]
+    fn the_queue_opens_fifteen_minutes_before_the_matchmaker() {
+        let schedule = nightly();
+        // 水曜 20:44 はまだ入れない、20:45 で入れる（マッチメイカはまだ止まっている）
+        assert!(!schedule.queue_is_open(jst(2026, 9, 16, 20, 44)));
+        assert!(schedule.queue_is_open(jst(2026, 9, 16, 20, 45)));
+        assert!(
+            !schedule.is_open(jst(2026, 9, 16, 20, 45)),
+            "受付は開いても稼働はまだ"
+        );
+        assert!(schedule.queue_is_open(jst(2026, 9, 16, 21, 0)));
+        // 閉じるのは稼働枠と同じ 2:00
+        assert!(schedule.queue_is_open(jst(2026, 9, 17, 1, 59)));
+        assert!(!schedule.queue_is_open(jst(2026, 9, 17, 2, 0)));
+        // 開催日でない木曜の夜は受付も開かない
+        assert!(!schedule.queue_is_open(jst(2026, 9, 17, 20, 45)));
+        // 月曜の昼はどちらも閉じている
+        assert!(!schedule.queue_is_open(jst(2026, 9, 14, 12, 0)));
+    }
+
+    /// 受付開始 = 稼働開始でも、日をまたぐ受付でも、判定は稼働枠と揃う。
+    #[test]
+    fn a_zero_lead_means_the_queue_opens_with_the_matchmaker() {
+        let schedule = MatchmakerSchedule {
+            queue_open_minute: parse_time("21:00").unwrap(),
+            ..nightly()
+        };
+        assert_eq!(schedule.queue_lead_minutes(), 0);
+        assert!(schedule.queue_open_is_valid());
+        assert!(!schedule.queue_is_open(jst(2026, 9, 16, 20, 59)));
+        assert!(schedule.queue_is_open(jst(2026, 9, 16, 21, 0)));
+
+        // 稼働開始が 0:30 で受付が前日 23:45 でも、リードは 45 分と数える
+        let late = MatchmakerSchedule {
+            start_minute: parse_time("00:30").unwrap(),
+            end_minute: parse_time("03:00").unwrap(),
+            queue_open_minute: parse_time("23:45").unwrap(),
+            ..nightly()
+        };
+        assert_eq!(late.queue_lead_minutes(), 45);
+        assert!(late.queue_open_is_valid());
+        // 水曜 0:30 開始の枠は火曜 23:45 から受け付ける（水曜が開催日）
+        assert!(!late.queue_is_open(jst(2026, 9, 15, 23, 44)));
+        assert!(late.queue_is_open(jst(2026, 9, 15, 23, 45)));
+        assert!(late.queue_is_open(jst(2026, 9, 16, 2, 59)));
+        assert!(!late.queue_is_open(jst(2026, 9, 16, 3, 0)));
+    }
+
+    /// 受付開始が稼働開始の後ろ、あるいは 12 時間より前なら不正。**SQL の CHECK と同じ。**
+    #[test]
+    fn a_queue_opening_after_the_matchmaker_is_rejected() {
+        let after = MatchmakerSchedule {
+            queue_open_minute: parse_time("21:01").unwrap(),
+            ..nightly()
+        };
+        assert!(!after.queue_open_is_valid());
+        let too_early = MatchmakerSchedule {
+            queue_open_minute: parse_time("08:59").unwrap(),
+            ..nightly()
+        };
+        assert!(!too_early.queue_open_is_valid());
+        let just_in_time = MatchmakerSchedule {
+            queue_open_minute: parse_time("09:00").unwrap(),
+            ..nightly()
+        };
+        assert!(just_in_time.queue_open_is_valid());
+        assert_eq!(just_in_time.queue_lead_minutes(), MAX_QUEUE_LEAD_MINUTES);
+    }
+
+    /// 無効なら受付も常に開いている。
+    #[test]
+    fn a_disabled_schedule_never_closes_the_queue() {
+        let schedule = MatchmakerSchedule {
+            enabled: false,
+            ..nightly()
+        };
+        for hour in 0..24 {
+            assert!(schedule.queue_is_open(jst(2026, 9, 14, hour, 0)));
         }
     }
 
