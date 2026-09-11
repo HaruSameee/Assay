@@ -60,8 +60,12 @@ const ADMIN: u128 = 1;
 // 道具
 // ----------------------------------------------------------------------
 
+/// テストの基準時刻。**既定の稼働枠（水金土日 21:00〜翌 2:00 JST）の内側**に置く。
+///
+/// 2026-09-12 13:00 UTC = 土曜 22:00 JST。枠の外に置くと、スケジュールを
+/// 何も設定していないマッチメイカのテストが「稼働時間外」で止まってしまう。
 fn at(seconds: i64) -> Timestamp {
-    Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap() + TimeDelta::seconds(seconds)
+    Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap() + TimeDelta::seconds(seconds)
 }
 
 fn player(n: u128) -> PlayerId {
@@ -2034,12 +2038,13 @@ async fn the_schedule_can_be_set_from_the_panel(owner: PgPool) {
     seed_cast(&db, 1).await;
     let app = db.router();
 
-    // 既定はスケジュールなし = いつでも稼働
+    // 既定は水金土日 21:00〜翌 2:00。**設定していなくても枠が効いている**
     let before = db.admin.matchmaker_schedule().await.unwrap();
-    assert!(!before.enabled);
+    assert!(before.enabled);
+    assert_eq!(before.day_labels(), vec!["水", "金", "土", "日"]);
     assert!(
-        before.is_open(jst(2026, 9, 14, 3, 0)),
-        "既定は常に開いている"
+        !before.is_open(jst(2026, 9, 14, 3, 0)),
+        "月曜の未明は既定の枠の外"
     );
 
     let (status, page) = save_schedule(
@@ -2244,6 +2249,55 @@ async fn clearing_the_schedule_returns_to_manual_only(owner: PgPool) {
     // **履歴は 2 行残る**（追記専用）
     assert_eq!(count(&db, "matchmaker_schedule_changes").await, 2);
     println!("外した後: 稼働 / 履歴 2 行");
+
+    db.done().await;
+}
+
+/// **既定のスケジュールは水金土日 21:00〜翌 2:00。**実際の開催枠をそのまま入れてある。
+///
+/// SQL 側（`current_matchmaker_schedule` の coalesce）と Rust 側
+/// （`MatchmakerSchedule::default()`）がずれていないことを、本物の DB で実測する。
+/// 片方だけ直すと「画面には出ているのにマッチメイカが止まらない」が起きる。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_default_schedule_is_the_nightly_window(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+
+    // 1 行も設定していない状態
+    assert_eq!(count(&db, "matchmaker_schedule_changes").await, 0);
+    let schedule = db.admin.matchmaker_schedule().await.unwrap();
+    assert_eq!(
+        schedule,
+        unite_matchsystem::admin::MatchmakerSchedule::default(),
+        "SQL と Rust の既定値がずれている"
+    );
+    assert!(schedule.enabled);
+    assert_eq!(schedule.day_labels(), vec!["水", "金", "土", "日"]);
+    assert_eq!(schedule.start_text(), "21:00");
+    assert_eq!(schedule.end_text(), "02:00");
+    println!(
+        "既定: {} {} 〜 {}（翌日）",
+        schedule.day_labels().join(""),
+        schedule.start_text(),
+        schedule.end_text()
+    );
+
+    // **設定していなくても枠が効く。**水曜の昼は止まり、水曜の夜は動く
+    let noon = chrono::FixedOffset::east_opt(9 * 3600)
+        .unwrap()
+        .with_ymd_and_hms(2026, 9, 16, 12, 0, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    let night = chrono::FixedOffset::east_opt(9 * 3600)
+        .unwrap()
+        .with_ymd_and_hms(2026, 9, 16, 21, 30, 0)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        db.admin.matchmaker_stop(noon).await.unwrap(),
+        Some(unite_matchsystem::admin::MatchmakerStop::Scheduled)
+    );
+    assert!(db.admin.matchmaker_stop(night).await.unwrap().is_none());
+    println!("水曜 12:00 → 停止 / 水曜 21:30 → 稼働");
 
     db.done().await;
 }

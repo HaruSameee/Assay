@@ -41,8 +41,12 @@ const APP_ROLE_PASSWORD: &str = "assay_app_test";
 // 道具
 // ----------------------------------------------------------------------
 
+/// テストの基準時刻。**既定の稼働枠（水金土日 21:00〜翌 2:00 JST）の内側**に置く。
+///
+/// 2026-09-12 13:00 UTC = 土曜 22:00 JST。枠の外に置くと、スケジュールを
+/// 何も設定していないマッチメイカが「稼働時間外」で止まる。
 fn at(seconds: i64) -> Timestamp {
-    Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap() + TimeDelta::seconds(seconds)
+    Utc.with_ymd_and_hms(2026, 9, 12, 13, 0, 0).unwrap() + TimeDelta::seconds(seconds)
 }
 
 fn player(n: u128) -> PlayerId {

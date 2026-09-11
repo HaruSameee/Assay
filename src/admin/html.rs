@@ -110,6 +110,16 @@ td.who .tag { margin-left: 6px; }
 .pager { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-top: 20px; }
 .pager .position { color: var(--muted); font-size: 0.85rem; }
 form.search { margin: 0 0 20px; }
+/* 稼働スケジュール: チェックボックスは共通の input 指定（width:100% /
+   min-height:48px）に引っ張られて巨大な箱になるので、そこだけ打ち消す。
+   label も共通で display:block なので、行に並べるために inline-flex に戻す */
+.days { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0 0 6px; }
+label.day { display: inline-flex; align-items: center; gap: 7px; margin: 0 0 8px;
+            font-weight: 650; white-space: nowrap; }
+label.day input[type="checkbox"] { flex: 0 0 auto; width: 18px; min-height: 0; height: 18px;
+                                   margin: 0; padding: 0; accent-color: var(--accent); }
+.ops .field-label { display: block; margin-bottom: 7px; font-weight: 700; }
+.ops input[type="time"] { width: auto; min-width: 9rem; }
 form.inline { display: inline; }
 button.revert { background: none; border: 1px solid var(--border); color: var(--text);
                 border-radius: 999px; padding: 2px 12px; font: inherit; font-size: 0.8rem;
@@ -580,9 +590,10 @@ fn schedule_section(view: &ScheduleView<'_>) -> String {
          稼働時間外ならそのまま止まったままです。</p>\n\
          <form method=\"post\" action=\"/admin/matchmaker/schedule\">\
          <input type=\"hidden\" name=\"key\" value=\"schedule:{key}\">\
-         <label class=\"day\"><input type=\"checkbox\" name=\"enabled\" value=\"on\"{enabled}> \
-         スケジュールを使う</label>\
-         <div class=\"field\"><span class=\"metric-label\">稼働する曜日</span>\
+         <div class=\"field\"><label class=\"day\">\
+         <input type=\"checkbox\" name=\"enabled\" value=\"on\"{enabled}> \
+         スケジュールを使う</label></div>\
+         <div class=\"field\"><span class=\"field-label\">稼働する曜日</span>\
          <div class=\"days\">{checkboxes}</div></div>\
          <div class=\"field\"><label for=\"start\">開始（JST）</label>\
          <input id=\"start\" name=\"start\" type=\"time\" value=\"{start}\" required></div>\
@@ -2043,6 +2054,57 @@ mod tests {
         assert!(
             rendered.contains("overflow-x: auto"),
             "表は横スクロールする"
+        );
+    }
+
+    /// **既定の枠がフォームに反映される。**何も設定していなくても、
+    /// 水金土日 21:00〜02:00 にチェックが入った状態で開く。
+    #[test]
+    fn the_schedule_form_is_prefilled_with_the_current_window() {
+        let defaults = MatchmakerSchedule::default();
+        let view = QueueView {
+            schedule: ScheduleView {
+                schedule: &defaults,
+                open: false,
+                form_key: "form-key",
+            },
+            ..queue_view(&[], &[], None)
+        };
+        let rendered = queue_page(&view);
+        // 選ばれている曜日だけ checked が付く
+        for day in ["wed", "fri", "sat", "sun"] {
+            assert!(
+                rendered.contains(&format!(
+                    "<input type=\"checkbox\" name=\"day_{day}\" value=\"on\" checked>"
+                )),
+                "{day} に checked が無い"
+            );
+        }
+        for day in ["mon", "tue", "thu"] {
+            assert!(
+                rendered.contains(&format!(
+                    "<input type=\"checkbox\" name=\"day_{day}\" value=\"on\">"
+                )),
+                "{day} に checked が付いている"
+            );
+        }
+        // 時刻も入っている
+        assert!(rendered.contains("name=\"start\" type=\"time\" value=\"21:00\""));
+        assert!(rendered.contains("name=\"end\" type=\"time\" value=\"02:00\""));
+        // 使う設定なので現在の枠が出る
+        assert!(rendered.contains("現在の枠"), "{rendered}");
+        assert!(rendered.contains("水金土日"), "{rendered}");
+        assert!(rendered.contains("稼働時間外"), "open=false のはず");
+
+        // **チェックボックスが巨大な箱にならないこと。**共通の input 指定
+        // （width:100% / min-height:48px）を打ち消す CSS が入っている
+        assert!(
+            rendered.contains("label.day input[type=\"checkbox\"]"),
+            "チェックボックスの打ち消しが無い"
+        );
+        assert!(
+            rendered.contains("label.day { display: inline-flex"),
+            "{rendered}"
         );
     }
 
