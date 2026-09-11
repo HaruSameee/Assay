@@ -492,24 +492,28 @@ async fn matched_to_code_posted_posts_to_both_voice_chats_and_records_every_id(o
     let summon = &summons[0];
     assert_eq!(summon.mention_users.len(), 10, "{}", summon.content);
     assert!(summon.content.contains("マッチが成立しました"));
-    // 両チームの行き先が 1 通に載る
-    assert!(summon.content.contains("<#101>"), "{}", summon.content);
-    assert!(summon.content.contains("<#102>"), "{}", summon.content);
+    // 本文はメンションだけ（通知のため）。中身は埋め込み
     assert_eq!(
         summon.content.matches("<@").count(),
         10,
         "{}",
         summon.content
     );
-    // **URL は 1 つだけ**
+    let embed = summon.embed.as_ref().expect("the summon is an embed");
+    // 両チームの行き先が 1 通に載る
+    let fields = format!("{:?}", embed.fields);
+    assert!(fields.contains("<#101>"), "{fields}");
+    assert!(fields.contains("<#102>"), "{fields}");
+    // **URL は 1 つだけ**（見出しのリンクと本文の同じ 1 本）
     assert_eq!(
-        summon.content.matches(SITE).count(),
-        1,
-        "{}",
-        summon.content
+        embed.url.as_deref(),
+        Some(format!("{SITE}/match/{}", fid(1).0).as_str())
     );
+    assert_eq!(embed.description.matches(SITE).count(), 1, "{embed:?}");
+    assert!(!summon.content.contains(SITE), "{}", summon.content);
+    let everything = format!("{summon:?}");
     for forbidden in ["レート", "top_carry", "上キャリー", "報告"] {
-        assert!(!summon.content.contains(forbidden), "{}", summon.content);
+        assert!(!everything.contains(forbidden), "{everything}");
     }
 
     // 2 通目はホストの通知。ホストは相手チームにも伝えるので招集チャンネルに出す
