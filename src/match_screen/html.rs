@@ -27,6 +27,7 @@ const MATCH_STYLES: &str = r#"
 .roster li.me { margin: 0 -18px; padding-right: 18px; padding-left: 14px; border-left: 4px solid var(--accent); background: var(--surface-strong); }
 .roster li.me .who::after { content: "あなた"; margin-left: 8px; border-radius: 999px; padding: 1px 8px; background: var(--accent); color: #07150f; font-size: 0.72rem; font-weight: 700; }
 .host-tag { margin-left: 8px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--muted); font-size: 0.72rem; font-weight: 700; }
+.stream-tag { margin-left: 8px; border: 1px solid var(--accent); border-radius: 999px; padding: 1px 8px; color: var(--accent); font-size: 0.72rem; font-weight: 700; white-space: nowrap; }
 .hidden-roles { margin: 10px 0 0; color: var(--muted); font-size: 0.8rem; }
 .room-code { margin: 24px 0; padding: 24px; border: 1px solid var(--accent); border-left-width: 4px; background: var(--surface-strong); }
 .room-code strong { display: block; margin: 6px 0; font-size: 2.4rem; line-height: 1.15; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -465,7 +466,7 @@ fn voice(voice: Option<&VoiceView>) -> String {
 
 fn teammate_row(entry: &TeammateView) -> String {
     format!(
-        "<li{me}>{avatar}<span class=\"who\">{name}{host}</span>\
+        "<li{me}>{avatar}<span class=\"who\">{name}{host}{stream}</span>\
          <span class=\"rating\">{rating:.0}</span>\
          <span class=\"role\">{role}</span></li>\n",
         me = if entry.is_me { " class=\"me\"" } else { "" },
@@ -475,6 +476,7 @@ fn teammate_row(entry: &TeammateView) -> String {
             &entry.trainer_name
         )),
         host = host_tag(entry.is_host),
+        stream = stream_tag(entry.streaming),
         rating = entry.rating,
         role = escape(&entry.role),
     )
@@ -512,7 +514,7 @@ fn avatar(url: &str) -> String {
 /// ラベルが無くても並びから構成が読める。
 fn opponent_row(entry: &OpponentView) -> String {
     format!(
-        "<li>{avatar}<span class=\"who\">{name}{host}</span>\
+        "<li>{avatar}<span class=\"who\">{name}{host}{stream}</span>\
          <span class=\"rating\">{rating:.0}</span></li>\n",
         avatar = avatar(&entry.avatar_url),
         name = escape(card_name(
@@ -520,6 +522,7 @@ fn opponent_row(entry: &OpponentView) -> String {
             &entry.trainer_name
         )),
         host = host_tag(entry.is_host),
+        stream = stream_tag(entry.streaming),
         rating = entry.rating,
     )
 }
@@ -527,6 +530,15 @@ fn opponent_row(entry: &OpponentView) -> String {
 fn host_tag(is_host: bool) -> &'static str {
     if is_host {
         "<span class=\"host-tag\">ホスト</span>"
+    } else {
+        ""
+    }
+}
+
+/// 配信中の印。**両チームに出す**（配信していることの明示が目的なので、相手にも見せる）。
+fn stream_tag(streaming: bool) -> &'static str {
+    if streaming {
+        "<span class=\"stream-tag\">📺 配信中</span>"
     } else {
         ""
     }
@@ -663,6 +675,7 @@ mod tests {
             avatar_url: "https://cdn.discordapp.com/embed/avatars/1.png".into(),
             is_me,
             is_host,
+            streaming: false,
         }
     }
 
@@ -674,6 +687,7 @@ mod tests {
             discord_name: Some("相手ディスコ".into()),
             avatar_url: "https://cdn.discordapp.com/embed/avatars/2.png".into(),
             is_host,
+            streaming: false,
         }
     }
 

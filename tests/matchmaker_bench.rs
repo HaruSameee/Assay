@@ -166,6 +166,7 @@ async fn enqueue_full_rosters(db: &AppDb, count: u128, enqueued_at: Timestamp) {
                         role: role.to_owned(),
                         priority: 1,
                     }],
+                    streaming: false,
                 },
                 enqueued_at,
             )

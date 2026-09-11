@@ -1002,8 +1002,9 @@ pub(crate) async fn insert_formation(
     for player in &formation.players {
         sqlx::query!(
             "insert into formation_players \
-             (formation_id, player_id, team, role, role_was_flexed, mu_at_match, sigma_at_match) \
-             values ($1, $2, $3, $4, $5, $6, $7)",
+             (formation_id, player_id, team, role, role_was_flexed, mu_at_match, sigma_at_match, \
+              streaming) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8)",
             formation.id.0,
             player.player_id.0,
             player.team.as_str(),
@@ -1011,6 +1012,7 @@ pub(crate) async fn insert_formation(
             player.role_was_flexed,
             player.mu_at_match,
             player.sigma_at_match,
+            player.streaming,
         )
         .execute(&mut *conn)
         .await?;

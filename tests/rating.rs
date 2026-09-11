@@ -131,6 +131,7 @@ fn formation_at(n: u128, red_display: f64, blue_display: f64) -> NewFormation {
                 team: if i <= 5 { Team::Red } else { Team::Blue },
                 role: ROLES[(i as usize - 1) % ROLES.len()].to_owned(),
                 role_was_flexed: false,
+                streaming: false,
                 mu_at_match: if i <= 5 { red_display } else { blue_display } / DISPLAY_SCALE,
                 sigma_at_match: 500.0 / DISPLAY_SCALE,
             })
@@ -203,6 +204,7 @@ async fn enqueue(db: &AppDb, who: PlayerId, role: &str, at_time: Timestamp) {
                     role: role.to_owned(),
                     priority: 1,
                 }],
+                streaming: false,
             },
             at_time,
         )

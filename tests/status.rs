@@ -126,6 +126,7 @@ fn formation_at(n: u128, red_display: f64, blue_display: f64) -> NewFormation {
                 team: if i <= 5 { Team::Red } else { Team::Blue },
                 role: ROLES[(i as usize - 1) % ROLES.len()].to_owned(),
                 role_was_flexed: false,
+                streaming: false,
                 mu_at_match: if i <= 5 { red_display } else { blue_display } / 60.0,
                 sigma_at_match: 500.0 / 60.0,
             })

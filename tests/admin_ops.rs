@@ -294,6 +294,7 @@ async fn enqueue(db: &AppDb, who: PlayerId, role: &str, enqueued_at: Timestamp) 
                     role: role.to_owned(),
                     priority: 1,
                 }],
+                streaming: false,
             },
             enqueued_at,
         )
@@ -1007,6 +1008,7 @@ async fn playable_formation(db: &AppDb, n: u128) {
             team: if i < 5 { Team::Red } else { Team::Blue },
             role: ROLES[(i % 5) as usize].to_owned(),
             role_was_flexed: false,
+            streaming: false,
             mu_at_match: 25.0,
             sigma_at_match: 8.3333,
         })

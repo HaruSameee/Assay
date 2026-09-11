@@ -1,0 +1,126 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select fp.player_id, fp.team, p.trainer_name, p.discord_user_id, (select s.display_name from player_discord_snapshots s where s.player_id = fp.player_id order by s.id desc limit 1) as discord_name, (select s.avatar_hash from player_discord_snapshots s where s.player_id = fp.player_id order by s.id desc limit 1) as avatar_hash, r.display_name as \"role_display_name!\", r.sort_order as \"role_sort_order!\", v.rating as \"rating!\", fp.streaming from formation_players fp join players p on p.id = fp.player_id join roles r on r.id = fp.role join player_current_ratings v on v.player_id = fp.player_id where fp.formation_id = $1 order by fp.team, r.sort_order, fp.player_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "player_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "team",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "team"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "trainer_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "trainer_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "discord_user_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "players",
+            "name": "discord_user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "discord_name",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "avatar_hash",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "role_display_name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "role_sort_order!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "rating!",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "player_current_ratings",
+            "name": "rating"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "streaming",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "formation_players",
+            "name": "streaming"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      null,
+      null,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "849450e21c698e52db359df1aca72743463432426bbbbdb991c526862c65cea7"
+}

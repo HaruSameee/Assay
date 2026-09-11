@@ -175,6 +175,7 @@ async fn enqueue(db: &AppDb, who: PlayerId, role: &str) {
                     role: role.to_owned(),
                     priority: 1,
                 }],
+                streaming: false,
             },
             at(0),
         )

@@ -240,6 +240,7 @@ fn formation_with_mu(n: u128, mu: impl Fn(u128) -> f64) -> NewFormation {
                 team: if i <= 5 { Team::Red } else { Team::Blue },
                 role: ROLES[(i as usize - 1) % 5].to_owned(),
                 role_was_flexed: false,
+                streaming: false,
                 mu_at_match: mu(i),
                 sigma_at_match: 8.33,
             })

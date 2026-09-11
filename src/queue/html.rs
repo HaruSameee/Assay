@@ -186,6 +186,10 @@ fn unqueued_page(
          <div class=\"field\"><label for=\"role-2\">第2希望</label>\n<select id=\"role-2\">{second}</select></div>\n\
          <div class=\"field\"><label for=\"role-3\">第3希望</label>\n<select id=\"role-3\"{third_disabled}>{third}</select></div>\n\
          </div>\n</fieldset>\n\
+         <div class=\"field\"><label class=\"check\" for=\"streaming\">\
+         <input id=\"streaming\" type=\"checkbox\"> 配信中（YouTube など）</label>\n\
+         <p class=\"field-help\">配信は誰でも自由にできます。チェックすると、この試合のマッチ画面で\
+         参加者全員に「配信中」と表示されます（相手チームにも見えます）。</p></div>\n\
          <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上 +{up} / 下 -{down} です。\
          現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p>\n\
          {breakdown}</div>\n\
@@ -286,7 +290,8 @@ fn queued_page(
          {breakdown}\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
          <dl class=\"details\"><div><dt>ロール希望</dt><dd><ol class=\"role-preferences\">{roles}</ol></dd></div>\n\
-         <div><dt>レート範囲</dt><dd>上 +{up_range} / 下 -{down_range}</dd></div></dl></section>\n\
+         <div><dt>レート範囲</dt><dd>上 +{up_range} / 下 -{down_range}</dd></div>\n\
+         <div><dt>配信</dt><dd>{streaming}</dd></div></dl></section>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button id=\"leave-queue\" class=\"button-danger\" type=\"button\">キューを離脱</button></div>\n\
          <p id=\"poll-status\" class=\"poll-status\" role=\"status\"></p>\n</section>\n\
@@ -296,6 +301,11 @@ fn queued_page(
         up_range = entry.up_range,
         down_range = entry.down_range,
         stopped = matchmaker_notice(status),
+        streaming = if entry.streaming {
+            "配信中として登録しています（マッチ画面で全員に表示されます）"
+        } else {
+            "配信していない"
+        },
         reported = reported_notice(reported),
         script = QUEUED_SCRIPT,
     );
@@ -443,6 +453,7 @@ const UNQUEUED_SCRIPT: &str = r#"
   const pollStatus = document.getElementById('poll-status');
   const errorBox = document.getElementById('queue-error');
   const roles = [1, 2, 3].map((n) => document.getElementById(`role-${n}`));
+  const streaming = document.getElementById('streaming');
 
   const blocked = (state) => state.eligibility.registration !== null ||
     state.eligibility.active_formation !== null || state.eligibility.pending_reports.length > 0;
@@ -490,7 +501,7 @@ const UNQUEUED_SCRIPT: &str = r#"
       const response = await fetch('/queue', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ roles: preferences })
+        body: JSON.stringify({ roles: preferences, streaming: !!(streaming && streaming.checked) })
       });
       const result = await response.json();
       if (response.status === 403) return window.location.reload();
@@ -706,6 +717,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".into(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: vec![RolePreference {
                 role: "jungle".into(),
                 priority: 1,
@@ -736,6 +748,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".into(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: vec![RolePreference {
                 role: "jungle".into(),
                 priority: 1,
@@ -853,6 +866,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".into(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: ROLE_OPTIONS
                 .iter()
                 .enumerate()
@@ -933,6 +947,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".into(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: vec![RolePreference {
                 role: "jungle".into(),
                 priority: 1,
@@ -992,6 +1007,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".into(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: vec![
                 RolePreference {
                     role: "jungle".into(),
@@ -1046,6 +1062,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".to_owned(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: vec![RolePreference {
                 role: "jungle".to_owned(),
                 priority: 1,
@@ -1194,6 +1211,7 @@ mod tests {
             updated_at: "2026-09-12T12:00:00+00:00".to_owned(),
             down_range: 50,
             up_range: 50,
+            streaming: false,
             roles: vec![RolePreference {
                 role: "jungle".to_owned(),
                 priority: 1,

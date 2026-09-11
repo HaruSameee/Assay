@@ -42,6 +42,8 @@ pub struct TeammateView {
     pub is_me: bool,
     /// この試合のホストか。
     pub is_host: bool,
+    /// 配信中と申告しているか（キューに入るときのチェック）。
+    pub streaming: bool,
 }
 
 /// 相手チームの1人。**`role` フィールドが無い。**
@@ -63,6 +65,8 @@ pub struct OpponentView {
     /// この試合のホストか。**ホストは相手チームでも伝える**
     /// （誰が部屋を建てたか分からないと、入れなかったときに聞く相手が分からない）。
     pub is_host: bool,
+    /// 配信中と申告しているか。**相手チームにも見せる**——配信していることの明示が目的。
+    pub streaming: bool,
 }
 
 /// 片チームの集合先 VC。
@@ -215,6 +219,7 @@ mod tests {
             discord_name: Some("ディスコ名".into()),
             avatar_url: "https://cdn.discordapp.com/embed/avatars/1.png".into(),
             is_host: true,
+            streaming: false,
         }
     }
 
@@ -238,6 +243,8 @@ mod tests {
                 "is_host",
                 "player_id",
                 "rating",
+                // 配信中の申告は相手にも見せる（配信の明示が目的。ロールとは無関係）
+                "streaming",
                 "trainer_name"
             ]
         );
@@ -259,6 +266,7 @@ mod tests {
                 avatar_url: "https://cdn.discordapp.com/embed/avatars/0.png".into(),
                 is_me: true,
                 is_host: false,
+                streaming: false,
             }],
             opponents: vec![opponent()],
             my_voice: None,

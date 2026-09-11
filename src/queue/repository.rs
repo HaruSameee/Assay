@@ -91,17 +91,20 @@ impl QueueRepository {
         let mut tx = self.pool.begin().await?;
 
         let entry = sqlx::query!(
-            "insert into queue_entries (id, player_id, enqueued_at, updated_at, down_range) \
+            "insert into queue_entries \
+                 (id, player_id, enqueued_at, updated_at, down_range, streaming) \
              values ($1, $2, $3, $3, \
-                     (select down_range from current_matching_ranges)) \
+                     (select down_range from current_matching_ranges), $4) \
              on conflict (player_id) do update \
-                 set down_range = excluded.down_range, updated_at = excluded.updated_at \
+                 set down_range = excluded.down_range, updated_at = excluded.updated_at, \
+                     streaming = excluded.streaming \
              returning id, enqueued_at, updated_at, down_range, \
                        (select up_range from current_matching_ranges) \
                            as \"up_range!\"",
             uuid::Uuid::new_v4(),
             player_id.0,
             now,
+            request.streaming,
         )
         .fetch_one(&mut *tx)
         .await
@@ -158,6 +161,7 @@ impl QueueRepository {
             up_range: entry.up_range,
             down_range: entry.down_range,
             roles: request.roles.clone(),
+            streaming: request.streaming,
         })
     }
 
@@ -205,7 +209,7 @@ impl QueueRepository {
     /// 自分のエントリ。キュー中でなければ `None`。
     pub async fn find(&self, player_id: PlayerId) -> Result<Option<QueueEntry>, QueueError> {
         let Some(entry) = sqlx::query!(
-            "select id, enqueued_at, updated_at, down_range \
+            "select id, enqueued_at, updated_at, down_range, streaming \
              from queue_entries where player_id = $1",
             player_id.0,
         )
@@ -235,6 +239,7 @@ impl QueueRepository {
                     priority: row.priority,
                 })
                 .collect(),
+            streaming: entry.streaming,
         }))
     }
 

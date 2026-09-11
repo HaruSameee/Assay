@@ -103,6 +103,8 @@ pub struct QueueEntry {
     pub down_range: i32,
     /// 希望ロール。`priority` の昇順。
     pub roles: Vec<RolePreference>,
+    /// 配信中として申告しているか。
+    pub streaming: bool,
 }
 
 /// 検証済みの投入リクエスト。DB へ渡せるのはこの型だけ。
@@ -114,6 +116,9 @@ pub struct QueueEntry {
 pub struct QueueRequest {
     /// 希望ロール。`priority` の昇順で 1..=n が詰まっている。
     pub roles: Vec<RolePreference>,
+    /// 配信中として申告するか。**表示のためだけの値**で、マッチングには関与しない。
+    /// 成立時に `formation_players.streaming` へ写され、マッチ画面で全員に見える。
+    pub streaming: bool,
 }
 
 /// 成立済み formation で本人に割り当てられた VC。
@@ -220,6 +225,8 @@ pub fn validate_request(roles: &[RolePreference]) -> Result<QueueRequest, QueueR
                 priority: preference.priority,
             })
             .collect(),
+        // 配信中の申告は検証の対象ではない（呼ぶ側が本人の入力をそのまま入れる）
+        streaming: false,
     })
 }
 
