@@ -131,9 +131,153 @@ pub enum DisputeOutcome {
     Duplicate,
 }
 
+// ----------------------------------------------------------------------
+// 終わった試合の裁定のやり直し
+// ----------------------------------------------------------------------
+//
+// 「無効試合にするか微妙な試合を各自の判断で報告し、確定した後で『やっぱり
+// 無効試合にしよう』となる」ことがある。10 人ぶんのレートを 1 人ずつ調整で
+// 打ち消すのは間違えやすく、増減幅を変えた後に引き直されもしない。
+//
+// やり直しも**終端イベントをもう 1 行積むだけ**。レートは導出値なので、最後の
+// 終端イベントが変われば 10 人ぶんの増減は自動的に引き直される
+// （`formation_final_outcomes` を見よ）。選べる裁定は係争のときと同じ
+// [`DisputeDecision`] で、元の裁定も、プレイヤーの報告も、1 行も書き換えない。
+
+/// 終わった試合 1 件の、いまの結果。**画面に出すためのもの。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalOutcome {
+    /// 最後の終端イベントの種別（`confirmed` / `nullified` / `voided`）。
+    pub kind: FormationEventKind,
+    /// payload の outcome。`voided` には無い。
+    pub outcome: Option<Outcome>,
+}
+
+impl FinalOutcome {
+    /// 画面に出す名前。
+    pub fn label(self) -> &'static str {
+        match (self.kind, self.outcome) {
+            (FormationEventKind::Confirmed, Some(Outcome::Win(Team::Red))) => "赤の勝ち",
+            (FormationEventKind::Confirmed, Some(Outcome::Win(Team::Blue))) => "青の勝ち",
+            (FormationEventKind::Confirmed, Some(Outcome::Draw)) => "引き分け",
+            (FormationEventKind::Nullified, _) => "無効試合",
+            (FormationEventKind::Voided, _) => "不成立",
+            // 種別と outcome が食い違う行は無いはず（評価器も裁定も両方を揃えて積む）。
+            // 来ても画面を落とさない
+            _ => "（不明）",
+        }
+    }
+
+    /// この裁定を選んでも何も変わらないか。
+    ///
+    /// 「赤の勝ち → 青の勝ち」は状態が `confirmed` のままでも結果が変わるので、
+    /// 種別だけでなく outcome も比べる。
+    pub fn is_same_as(self, decision: DisputeDecision) -> bool {
+        self.kind == decision.kind() && self.outcome == decision.outcome()
+    }
+}
+
+/// 裁定のやり直しを追記する 1 件。
+#[derive(Debug, Clone)]
+pub struct NewReadjudication {
+    /// 対象の formation。
+    pub formation_id: FormationId,
+    /// 新しい裁定。**検証済みの値を渡すこと**（[`parse_decision`]）。
+    pub decision: DisputeDecision,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+/// 裁定のやり直しの結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadjudicationOutcome {
+    /// 追記した。
+    Changed {
+        /// やり直す前の結果。
+        before: FinalOutcome,
+        /// 追記後の状態（`confirmed` / `nullified` / `voided`）。
+        state: String,
+    },
+    /// **既にその結果になっている。**行は増やさない。
+    Unchanged {
+        /// いまの結果。
+        current: FinalOutcome,
+    },
+    /// **終わった試合ではない。**進行中・係争中・解散はここでは扱わない。
+    NotFinished {
+        /// そのときの状態。画面の文言に使う。
+        state: String,
+    },
+    /// 同じ冪等キーで既に追記済み。
+    Duplicate,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **同じ結果を選び直しても何も起きない。**種別だけでなく outcome も見る。
+    #[test]
+    fn the_same_result_is_recognised_by_kind_and_outcome() {
+        let red = FinalOutcome {
+            kind: FormationEventKind::Confirmed,
+            outcome: Some(Outcome::Win(Team::Red)),
+        };
+        assert!(red.is_same_as(DisputeDecision::Win(Team::Red)));
+        // 状態は confirmed のままでも、赤 → 青は変更
+        assert!(!red.is_same_as(DisputeDecision::Win(Team::Blue)));
+        assert!(!red.is_same_as(DisputeDecision::Nullified));
+
+        let nullified = FinalOutcome {
+            kind: FormationEventKind::Nullified,
+            outcome: Some(Outcome::Nullified),
+        };
+        assert!(nullified.is_same_as(DisputeDecision::Nullified));
+        assert!(!nullified.is_same_as(DisputeDecision::Voided));
+
+        let voided = FinalOutcome {
+            kind: FormationEventKind::Voided,
+            outcome: None,
+        };
+        assert!(voided.is_same_as(DisputeDecision::Voided));
+        assert!(!voided.is_same_as(DisputeDecision::Nullified));
+    }
+
+    /// 画面の名前は内部の識別子ではない。
+    #[test]
+    fn final_outcomes_have_human_labels() {
+        for (kind, outcome, label) in [
+            (
+                FormationEventKind::Confirmed,
+                Some(Outcome::Win(Team::Red)),
+                "赤の勝ち",
+            ),
+            (
+                FormationEventKind::Confirmed,
+                Some(Outcome::Win(Team::Blue)),
+                "青の勝ち",
+            ),
+            (
+                FormationEventKind::Confirmed,
+                Some(Outcome::Draw),
+                "引き分け",
+            ),
+            (
+                FormationEventKind::Nullified,
+                Some(Outcome::Nullified),
+                "無効試合",
+            ),
+            (FormationEventKind::Voided, None, "不成立"),
+        ] {
+            assert_eq!(FinalOutcome { kind, outcome }.label(), label);
+        }
+    }
 
     #[test]
     fn only_the_four_known_values_are_accepted() {

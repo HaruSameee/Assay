@@ -67,7 +67,11 @@ impl FormationState {
         }
     }
 
-    /// これ以上遷移しない状態か。`Disputed` はスタッフ裁定で進むので終端ではない。
+    /// これ以上**自動では**遷移しない状態か。`Disputed` はスタッフ裁定で進むので終端ではない。
+    ///
+    /// `Confirmed` / `Nullified` / `Voided` の 3 つは運営の再裁定で互いに移れる
+    /// （[`apply`] を見よ）。それでも終端と呼ぶのは、報告の評価・期限走査・再開処理が
+    /// これらの状態を二度と触らないからである。動かすのは運営の 1 行だけ。
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -394,8 +398,15 @@ pub fn apply(
                 _ => return Err(invalid(state, event)),
             }
         }
+        // **終わった試合の 3 つの終端（confirmed / nullified / voided）は互いに移れる。**
+        // 運営の再裁定で「確定した後にやっぱり無効試合にする」を表すため。
+        // 自動の経路（報告の評価・期限走査）は in_progress でしか積まないので、
+        // 終端どうしを動かすのは運営の 1 行だけになる。`abandoned` は試合が
+        // 始まる前の終わり方なので、ここには入らない
         K::Confirmed => match state {
-            S::InProgress { .. } | S::Disputed | S::Confirmed => S::Confirmed,
+            S::InProgress { .. } | S::Disputed | S::Confirmed | S::Nullified | S::Voided => {
+                S::Confirmed
+            }
             _ => return Err(invalid(state, event)),
         },
         K::Disputed => match state {
@@ -403,11 +414,15 @@ pub fn apply(
             _ => return Err(invalid(state, event)),
         },
         K::Nullified => match state {
-            S::InProgress { .. } | S::Disputed | S::Nullified => S::Nullified,
+            S::InProgress { .. } | S::Disputed | S::Confirmed | S::Nullified | S::Voided => {
+                S::Nullified
+            }
             _ => return Err(invalid(state, event)),
         },
         K::Voided => match state {
-            S::InProgress { .. } | S::Disputed | S::Voided => S::Voided,
+            S::InProgress { .. } | S::Disputed | S::Confirmed | S::Nullified | S::Voided => {
+                S::Voided
+            }
             _ => return Err(invalid(state, event)),
         },
         K::Abandoned => match state {
@@ -712,9 +727,12 @@ mod tests {
             (in_progress(a, "1234"), ev(0, K::VcAssigned, None)),
             (in_progress(a, "1234"), ev(0, K::HostAssigned, Some(a))),
             (S::Disputed, ev(0, K::VcAssigned, None)),
-            (S::Confirmed, ev(0, K::Voided, None)),
+            // 終わった試合の 3 つの終端どうしは再裁定で移れる（別のテスト）。
+            // 係争へ戻す・解散へ落とすのは今も不正
             (S::Confirmed, ev(0, K::Disputed, None)),
-            (S::Voided, ev(0, K::Confirmed, None)),
+            (S::Confirmed, abandon(0, AbandonReason::NotEnoughPlayers)),
+            (S::Voided, ev(0, K::Disputed, None)),
+            (S::Abandoned, ev(0, K::Confirmed, None)),
             (S::Abandoned, ev(0, K::HostAssigned, Some(a))),
             (S::Abandoned, ev(0, K::VcAssigned, None)),
         ];
@@ -918,6 +936,35 @@ mod tests {
             apply(&disputed, &ev(5, K::Voided, None)).unwrap(),
             S::Voided
         );
+    }
+
+    /// **終わった試合の 3 つの終端は運営の再裁定で互いに移れる。**
+    /// 「確定した後にやっぱり無効試合にする」を 1 行の追記で表すため。
+    #[test]
+    fn a_finished_match_can_be_readjudicated_between_the_three_terminals() {
+        let finished = [
+            (K::Confirmed, S::Confirmed),
+            (K::Nullified, S::Nullified),
+            (K::Voided, S::Voided),
+        ];
+        for (_, from) in &finished {
+            assert!(from.is_terminal());
+            for (kind, to) in &finished {
+                assert_eq!(
+                    apply(from, &ev(9, *kind, None)).unwrap(),
+                    *to,
+                    "{from} -> {kind}"
+                );
+            }
+            // 係争へ戻すことはできない（裁定されるまで結果が無い状態には戻らない）
+            assert!(apply(from, &ev(9, K::Disputed, None)).is_err(), "{from}");
+            // 解散へも戻れない（試合が始まる前の終わり方）
+            assert!(apply(from, &ev(9, K::Abandoned, None)).is_err(), "{from}");
+        }
+        // 解散した試合に結果は積めない
+        for (kind, _) in &finished {
+            assert!(apply(&S::Abandoned, &ev(9, *kind, None)).is_err(), "{kind}");
+        }
     }
 
     #[test]

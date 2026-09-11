@@ -19,7 +19,8 @@ use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::RosterPage;
 use super::repository::{
-    AdjustmentRow, AwaitingReports, DisputedFormation, FoundPlayer, QueuedEntry,
+    AdjustmentRow, AwaitingReports, DisputedFormation, DisputedVote, FinishedFormation,
+    FoundPlayer, QueuedEntry,
 };
 use super::schedule::MatchmakerSchedule;
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
@@ -2221,6 +2222,8 @@ pub struct ReportsView<'a> {
     pub form_key: &'a str,
     /// 係争中の試合。**閲覧だけ**（入力欄は出さない）。
     pub disputed: &'a [DisputedFormation],
+    /// 終わった試合（新しい順）。**裁定のやり直し**の材料。
+    pub finished: &'a [FinishedFormation],
     pub notice: Option<Notice>,
 }
 
@@ -2257,9 +2260,11 @@ pub fn reports_page(view: &ReportsView<'_>) -> String {
              {notice}\
              {body}\
              {disputed}\
+             {finished}\
              </section>\n",
             nav = admin_nav("/admin/reports"),
             disputed = disputed_section(view.disputed, view.form_key),
+            finished = finished_section(view.finished, view.form_key),
             notice = notice_html(view.notice.as_ref()),
         ),
     )
@@ -2346,8 +2351,37 @@ fn disputed_section(disputed: &[DisputedFormation], form_key: &str) -> String {
 
 /// 係争中の試合 1 件の内訳と裁定フォーム。
 fn disputed_block(formation: &DisputedFormation, form_key: &str) -> String {
-    let rows = formation
-        .votes
+    let id = formation.formation_id.to_string();
+    format!(
+        "<h3>{label}</h3>\n<p class=\"fine-print\">成立: {at}</p>\n\
+         {votes}\
+         <form method=\"post\" action=\"/admin/reports/dispute\">\
+         <input type=\"hidden\" name=\"formation\" value=\"{id}\">\
+         <input type=\"hidden\" name=\"key\" value=\"dispute:{id}:{form_key}\">\
+         <label for=\"decision-{id}\">裁定</label>\
+         <select id=\"decision-{id}\" name=\"decision\" required>{choices}</select>\
+         <label for=\"reason-{id}\">理由（記録に残ります）</label>\
+         <input id=\"reason-{id}\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">この裁定で確定する</button>\
+         </div></form>\n",
+        label = escape(&match_label(formation.formation_id)),
+        at = escape(&display_time(formation.created_at)),
+        votes = vote_table(&formation.votes),
+        choices = decision_options(),
+        id = escape(&id),
+        form_key = escape(form_key),
+    )
+}
+
+/// 管理画面での試合の呼び名（`match-xxxxxxxx`）。マッチ画面の URL の先頭 8 桁と同じ。
+fn match_label(formation_id: uuid::Uuid) -> String {
+    format!("match-{}", &formation_id.simple().to_string()[..8])
+}
+
+/// 参加者 10 人の最新報告の表。係争と裁定のやり直しで共通。
+fn vote_table(votes: &[DisputedVote]) -> String {
+    let rows = votes
         .iter()
         .map(|vote| {
             let name = vote
@@ -2371,8 +2405,16 @@ fn disputed_block(formation: &DisputedFormation, form_key: &str) -> String {
             )
         })
         .collect::<String>();
-    let id = formation.formation_id.to_string();
-    let choices = DisputeDecision::ALL
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>プレイヤー</th><th>チーム</th><th>最新の報告</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody></table></div>\n"
+    )
+}
+
+/// 裁定の選択肢。係争と裁定のやり直しで同じ 4 つ。
+fn decision_options() -> String {
+    DisputeDecision::ALL
         .iter()
         .map(|decision| {
             let note = if decision.changes_ratings() {
@@ -2386,27 +2428,67 @@ fn disputed_block(formation: &DisputedFormation, form_key: &str) -> String {
                 label = escape(decision.label()),
             )
         })
-        .collect::<String>();
+        .collect()
+}
+
+/// 終わった試合の一覧と、**裁定をやり直すフォーム**。
+///
+/// 「無効試合にするか微妙な試合を各自の判断で報告し、確定した後で『やっぱり
+/// 無効試合にしよう』となる」ときに使う。10 人ぶんのレートを 1 人ずつ調整で
+/// 打ち消す代わりに、試合の結果そのものを変える。レートは導出値なので、
+/// 結果が変われば 10 人ぶんが同時に引き直される。
+///
+/// 1 件ずつ折りたたんで出す。件数が多いので、開くまで内訳もフォームも見せない。
+fn finished_section(finished: &[FinishedFormation], form_key: &str) -> String {
+    let body = if finished.is_empty() {
+        String::from("<p class=\"fine-print\">今シーズンに終わった試合はまだありません。</p>\n")
+    } else {
+        finished
+            .iter()
+            .map(|formation| finished_block(formation, form_key))
+            .collect::<String>()
+    };
     format!(
-        "<h3>{label}</h3>\n<p class=\"fine-print\">成立: {at}</p>\n\
-         <div class=\"table-wrap\"><table class=\"log\">\n\
-         <thead><tr><th>プレイヤー</th><th>チーム</th><th>最新の報告</th></tr></thead>\n\
-         <tbody>\n{rows}</tbody></table></div>\n\
-         <form method=\"post\" action=\"/admin/reports/dispute\">\
+        "<section class=\"section\" aria-labelledby=\"finished-title\">\n\
+         <h2 id=\"finished-title\">終わった試合の裁定をやり直す（直近 {count}件）</h2>\n\
+         <p class=\"fine-print\">確定した後で「やっぱり無効試合にする」「勝敗が逆だった」\
+         ときはここから。<strong>その試合の 10 人ぶんのレートがまとめて引き直されます</strong>\
+         ——1 人ずつ調整を入れる必要はありません。\
+         試合の呼び名（match-xxxxxxxx）はマッチ画面の URL の先頭 8 桁です。</p>\n\
+         <p class=\"fine-print\"><strong>元の裁定もプレイヤーの報告も書き換わりません。</strong>\
+         やり直しは、その上に積む別の 1 行として記録されます。\
+         今シーズンの試合だけを出しています（境界より前の試合はやり直してもレートに入りません）。</p>\n\
+         {body}</section>\n",
+        count = finished.len(),
+    )
+}
+
+/// 終わった試合 1 件。折りたたみの見出しに、いまの結果を出す。
+fn finished_block(formation: &FinishedFormation, form_key: &str) -> String {
+    let id = formation.formation_id.to_string();
+    format!(
+        "<details class=\"finished\" data-formation=\"{id}\">\
+         <summary><strong>{label}</strong> — いまの結果: {result} / 成立: {at}</summary>\n\
+         <p class=\"fine-print\">最後の裁定: {decided}</p>\n\
+         {votes}\
+         <form method=\"post\" action=\"/admin/reports/readjudicate\">\
          <input type=\"hidden\" name=\"formation\" value=\"{id}\">\
-         <input type=\"hidden\" name=\"key\" value=\"dispute:{id}:{form_key}\">\
-         <label for=\"decision-{id}\">裁定</label>\
-         <select id=\"decision-{id}\" name=\"decision\" required>{choices}</select>\
-         <label for=\"reason-{id}\">理由（記録に残ります）</label>\
-         <input id=\"reason-{id}\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <input type=\"hidden\" name=\"key\" value=\"readjudicate:{id}:{form_key}\">\
+         <label for=\"readjudicate-{id}\">新しい裁定</label>\
+         <select id=\"readjudicate-{id}\" name=\"decision\" required>{choices}</select>\
+         <label for=\"readjudicate-reason-{id}\">理由（記録に残ります）</label>\
+         <input id=\"readjudicate-reason-{id}\" name=\"reason\" type=\"text\" \
+         autocomplete=\"off\" required>\
          <div class=\"actions\">\
-         <button class=\"button button-primary\" type=\"submit\">この裁定で確定する</button>\
-         </div></form>\n",
-        label = escape(&format!(
-            "match-{}",
-            &formation.formation_id.simple().to_string()[..8]
-        )),
+         <button class=\"button button-primary\" type=\"submit\">この試合の裁定をやり直す</button>\
+         </div></form>\n\
+         </details>\n",
+        label = escape(&match_label(formation.formation_id)),
+        result = escape(formation.result.label()),
         at = escape(&display_time(formation.created_at)),
+        decided = escape(&display_time(formation.decided_at)),
+        votes = vote_table(&formation.votes),
+        choices = decision_options(),
         id = escape(&id),
         form_key = escape(form_key),
     )

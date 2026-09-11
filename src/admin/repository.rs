@@ -17,7 +17,9 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use super::disputes::{DisputeOutcome, NewDisputeResolution};
+use super::disputes::{
+    DisputeOutcome, FinalOutcome, NewDisputeResolution, NewReadjudication, ReadjudicationOutcome,
+};
 use super::matching_range::{MatchingRangeChange, MatchingRangeOutcome, MatchingRangePreview};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
@@ -1467,48 +1469,242 @@ impl AdminRepository {
             if formation.snapshot.state != crate::lifecycle::FormationState::Disputed {
                 continue;
             }
-            // 各プレイヤーの**最新**報告だけ（訂正で打ち消された行は出さない）。
-            // 判定に使うのと同じ「打ち消されていない行」の条件を使う
-            let rows = sqlx::query!(
-                "select fp.player_id, fp.team, p.trainer_name, \
-                        mr.outcome as \"outcome?\", \
-                        (mr.raw_result->>'source' = 'staff') as \"from_staff?\" \
-                 from formation_players fp \
-                 join players p on p.id = fp.player_id \
-                 left join match_reports mr \
-                   on mr.formation_id = fp.formation_id \
-                  and mr.player_id = fp.player_id \
-                  and not exists ( \
-                      select 1 from match_reports correction \
-                      where correction.supersedes_id = mr.id \
-                  ) \
-                 where fp.formation_id = $1 \
-                 order by fp.team, fp.player_id",
-                formation.log.formation_id.0,
-            )
-            .fetch_all(&self.pool)
-            .await?;
             disputed.push(DisputedFormation {
                 formation_id: formation.log.formation_id.0,
                 created_at: formation.log.created_at,
-                votes: rows
-                    .into_iter()
-                    .map(|row| DisputedVote {
-                        player_id: row.player_id,
-                        trainer_name: row.trainer_name,
-                        team: row.team,
-                        outcome: row.outcome,
-                        from_staff: row.from_staff.unwrap_or(false),
-                    })
-                    .collect(),
+                votes: self.latest_votes(formation.log.formation_id).await?,
             });
         }
         disputed.sort_by_key(|entry| entry.created_at);
         Ok(disputed)
     }
+
+    /// 参加者 10 人の**最新**報告（訂正で打ち消された行は出さない）。
+    ///
+    /// 判定に使うのと同じ「打ち消されていない行」の条件を使う。
+    async fn latest_votes(
+        &self,
+        formation_id: FormationId,
+    ) -> Result<Vec<DisputedVote>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select fp.player_id, fp.team, p.trainer_name, \
+                    mr.outcome as \"outcome?\", \
+                    (mr.raw_result->>'source' = 'staff') as \"from_staff?\" \
+             from formation_players fp \
+             join players p on p.id = fp.player_id \
+             left join match_reports mr \
+               on mr.formation_id = fp.formation_id \
+              and mr.player_id = fp.player_id \
+              and not exists ( \
+                  select 1 from match_reports correction \
+                  where correction.supersedes_id = mr.id \
+              ) \
+             where fp.formation_id = $1 \
+             order by fp.team, fp.player_id",
+            formation_id.0,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DisputedVote {
+                player_id: row.player_id,
+                trainer_name: row.trainer_name,
+                team: row.team,
+                outcome: row.outcome,
+                from_staff: row.from_staff.unwrap_or(false),
+            })
+            .collect())
+    }
+
+    /// 終わった試合（confirmed / nullified / voided）を新しい順に `limit` 件。
+    ///
+    /// **現在のシーズンの試合だけ。**境界より前の試合は裁定し直してもレートに
+    /// 入らないので、出しても意味が無い。結果は `formation_final_outcomes`
+    /// （最後の終端イベント）から読む——レートの導出が読むのと同じ行である。
+    pub async fn finished_formations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<FinishedFormation>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select f.id as \"formation_id!\", f.created_at as \"created_at!\", \
+                    o.kind as \"kind!\", o.outcome, o.occurred_at as \"decided_at!\" \
+             from formations f \
+             join formation_final_outcomes o on o.formation_id = f.id \
+             cross join current_season s \
+             where f.created_at >= s.started_at \
+             order by f.created_at desc, f.id desc \
+             limit $1",
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut finished = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(result) = final_outcome(&row.kind, row.outcome.as_deref()) else {
+                // ビューは 3 種別しか返さない。来ても一覧を落とさず、その行だけ飛ばす
+                tracing::warn!(kind = %row.kind, "unknown final outcome kind");
+                continue;
+            };
+            finished.push(FinishedFormation {
+                formation_id: row.formation_id,
+                created_at: row.created_at,
+                decided_at: row.decided_at,
+                result,
+                votes: self.latest_votes(FormationId(row.formation_id)).await?,
+            });
+        }
+        Ok(finished)
+    }
+
+    /// いまの結果を 1 件読む。終わっていなければ `None`。
+    async fn final_outcome_of(
+        &self,
+        formation_id: FormationId,
+    ) -> Result<Option<FinalOutcome>, sqlx::Error> {
+        let row = sqlx::query!(
+            "select o.kind as \"kind!\", o.outcome \
+             from formation_final_outcomes o where o.formation_id = $1",
+            formation_id.0,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|row| final_outcome(&row.kind, row.outcome.as_deref())))
+    }
+}
+
+/// 終わった試合 1 件。**裁定のやり直しの材料。**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedFormation {
+    pub formation_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    /// 最後の終端イベントの時刻（やり直した後はその時刻）。
+    pub decided_at: DateTime<Utc>,
+    /// いまの結果。
+    pub result: FinalOutcome,
+    /// 参加者 10 人の最新報告（未報告も含む）。
+    pub votes: Vec<DisputedVote>,
+}
+
+/// `formation_final_outcomes` の 1 行を [`FinalOutcome`] にする。知らない値は `None`。
+fn final_outcome(kind: &str, outcome: Option<&str>) -> Option<FinalOutcome> {
+    let kind: crate::lifecycle::FormationEventKind = kind.parse().ok()?;
+    let outcome = match outcome {
+        Some(raw) => Some(raw.parse::<Outcome>().ok()?),
+        None => None,
+    };
+    Some(FinalOutcome { kind, outcome })
 }
 
 impl AdminRepository {
+    /// 終わった試合の裁定をやり直す。**終端イベントをもう 1 行積むだけ。**
+    ///
+    /// 元の裁定もプレイヤーの報告も 1 行も書き換えない。レートは導出値なので、
+    /// 最後の終端イベントが変われば 10 人ぶんの増減は自動的に引き直される
+    /// （`formation_final_outcomes` を見よ）。
+    ///
+    /// 対象は confirmed / nullified / voided のどれかで終わっている試合だけ。
+    /// 係争中は [`Self::resolve_dispute`] の経路、進行中は報告の評価に任せる。
+    pub async fn readjudicate(
+        &self,
+        input: &NewReadjudication,
+    ) -> Result<ReadjudicationOutcome, AdminStoreError> {
+        let formations = crate::persistence::FormationRepository::new(self.pool.clone());
+        let event_key = format!("match_readjudicated:{}", input.idempotency_key);
+        let log = formations
+            .load_events(input.formation_id)
+            .await
+            .map_err(repository_error)?;
+
+        // **冪等キーの判定を状態より先に置く**（resolve_dispute と同じ理由）
+        if log
+            .events
+            .iter()
+            .any(|stored| stored.event.idempotency_key == event_key)
+        {
+            return Ok(ReadjudicationOutcome::Duplicate);
+        }
+
+        let state = log.snapshot().state;
+        if !matches!(
+            state,
+            crate::lifecycle::FormationState::Confirmed
+                | crate::lifecycle::FormationState::Nullified
+                | crate::lifecycle::FormationState::Voided
+        ) {
+            return Ok(ReadjudicationOutcome::NotFinished {
+                state: state.name().to_owned(),
+            });
+        }
+        let Some(before) = self.final_outcome_of(input.formation_id).await? else {
+            // 状態機械が終端と言っているのにビューに行が無い。起きないが、
+            // 起きたら積まずに止める（何を打ち消すのか分からないまま進めない）
+            return Ok(ReadjudicationOutcome::NotFinished {
+                state: state.name().to_owned(),
+            });
+        };
+        if before.is_same_as(input.decision) {
+            return Ok(ReadjudicationOutcome::Unchanged { current: before });
+        }
+
+        // payload は裁定と同じ形。**やり直しであることは basis で分かる**
+        let mut payload = serde_json::json!({
+            "decision_basis": "staff_readjudication",
+            "previous_kind": before.kind.as_str(),
+        });
+        if let Some(outcome) = input.decision.outcome() {
+            payload["outcome"] = serde_json::json!(outcome.as_str());
+        }
+        if let Some(previous) = before.outcome {
+            payload["previous_outcome"] = serde_json::json!(previous.as_str());
+        }
+        let event = crate::persistence::NewEvent::new(
+            input.decision.kind(),
+            None,
+            input.created_at,
+            event_key,
+        )
+        .with_payload(payload);
+
+        let appended = formations
+            .append_event(input.formation_id, &event)
+            .await
+            .map_err(repository_error)?;
+        if appended.already_recorded {
+            return Ok(ReadjudicationOutcome::Duplicate);
+        }
+
+        // 運営操作ログは**別トランザクション**（resolve_dispute と同じ理由）
+        let mut tx = self.pool.begin().await?;
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::MatchReadjudicated,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "formation_id": input.formation_id.0,
+                    "decision": input.decision.as_str(),
+                    "previous_kind": before.kind.as_str(),
+                    "previous_outcome": before.outcome.map(Outcome::as_str),
+                    "event_id": appended.event_id.0,
+                    "changes_ratings": input.decision.changes_ratings()
+                        || before.kind == crate::lifecycle::FormationEventKind::Confirmed,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("match_readjudicated:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(ReadjudicationOutcome::Changed {
+            before,
+            state: appended.state.name().to_owned(),
+        })
+    }
+
     /// 係争を裁定して終端イベントを 1 行積む。
     ///
     /// **報告は 1 行も書き換えない。**割れた報告はそのまま残り、裁定はその上に乗る

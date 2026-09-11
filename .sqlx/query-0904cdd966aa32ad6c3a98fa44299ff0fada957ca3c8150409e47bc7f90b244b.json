@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select f.id as \"formation_id!\", f.created_at as \"created_at!\", o.kind as \"kind!\", o.outcome, o.occurred_at as \"decided_at!\" from formations f join formation_final_outcomes o on o.formation_id = f.id cross join current_season s where f.created_at >= s.started_at order by f.created_at desc, f.id desc limit $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "formation_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "formations",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "formations",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_final_outcomes",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "formation_final_outcomes",
+            "name": "outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "decided_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "formation_final_outcomes",
+            "name": "occurred_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0904cdd966aa32ad6c3a98fa44299ff0fada957ca3c8150409e47bc7f90b244b"
+}
