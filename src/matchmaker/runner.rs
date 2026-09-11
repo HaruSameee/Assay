@@ -114,23 +114,22 @@ impl Matchmaker {
 
     /// 1 回実行する。
     ///
-    /// 走査の方向は**時刻から決める**（[`ScanDirection::for_scan`]）。実行間隔ごとに
-    /// 上から / 下からが入れ替わるので、下の帯にも先に組める回が 1 回おきに来る。
-    /// プロセス内に回数を持たないので、再起動しても並びは崩れない。
+    /// 走査の方向は**毎回ランダム**（[`ScanDirection::random`]）。上から / 下からの
+    /// どちらが先に組まれるかは外から読めないので、「下からの回だけ狙ってキューに
+    /// 入る」ができない。プロセス内に回数を持たず、再起動の影響も受けない。
     pub async fn run_once(&self, now: Timestamp) -> Result<RunOutcome, RepositoryError> {
         self.run_once_with(now, &mut || FormationId(Uuid::new_v4()))
             .await
     }
 
-    /// ID の採番を差し替えて 1 回実行する（テスト用）。方向は `now` から決める。
+    /// ID の採番を差し替えて 1 回実行する（テスト用）。方向はランダム。
     pub async fn run_once_with(
         &self,
         now: Timestamp,
         next_id: &mut dyn FnMut() -> FormationId,
     ) -> Result<RunOutcome, RepositoryError> {
-        let direction = ScanDirection::for_scan(now, self.config.interval);
         self.repo
-            .run_once_with(&self.vc_pool, now, direction, next_id)
+            .run_once_with(&self.vc_pool, now, ScanDirection::random(), next_id)
             .await
     }
 

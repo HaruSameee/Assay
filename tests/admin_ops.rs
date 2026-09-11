@@ -34,7 +34,7 @@ use unite_matchsystem::lifecycle::{
     FormationEventKind as K, FormationId, FormationState as S, PlayerId, Timestamp,
 };
 use unite_matchsystem::matchmaker::{
-    Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome, ScanDirection,
+    Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
 };
 use unite_matchsystem::nullified::NullifiedReportRepository;
 use unite_matchsystem::persistence::{
@@ -372,7 +372,7 @@ async fn a_paused_matchmaker_keeps_counting_and_publishing(owner: PgPool) {
             unmatched: 10,
             longest_unmatched_wait_seconds: Some(600),
             paused: true,
-            direction: ScanDirection::for_scan(at(600), db.matchmaker(2).interval()),
+            direction: outcome.direction, // 方向はランダム（どちらでも同じ結果）
             ..RunOutcome::default()
         },
         "止めていても、何人を待たせているかは見えなくならない"

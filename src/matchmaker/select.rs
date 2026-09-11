@@ -229,7 +229,11 @@ impl ProposedMatch {
 // ウィンドウは「基準（最低レート）+ 上方向の幅」で、基準をどの順に試すかだけが
 // 方向で変わる。**上からだけ**だと、上と下の両方のウィンドウに入れる中間の人は
 // 常に上の組に取られ、最下位付近は「あと 1〜2 人足りない」で残り続ける。
-// スキャンごとに方向を交互にして、下の帯にも先に組める回を作る。
+// スキャンごとに方向を変えて、下の帯にも先に組める回を作る。
+//
+// **方向は毎回ランダムに引き、参加者には見せない。**交互や時刻で決めると周期が
+// 読めて「下からの回だけキューに入る / 上からの回を避ける」ができてしまう。
+// 見せてよいのはサーバのログだけ（Discord の実行ログには出さない）。
 
 /// 1 回のスキャンで基準を試す順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -242,7 +246,7 @@ pub enum ScanDirection {
 }
 
 impl ScanDirection {
-    /// ログに出す名前。
+    /// サーバのログに出す名前。**参加者向けの経路には出さない。**
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TopDown => "top_down",
@@ -250,12 +254,11 @@ impl ScanDirection {
         }
     }
 
-    /// **時刻から決める。**プロセス内に回数を持たない（マッチメイカは実行ごとの
-    /// 状態を持たない）。`interval` ごとに 1 目盛り進むので、3 分ごとのスキャンは
-    /// 交互になり、再起動しても並びは変わらない。
-    pub fn for_scan(now: Timestamp, interval: std::time::Duration) -> Self {
-        let seconds = interval.as_secs().max(1) as i64;
-        if now.timestamp().div_euclid(seconds) % 2 == 0 {
+    /// **毎回ランダムに引く。**プロセス内に回数を持たず、時刻にも依らないので、
+    /// 外から周期を推測できない。乱数源は OS（`uuid` v4 と同じ `getrandom`）。
+    pub fn random() -> Self {
+        // v4 の下位ビットはすべて乱数（版と variant のビットは上位側にある）
+        if uuid::Uuid::new_v4().as_u128() & 1 == 0 {
             Self::TopDown
         } else {
             Self::BottomUp
@@ -894,36 +897,22 @@ mod tests {
         assert_eq!(ids(&bottom_up[0]), expected);
     }
 
-    /// **方向は時刻から決まり、実行間隔ごとに交互になる。**プロセス内に回数を持たない。
+    /// **方向はランダム。**どちらも出るし、片方に固定されない。
+    /// （400 回引いて片方しか出ない確率は 2^-399。偏りの検定はしない）
     #[test]
-    fn the_direction_alternates_every_interval_from_the_clock() {
-        let interval = Duration::from_secs(180);
-        let start = Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap();
-        let mut seen = Vec::new();
-        for tick in 0..6 {
-            let at = start + TimeDelta::seconds(180 * tick + 7); // ずれても目盛りは同じ
-            seen.push(ScanDirection::for_scan(at, interval));
-        }
-        // 6 回のうち 3 回ずつで、隣どうしは必ず違う
-        assert_eq!(
-            seen.iter()
-                .filter(|d| **d == ScanDirection::BottomUp)
-                .count(),
-            3
+    fn the_direction_is_drawn_at_random_each_time() {
+        let draws: Vec<ScanDirection> = (0..400).map(|_| ScanDirection::random()).collect();
+        let bottom_up = draws
+            .iter()
+            .filter(|d| **d == ScanDirection::BottomUp)
+            .count();
+        assert!(bottom_up > 0, "下からが 1 回も出ない");
+        assert!(bottom_up < draws.len(), "上からが 1 回も出ない");
+        // 明らかな周期（交互）になっていない: 隣が同じになる箇所がある
+        assert!(
+            draws.windows(2).any(|pair| pair[0] == pair[1]),
+            "交互の周期になっている: {draws:?}"
         );
-        for pair in seen.windows(2) {
-            assert_ne!(pair[0], pair[1], "{seen:?}");
-        }
-        // 同じ目盛りの中では変わらない（ティックの揺れで方向が飛ばない）
-        assert_eq!(
-            ScanDirection::for_scan(start, interval),
-            ScanDirection::for_scan(start + TimeDelta::seconds(179), interval)
-        );
-        // 間隔 0 でも落ちない
-        assert!(matches!(
-            ScanDirection::for_scan(start, Duration::from_secs(0)),
-            ScanDirection::TopDown | ScanDirection::BottomUp
-        ));
     }
 
     // ------------------------------------------------------------------
