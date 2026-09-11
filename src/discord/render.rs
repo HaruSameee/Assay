@@ -17,7 +17,7 @@ use serenity::model::id::UserId;
 
 use crate::host::HostResources;
 use crate::lifecycle::{AbandonReason, FormationId, PlayerId, Timestamp};
-use crate::matchmaker::{MatchmakerSummary, RunOutcome};
+use crate::matchmaker::{MatchmakerSummary, RunOutcome, ScanDirection};
 use crate::persistence::{Outcome, ReportVote, RosterEntry, Team};
 
 use super::gateway::OutgoingMessage;
@@ -114,9 +114,13 @@ fn plain_discord_text(value: &str) -> String {
 pub fn matchmaker_run_log(outcome: &RunOutcome, at: Timestamp) -> OutgoingMessage {
     let jst = FixedOffset::east_opt(JST_OFFSET_SECONDS).expect("valid offset");
     let mut content = format!(
-        "**マッチメイカ実行 {} JST**\nキュー中: {}人\n成立: {}組\n",
+        "**マッチメイカ実行 {} JST**\nキュー中: {}人\n走査: {}\n成立: {}組\n",
         at.with_timezone(&jst).format("%Y-%m-%d %H:%M"),
         outcome.candidates,
+        match outcome.direction {
+            ScanDirection::TopDown => "上から（高レート帯を先に組む回）",
+            ScanDirection::BottomUp => "下から（低レート帯を先に組む回）",
+        },
         outcome.assignments.len()
     );
     for assigned in &outcome.assignments {
@@ -849,6 +853,7 @@ mod tests {
             unmatched: 13,
             longest_unmatched_wait_seconds: Some(12 * 60),
             paused: false,
+            direction: ScanDirection::BottomUp,
         };
         let at = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
         let run = matchmaker_run_log(&outcome, at);
@@ -889,6 +894,12 @@ mod tests {
         );
         assert!(run.content.contains("vc3 (<#31> / <#32>)"));
         assert!(run.content.contains("レート帯"));
+        assert!(
+            run.content
+                .contains("走査: 下から（低レート帯を先に組む回）"),
+            "{}",
+            run.content
+        );
         assert!(
             run.content
                 .contains("希望順位: 第1 7人 / 第2 2人 / 第3 1人")
@@ -954,6 +965,7 @@ mod tests {
             unmatched: 13,
             longest_unmatched_wait_seconds: Some(12 * 60),
             paused: false,
+            direction: ScanDirection::BottomUp,
         };
         let summary = MatchmakerSummary {
             queued: 13,

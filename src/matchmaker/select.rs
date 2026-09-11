@@ -223,6 +223,55 @@ impl ProposedMatch {
 }
 
 // ----------------------------------------------------------------------
+// 走査の方向
+// ----------------------------------------------------------------------
+//
+// ウィンドウは「基準（最低レート）+ 上方向の幅」で、基準をどの順に試すかだけが
+// 方向で変わる。**上からだけ**だと、上と下の両方のウィンドウに入れる中間の人は
+// 常に上の組に取られ、最下位付近は「あと 1〜2 人足りない」で残り続ける。
+// スキャンごとに方向を交互にして、下の帯にも先に組める回を作る。
+
+/// 1 回のスキャンで基準を試す順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanDirection {
+    /// 最高レートの人を基準にして下へ（07 §4-3 の元の形）。
+    #[default]
+    TopDown,
+    /// 最低レートの人を基準にして上へ。
+    BottomUp,
+}
+
+impl ScanDirection {
+    /// ログに出す名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TopDown => "top_down",
+            Self::BottomUp => "bottom_up",
+        }
+    }
+
+    /// **時刻から決める。**プロセス内に回数を持たない（マッチメイカは実行ごとの
+    /// 状態を持たない）。`interval` ごとに 1 目盛り進むので、3 分ごとのスキャンは
+    /// 交互になり、再起動しても並びは変わらない。
+    pub fn for_scan(now: Timestamp, interval: std::time::Duration) -> Self {
+        let seconds = interval.as_secs().max(1) as i64;
+        if now.timestamp().div_euclid(seconds) % 2 == 0 {
+            Self::TopDown
+        } else {
+            Self::BottomUp
+        }
+    }
+
+    /// 基準を試す順の添字列。`pool` はレート降順なので、下からは末尾から。
+    fn anchors(self, len: usize) -> Box<dyn Iterator<Item = usize>> {
+        match self {
+            Self::TopDown => Box::new(0..len),
+            Self::BottomUp => Box::new((0..len).rev()),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------
 // 本体
 // ----------------------------------------------------------------------
 
@@ -237,6 +286,7 @@ pub fn select_matches(candidates: &[Candidate], now: Timestamp) -> Vec<ProposedM
         &AllyBlocks::new(),
         now,
         MatchingRanges::default(),
+        ScanDirection::TopDown,
         &mut observer,
     )
 }
@@ -271,8 +321,29 @@ pub fn select_matches_within(
     now: Timestamp,
     ranges: MatchingRanges,
 ) -> Vec<ProposedMatch> {
+    select_matches_scanning(candidates, ally_blocks, now, ranges, ScanDirection::TopDown)
+}
+
+/// 幅と走査の方向を明示して組む。**本番のスキャンはこれを通る。**
+///
+/// 方向で変わるのは基準を試す順だけで、ウィンドウの条件（07 §3-1）も
+/// ロール割り当ても同じ。どの組が**先に**確定するかが変わる。
+pub fn select_matches_scanning(
+    candidates: &[Candidate],
+    ally_blocks: &AllyBlocks,
+    now: Timestamp,
+    ranges: MatchingRanges,
+    direction: ScanDirection,
+) -> Vec<ProposedMatch> {
     let mut observer = NoopSelectionObserver;
-    select_matches_inner(candidates, ally_blocks, now, ranges, &mut observer)
+    select_matches_inner(
+        candidates,
+        ally_blocks,
+        now,
+        ranges,
+        direction,
+        &mut observer,
+    )
 }
 
 fn select_matches_inner<O: SelectionObserver>(
@@ -280,6 +351,7 @@ fn select_matches_inner<O: SelectionObserver>(
     ally_blocks: &AllyBlocks,
     now: Timestamp,
     ranges: MatchingRanges,
+    direction: ScanDirection,
     observer: &mut O,
 ) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
@@ -293,7 +365,9 @@ fn select_matches_inner<O: SelectionObserver>(
 
     let mut matches = Vec::new();
     while pool.len() >= MATCH_SIZE {
-        let Some((taken, proposal)) = find_one(&pool, ally_blocks, now, ranges, observer) else {
+        let Some((taken, proposal)) =
+            find_one(&pool, ally_blocks, now, ranges, direction, observer)
+        else {
             break;
         };
         // 成立した 10 人を候補から外す（添字の大きい方から消す）
@@ -307,21 +381,23 @@ fn select_matches_inner<O: SelectionObserver>(
     matches
 }
 
-/// 幅 50 のウィンドウを上から順に試して、最初に成立した 1 組を返す。
+/// 幅 50 のウィンドウを `direction` の順に試して、最初に成立した 1 組を返す。
 ///
 /// **比較は両端を含む（`<=`）。**差ちょうど 50 は同じウィンドウに入る。
 ///
-/// `anchor` は 0（最高レート）から順に下りるので、上のウィンドウで組めなかった候補は
-/// **同じ呼び出しの中で下のウィンドウでも評価される**（飛ばさない）。
+/// 上からなら `anchor` は 0（最高レート）から順に下りるので、上のウィンドウで
+/// 組めなかった候補は**同じ呼び出しの中で下のウィンドウでも評価される**（飛ばさない）。
+/// 下からはその逆で、最低レートの人を基準にした窓から試す。
 fn find_one<O: SelectionObserver>(
     pool: &[&Candidate],
     ally_blocks: &AllyBlocks,
     now: Timestamp,
     ranges: MatchingRanges,
+    direction: ScanDirection,
     observer: &mut O,
 ) -> Option<(Vec<usize>, ProposedMatch)> {
     let span = f64::from(ranges.up);
-    for anchor in 0..pool.len() {
+    for anchor in direction.anchors(pool.len()) {
         observer.record_anchor();
         // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
         // ここで 2 条件を満たしていれば部分集合はどれも満たす
@@ -681,6 +757,7 @@ mod tests {
             blocks,
             now(),
             MatchingRanges::default(),
+            ScanDirection::TopDown,
             &mut diagnostics,
         );
         (matches, diagnostics)
@@ -734,6 +811,119 @@ mod tests {
                 assert_eq!(role_counts(proposal).get(&(role, team)), Some(&1));
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 走査の方向
+    // ------------------------------------------------------------------
+
+    /// 5 人ずつ 3 段（1610 / 1575 / 1550）。幅 50 なので上 2 段か下 2 段のどちらかしか
+    /// 組めない。**上からは上 2 段、下からは下 2 段が先に確定する。**
+    fn three_tiers() -> Vec<Candidate> {
+        let mut roster = Vec::new();
+        for (tier, rating) in [(100u128, 1610.0), (200, 1575.0), (300, 1550.0)] {
+            for (index, role) in ROLES.iter().enumerate() {
+                roster.push(who(
+                    tier + index as u128,
+                    rating,
+                    DEFAULT_DOWN_RANGE,
+                    600,
+                    &[*role],
+                ));
+            }
+        }
+        roster
+    }
+
+    /// **同じキューでも、方向で先に組まれる帯が変わる。**上からだと最下段が残り、
+    /// 下からだと最上段が残る。残った 5 人はどちらでも組めない（幅 50 に 10 人いない）。
+    #[test]
+    fn the_scan_direction_decides_which_band_forms_first() {
+        let roster = three_tiers();
+        let top_down = select_matches_scanning(
+            &roster,
+            &AllyBlocks::new(),
+            now(),
+            MatchingRanges::default(),
+            ScanDirection::TopDown,
+        );
+        assert_eq!(top_down.len(), 1);
+        assert_well_formed(&top_down[0]);
+        let mut expected: Vec<u128> = (100..105).chain(200..205).collect();
+        expected.sort_unstable();
+        assert_eq!(ids(&top_down[0]), expected, "上からは 1610 と 1575 の帯");
+
+        let bottom_up = select_matches_scanning(
+            &roster,
+            &AllyBlocks::new(),
+            now(),
+            MatchingRanges::default(),
+            ScanDirection::BottomUp,
+        );
+        assert_eq!(bottom_up.len(), 1);
+        assert_well_formed(&bottom_up[0]);
+        let mut expected: Vec<u128> = (200..205).chain(300..305).collect();
+        expected.sort_unstable();
+        assert_eq!(ids(&bottom_up[0]), expected, "下からは 1575 と 1550 の帯");
+
+        // 既定の入口は今までどおり上から
+        assert_eq!(ids(&select_matches(&roster, now())[0]), ids(&top_down[0]));
+    }
+
+    /// **方向が変わっても、組の条件は変わらない。**幅・各人の下方向設定・ロールは同じ。
+    #[test]
+    fn a_bottom_up_scan_respects_the_same_window_rules() {
+        // 最下段の 1 人が「下方向 10」に絞っている → 下からでも彼を基準にした窓は
+        // 上に 50 まで見るので影響しない。逆に、1575 の帯の 1 人が下方向 10 なら、
+        // 1550 を基準にした窓（差 25）には入れない
+        let mut roster = three_tiers();
+        roster[5].down_range = 10; // id 200（1575 帯の 1 人目）
+        let bottom_up = select_matches_scanning(
+            &roster,
+            &AllyBlocks::new(),
+            now(),
+            MatchingRanges::default(),
+            ScanDirection::BottomUp,
+        );
+        // 1550 を基準にした窓は 9 人（id 200 が抜ける）で組めない。次の基準（1575 帯）
+        // では上 2 段が組める
+        assert_eq!(bottom_up.len(), 1);
+        assert_well_formed(&bottom_up[0]);
+        let mut expected: Vec<u128> = (100..105).chain(200..205).collect();
+        expected.sort_unstable();
+        assert_eq!(ids(&bottom_up[0]), expected);
+    }
+
+    /// **方向は時刻から決まり、実行間隔ごとに交互になる。**プロセス内に回数を持たない。
+    #[test]
+    fn the_direction_alternates_every_interval_from_the_clock() {
+        let interval = Duration::from_secs(180);
+        let start = Utc.with_ymd_and_hms(2026, 9, 12, 21, 0, 0).unwrap();
+        let mut seen = Vec::new();
+        for tick in 0..6 {
+            let at = start + TimeDelta::seconds(180 * tick + 7); // ずれても目盛りは同じ
+            seen.push(ScanDirection::for_scan(at, interval));
+        }
+        // 6 回のうち 3 回ずつで、隣どうしは必ず違う
+        assert_eq!(
+            seen.iter()
+                .filter(|d| **d == ScanDirection::BottomUp)
+                .count(),
+            3
+        );
+        for pair in seen.windows(2) {
+            assert_ne!(pair[0], pair[1], "{seen:?}");
+        }
+        // 同じ目盛りの中では変わらない（ティックの揺れで方向が飛ばない）
+        assert_eq!(
+            ScanDirection::for_scan(start, interval),
+            ScanDirection::for_scan(start + TimeDelta::seconds(179), interval)
+        );
+        // 間隔 0 でも落ちない
+        assert!(matches!(
+            ScanDirection::for_scan(start, Duration::from_secs(0)),
+            ScanDirection::TopDown | ScanDirection::BottomUp
+        ));
     }
 
     // ------------------------------------------------------------------

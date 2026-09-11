@@ -35,7 +35,7 @@ use crate::rating::DISPLAY_SCALE;
 
 use super::select::{
     Candidate, MATCHMAKING_PARAMS_VERSION, PREDICTED_WIN_PROB, ProposedMatch, RoleWish,
-    select_matches_within,
+    ScanDirection, select_matches_scanning,
 };
 
 /// 1 回の実行の結果。
@@ -56,6 +56,8 @@ pub struct RunOutcome {
     /// 運営がマッチメイカを止めていたか。**止まっていてもループは回る**ので、
     /// キューの人数と待ち時間は普段どおり数える（何人待たせているかが見えなくなる）。
     pub paused: bool,
+    /// このスキャンで基準を試した順（上から / 下から）。ログに出す。
+    pub direction: ScanDirection,
 }
 
 /// 成立した formation と、そのトランザクションで永続化した VC 割当。
@@ -267,6 +269,7 @@ impl MatchmakerRepository {
         &self,
         vc_pool: &[VcAssignment],
         now: Timestamp,
+        direction: ScanDirection,
         next_id: &mut dyn FnMut() -> FormationId,
     ) -> Result<RunOutcome, RepositoryError> {
         let mut tx = self.pool.begin().await?;
@@ -285,6 +288,7 @@ impl MatchmakerRepository {
             candidates: candidates.len(),
             unmatched: candidates.len(),
             longest_unmatched_wait_seconds: longest_wait(&candidates, now),
+            direction,
             ..RunOutcome::default()
         };
 
@@ -318,7 +322,7 @@ impl MatchmakerRepository {
             return Ok(outcome);
         }
 
-        let proposals = select_matches_within(&candidates, &ally_blocks, now, ranges);
+        let proposals = select_matches_scanning(&candidates, &ally_blocks, now, ranges, direction);
         if proposals.is_empty() {
             tx.commit().await?;
             return Ok(outcome);

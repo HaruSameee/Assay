@@ -20,7 +20,7 @@ use unite_matchsystem::lifecycle::{
     AbandonReason, FormationEventKind as K, FormationId, FormationState, PlayerId, Timestamp,
 };
 use unite_matchsystem::matchmaker::{
-    Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome,
+    Matchmaker, MatchmakerConfig, MatchmakerRepository, ROLES, RunOutcome, ScanDirection,
 };
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, Team, VcAssignment,
@@ -357,6 +357,7 @@ async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
             unmatched: 9,
             longest_unmatched_wait_seconds: Some(600),
             paused: false,
+            direction: ScanDirection::for_scan(at(600), db.matchmaker(2).interval()),
         }
     );
     assert_eq!(count(&db, "formations").await, 0);
@@ -526,6 +527,62 @@ async fn twenty_queued_players_form_two_matches_in_one_run(owner: PgPool) {
     .unwrap();
     assert_eq!(labels.len(), 2);
     assert_ne!(labels[0], labels[1], "two matches never share a pair");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// 走査の方向（1 回おきに下から）
+// ----------------------------------------------------------------------
+
+/// 5 人ずつ 3 段（+110 / +75 / +50）。幅 50 なので上 2 段か下 2 段しか組めない。
+/// **上からの回は上 2 段、下からの回は下 2 段が組まれ、方向は 3 分ごとに入れ替わる。**
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn every_other_run_scans_from_the_bottom_band(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 15).await;
+    // player 1〜5 が最上段、6〜10 が中段、11〜15 が最下段
+    for n in 1..=15u128 {
+        let delta = match n {
+            1..=5 => 110.0,
+            6..=10 => 75.0,
+            _ => 50.0,
+        };
+        adjust_rating(&db, player(n), delta).await;
+    }
+    enqueue_full_rosters(&db, 15, at(0)).await;
+    let matchmaker = db.matchmaker(3);
+    let interval = matchmaker.interval().as_secs() as i64;
+
+    // 連続する 2 ティックで方向が違うことを時計から確かめる
+    let (first, second) = (at(600), at(600 + interval));
+    let first_direction = ScanDirection::for_scan(first, matchmaker.interval());
+    assert_ne!(
+        first_direction,
+        ScanDirection::for_scan(second, matchmaker.interval()),
+        "隣のティックは必ず逆方向"
+    );
+
+    let outcome = matchmaker.run_once(first).await.unwrap();
+    assert_eq!(outcome.direction, first_direction);
+    assert_eq!(outcome.created.len(), 1, "{outcome:?}");
+    let roster = db.formations.load_roster(outcome.created[0]).await.unwrap();
+    let mut ids: Vec<u128> = roster
+        .iter()
+        .map(|entry| entry.player_id.0.as_u128())
+        .collect();
+    ids.sort_unstable();
+    let (expected, band): (Vec<u128>, &str) = match first_direction {
+        ScanDirection::TopDown => ((1..=10).collect(), "上 2 段"),
+        ScanDirection::BottomUp => ((6..=15).collect(), "下 2 段"),
+    };
+    assert_eq!(ids, expected, "{first_direction:?} の回は{band}が組まれる");
+    println!("{} の回 → {band}（{ids:?}）", first_direction.as_str());
+
+    // 残った 5 人は次の回でも組めない（幅 50 に 10 人いない）が、方向は逆になる
+    let outcome = matchmaker.run_once(second).await.unwrap();
+    assert_ne!(outcome.direction, first_direction);
+    assert!(outcome.created.is_empty());
+    assert_eq!(count(&db, "queue_entries").await, 5);
     db.done().await;
 }
 
