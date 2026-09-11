@@ -377,6 +377,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Ok(outcome) => {
                         info!(
                             queued = outcome.candidates,
+                            direction = outcome.direction.as_str(),
                             formed = outcome.created.len(),
                             vc_exhausted = outcome.vc_exhausted,
                             paused = outcome.paused,

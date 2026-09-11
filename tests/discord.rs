@@ -1533,6 +1533,7 @@ async fn matchmaker_logs_skip_empty_runs_and_failures_do_not_discard_formations(
         unmatched: 0,
         longest_unmatched_wait_seconds: None,
         paused: false,
+        direction: Default::default(),
     };
     adapter
         .publish_matchmaker_run_log(&outcome, now)

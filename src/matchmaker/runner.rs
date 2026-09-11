@@ -17,6 +17,7 @@ use crate::lifecycle::{FormationId, Timestamp};
 use crate::persistence::{RepositoryError, VcAssignment};
 
 use super::repository::{MatchmakerRepository, MatchmakerSummary, RunOutcome};
+use super::select::ScanDirection;
 
 /// 実行間隔の環境変数。**当日の校正対象**（07 §4-1）。
 pub const INTERVAL_SECONDS: &str = "MATCHMAKER_INTERVAL_SECONDS";
@@ -112,18 +113,38 @@ impl Matchmaker {
     }
 
     /// 1 回実行する。
+    ///
+    /// 走査の方向は**時刻から決める**（[`ScanDirection::for_scan`]）。実行間隔ごとに
+    /// 上から / 下からが入れ替わるので、下の帯にも先に組める回が 1 回おきに来る。
+    /// プロセス内に回数を持たないので、再起動しても並びは崩れない。
     pub async fn run_once(&self, now: Timestamp) -> Result<RunOutcome, RepositoryError> {
         self.run_once_with(now, &mut || FormationId(Uuid::new_v4()))
             .await
     }
 
-    /// ID の採番を差し替えて 1 回実行する（テスト用）。
+    /// ID の採番を差し替えて 1 回実行する（テスト用）。方向は `now` から決める。
     pub async fn run_once_with(
         &self,
         now: Timestamp,
         next_id: &mut dyn FnMut() -> FormationId,
     ) -> Result<RunOutcome, RepositoryError> {
-        self.repo.run_once_with(&self.vc_pool, now, next_id).await
+        let direction = ScanDirection::for_scan(now, self.config.interval);
+        self.repo
+            .run_once_with(&self.vc_pool, now, direction, next_id)
+            .await
+    }
+
+    /// 方向を明示して 1 回実行する（テスト用）。
+    pub async fn run_once_scanning(
+        &self,
+        now: Timestamp,
+        direction: ScanDirection,
+    ) -> Result<RunOutcome, RepositoryError> {
+        self.repo
+            .run_once_with(&self.vc_pool, now, direction, &mut || {
+                FormationId(Uuid::new_v4())
+            })
+            .await
     }
 
     /// Discord の 15 分サマリ用に、永続化されたキューと formation を集計する。
