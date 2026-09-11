@@ -758,10 +758,10 @@ async fn nobody_can_see_how_many_others_have_reported(owner: PgPool) {
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    // **早期確定の閾値（7人）に届かない 6 人**が報告した状態で見る。
-    // 7 人に届くと確定して結果そのものが出るので、「他人の報告状況が漏れないこと」を
+    // **確定の閾値（6 人）に届かない 5 人**が報告した状態で見る。
+    // 6 人に届くと確定して結果そのものが出るので、「他人の報告状況が漏れないこと」を
     // 見るにはその手前で止める必要がある
-    for reporter in 1..=6u128 {
+    for reporter in 1..=5u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
 
@@ -843,13 +843,13 @@ async fn split_reports_do_not_confirm_and_never_show_the_breakdown(owner: PgPool
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    for reporter in 1..=5u128 {
+    // 4 対 4 の途中: どちらも閾値（6 人）に届かず、まだ 2 人残っているので待つ
+    for reporter in 1..=4u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
-    for reporter in 6..=10u128 {
+    for reporter in 6..=9u128 {
         assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
     }
-    // 全員が出していても、どちらの結果も早期確定の閾値（7人）に届かないので期限まで待つ
     assert!(
         matches!(state_of(&db, 1).await, S::InProgress { .. }),
         "{:?}",
@@ -871,14 +871,10 @@ async fn split_reports_do_not_confirm_and_never_show_the_breakdown(owner: PgPool
     assert_eq!(view["i_reported"], json!(true));
     assert_eq!(view["actions"]["report"], json!(false));
 
-    // 係争になった後の画面にも内訳を出さない
-    db.formations
-        .append_event(
-            fid(1),
-            &NewEvent::new(K::Disputed, None, at(100), "dispute-1"),
-        )
-        .await
-        .unwrap();
+    // 5 対 5 で全員が出そろうと、期限を待たずに係争になる。その画面にも内訳を出さない
+    assert_eq!(report(&app, 1, 5, "red").await, StatusCode::OK);
+    assert_eq!(report(&app, 1, 10, "blue").await, StatusCode::OK);
+    assert_eq!(state_of(&db, 1).await, S::Disputed);
     let (_, view) = get_json(&app, 1, player(1)).await;
     assert_eq!(view["stage"], "disputed");
     let (_, html) = get_html(&app, 1, player(1)).await;
@@ -919,23 +915,26 @@ async fn a_correction_moves_the_confirmation_but_not_the_agreement_metric(owner:
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    // 10 人が報告するが、**閾値（7人）には届かない** 6 対 4 で止める
-    for reporter in 1..=6u128 {
+    // 10 人が報告するが、**閾値（6 人）には届かない** 5 対 5。
+    // 全員が報告し終えているので、期限を待たずに係争になる
+    for reporter in 1..=5u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
-    for reporter in 7..=10u128 {
+    for reporter in 6..=10u128 {
         assert_eq!(report(&app, 1, reporter, "blue").await, StatusCode::OK);
     }
-    assert!(
-        matches!(state_of(&db, 1).await, S::InProgress { .. }),
-        "6 対 4 で確定してはいけない"
+    assert_eq!(
+        state_of(&db, 1).await,
+        S::Disputed,
+        "5 対 5 は全員報告済みなので係争"
     );
 
-    // **訂正が確定を動かす。**player 7 が blue → red に直すと red が 7 人になる
-    assert_eq!(report(&app, 1, 7, "red").await, StatusCode::OK);
+    // **訂正が確定を動かす。**player 6 が blue → red に直すと red が 6 人になり、
+    // 係争のまま運営を待たずに確定する
+    assert_eq!(report(&app, 1, 6, "red").await, StatusCode::OK);
     assert_eq!(state_of(&db, 1).await, S::Confirmed);
 
-    // 一致率は**最初の報告**で測る。player 7 の最初は blue なので、red と一致するのは 6/10
+    // 一致率は**最初の報告**で測る。player 6 の最初は blue なので、red と一致するのは 5/10
     let log = db.formations.load_events(fid(1)).await.unwrap();
     let confirmed = log
         .events
@@ -945,22 +944,103 @@ async fn a_correction_moves_the_confirmation_but_not_the_agreement_metric(owner:
         .expect("confirmed event");
     assert_eq!(
         confirmed.payload["first_report_agreement_matching"],
-        json!(6)
+        json!(5)
     );
     assert_eq!(confirmed.payload["first_report_agreement_total"], json!(10));
 
-    // 訂正で行が消えていない（追記のまま）。訂正したのは player 7
+    // 訂正で行が消えていない（追記のまま）。訂正したのは player 6
     let rows: i64 = sqlx::query_scalar!(
         "select count(*) as \"count!\" from match_reports \
          where formation_id = $1 and player_id = $2",
         fid(1).0,
-        player(7).0
+        player(6).0
     )
     .fetch_one(&db.pool)
     .await
     .unwrap();
     assert_eq!(rows, 2, "訂正は打ち消しではなく追記");
     db.done().await;
+}
+
+/// **本番で起きた事故（2026-09-12 match-c4389f1e）を、本物の報告経路で再現する。**
+///
+/// 試合開始 1 分後に赤チームの 1 人が「青の勝ち」を報告し、期限切れで係争になる
+/// （以前はここで 1 票のまま**確定**していた）。その後、試合が終わって 8 人が
+/// 「赤の勝ち」を報告する。過半数（6 人）に届いた時点で、**運営を待たずに赤の勝ちで確定**する。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_dispute_settles_itself_once_a_majority_reports_late(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    formation_at(&db, 1, Stage::InProgress).await;
+    let app = db.router();
+    let ratings = unite_matchsystem::rating::RatingAdjustmentRepository::new(db.pool.clone());
+
+    // 開始直後、赤チームの player 1 が誤って「青の勝ち」
+    assert_eq!(report(&app, 1, 1, "blue").await, StatusCode::OK);
+    assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
+
+    // 期限切れ（5 秒スキャンの評価と同じ）。**1 票では確定しない**——係争になる
+    db.formations
+        .append_event(
+            fid(1),
+            &NewEvent::new(K::Disputed, None, at(100), "window-elapsed"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state_of(&db, 1).await, S::Disputed);
+    assert_eq!(ratings.display_rating(pid_of(1)).await.unwrap(), 1500.0);
+
+    // 試合が終わり、残りが報告する。赤 5 人が赤（1 人は青のまま）、青 5 人のうち 4 人が赤
+    for reporter in 2..=5u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    // ここまで赤 4 票: まだ届かない。係争のまま
+    assert_eq!(state_of(&db, 1).await, S::Disputed);
+    assert_eq!(report(&app, 1, 6, "red").await, StatusCode::OK);
+    assert_eq!(
+        state_of(&db, 1).await,
+        S::Disputed,
+        "5 票で動いてはいけない"
+    );
+
+    // 6 票目で確定
+    assert_eq!(report(&app, 1, 7, "red").await, StatusCode::OK);
+    assert_eq!(state_of(&db, 1).await, S::Confirmed, "6 票で確定していない");
+    let log = db.formations.load_events(fid(1)).await.unwrap();
+    let confirmed = log
+        .events
+        .iter()
+        .rev()
+        .find(|stored| stored.event.kind == K::Confirmed)
+        .expect("confirmed event");
+    assert_eq!(confirmed.payload["outcome"], "red");
+    assert_eq!(confirmed.payload["decision_basis"], "majority_threshold");
+
+    // 残りの報告は受理されるが、確定は動かない
+    for reporter in 8..=10u128 {
+        assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
+    }
+    assert_eq!(state_of(&db, 1).await, S::Confirmed);
+
+    // **勝った赤が +7、負けた青が -7。**誤報した player 1 も赤なので +7
+    assert_eq!(ratings.display_rating(pid_of(1)).await.unwrap(), 1507.0);
+    assert_eq!(ratings.display_rating(pid_of(6)).await.unwrap(), 1493.0);
+    println!(
+        "1 票の誤報 → 係争 → 6 票で赤の勝ち: {:?} / 終端の列 {:?}",
+        confirmed.payload,
+        kinds(&db, 1)
+            .await
+            .iter()
+            .filter(|k| matches!(k, K::Disputed | K::Confirmed))
+            .collect::<Vec<_>>()
+    );
+    db.done().await;
+}
+
+fn pid_of(n: u128) -> PlayerId {
+    player(n)
 }
 
 /// 確定しても、まだ報告していない人には報告の入口が残る。
@@ -980,18 +1060,18 @@ async fn an_unreported_player_can_still_report_after_confirmation(owner: PgPool)
     formation_at(&db, 1, Stage::InProgress).await;
     let app = db.router();
 
-    // 6 人では閾値に届かない
-    for reporter in 1..=6u128 {
+    // 5 人では閾値に届かない
+    for reporter in 1..=5u128 {
         assert_eq!(report(&app, 1, reporter, "red").await, StatusCode::OK);
     }
     assert!(matches!(state_of(&db, 1).await, S::InProgress { .. }));
 
-    // 7 人目で確定する（残り 3 人を待たない）
-    assert_eq!(report(&app, 1, 7, "red").await, StatusCode::OK);
+    // 6 人目で確定する（残り 4 人を待たない）
+    assert_eq!(report(&app, 1, 6, "red").await, StatusCode::OK);
     assert_eq!(state_of(&db, 1).await, S::Confirmed);
 
-    // **残り 3 人は確定後も報告できる。**受理はするが確定は動かさない
-    for reporter in 8..=10u128 {
+    // **残り 4 人は確定後も報告できる。**受理はするが確定は動かさない
+    for reporter in 7..=10u128 {
         assert_eq!(
             report(&app, 1, reporter, "blue").await,
             StatusCode::OK,
