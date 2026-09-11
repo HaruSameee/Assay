@@ -1,5 +1,3 @@
-//! マッチメイカの稼働スケジュール。**判定は純粋関数。**
-//!
 //! 「水金土日 21〜2 時」のような週次の枠を運営が設定できるようにする。
 //!
 //! **手動の停止が常に勝つ。**障害で緊急停止したのに 21 時になったら勝手に再開する、
@@ -14,7 +12,7 @@ use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 const JST_OFFSET_SECONDS: i32 = 9 * 3600;
 
 /// 週次の稼働枠。**`current_matchmaker_schedule` の 1 行に対応する。**
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchmakerSchedule {
     /// スケジュールを使うか。`false` なら手動の停止・再開だけが効く。
     pub enabled: bool,
@@ -24,6 +22,24 @@ pub struct MatchmakerSchedule {
     pub start_minute: i32,
     /// 稼働終了（JST の 0 時からの分）。**`start` より小さければ日をまたぐ。**
     pub end_minute: i32,
+}
+
+/// 稼働枠の既定値: **水金土日 21:00〜翌 2:00（JST）。**
+///
+/// `current_matchmaker_schedule` が「1 行も無いとき」に返す値と同じ。
+/// 実際の開催枠なので、何も設定していない状態でそのまま動く。
+/// **SQL 側とここがずれていないことは統合テストで実測する**
+/// （`tests/admin_ops.rs` の既定値テスト）。
+impl Default for MatchmakerSchedule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // bit 0 = 月曜。水(2)+金(4)+土(5)+日(6) = 4+16+32+64
+            days_mask: 0b111_0100,
+            start_minute: 21 * 60,
+            end_minute: 2 * 60,
+        }
+    }
 }
 
 impl MatchmakerSchedule {
@@ -247,8 +263,27 @@ mod tests {
         for hour in 0..24 {
             assert!(schedule.is_open(jst(2026, 9, 14, hour, 0)));
         }
-        // 既定（1 行も無いとき）も同じ
-        assert!(MatchmakerSchedule::default().is_open(jst(2026, 9, 14, 3, 0)));
+        // **既定は「使う」設定。**無効化はここで明示したときだけ
+        assert!(MatchmakerSchedule::default().enabled);
+    }
+
+    /// **既定は水金土日 21:00〜翌 2:00。**実際の開催枠をそのまま入れてある。
+    ///
+    /// SQL 側（`current_matchmaker_schedule` の coalesce）と一致していることは
+    /// `tests/admin_ops.rs` の統合テストが本物の DB で実測する。
+    #[test]
+    fn the_default_is_the_nightly_window() {
+        let defaults = MatchmakerSchedule::default();
+        assert_eq!(defaults, nightly());
+        assert!(defaults.enabled);
+        assert_eq!(defaults.day_labels(), vec!["水", "金", "土", "日"]);
+        assert_eq!(defaults.start_text(), "21:00");
+        assert_eq!(defaults.end_text(), "02:00");
+        assert!(defaults.crosses_midnight());
+        // 月曜の昼は閉じている（枠の外）
+        assert!(!defaults.is_open(jst(2026, 9, 14, 12, 0)));
+        // 金曜の夜は開いている
+        assert!(defaults.is_open(jst(2026, 9, 11, 21, 0)));
     }
 
     /// 曜日を 1 つも選ばなければ、有効でも常に閉じている。
