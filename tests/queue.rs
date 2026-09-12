@@ -1724,21 +1724,26 @@ async fn the_queue_only_accepts_entries_during_its_window(owner: PgPool) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(closed["queue_open"], false, "{closed}");
     assert_eq!(closed["matchmaker_open"], false, "{closed}");
-    assert!(
-        closed["queue_window"]
-            .as_str()
-            .is_some_and(|window| window.starts_with("月火水木金土日 ")),
+    // 受付開始と稼働開始は別々のフィールド（1 つの枠にまとめない）
+    assert_eq!(
+        closed["queue_schedule"]["days"], "月火水木金土日",
         "{closed}"
     );
+    let queue_open = closed["queue_schedule"]["queue_open"].as_str().unwrap();
+    let start = closed["queue_schedule"]["matchmaker_start"]
+        .as_str()
+        .unwrap();
+    assert_ne!(queue_open, start, "{closed}");
     let (status, refused) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
     assert_eq!(refused["error"], "queue_closed");
+    let message = refused["message"].as_str().unwrap();
     assert!(
-        refused["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("受付時間外")),
-        "{refused}"
+        message.contains(&format!("キュー受付は 月火水木金土日 {queue_open} から"))
+            && message.contains(&format!("マッチメイキングは {start} から")),
+        "受付開始と稼働開始を分けて書く: {refused}"
     );
+    assert!(!message.contains(&format!("{queue_open}〜")), "{refused}");
     let (_, page) = get_queue_html(&app, me, "/queue").await;
     assert!(page.contains("data-notice=\"queue-closed\""), "{page}");
     assert!(page.contains("いまはキューの受付時間外です"), "{page}");
@@ -1794,7 +1799,7 @@ async fn the_queue_only_accepts_entries_during_its_window(owner: PgPool) {
     set_schedule(&db.pool, false, 0, 1, 0, "manual-only").await;
     let (_, unscheduled) = get_queue(&app, Some(me)).await;
     assert_eq!(unscheduled["queue_open"], true, "{unscheduled}");
-    assert_eq!(unscheduled["queue_window"], Value::Null, "{unscheduled}");
+    assert_eq!(unscheduled["queue_schedule"], Value::Null, "{unscheduled}");
     let (status, _) = post_queue(&app, me, json!({ "roles": [wish("jungle", 1)] })).await;
     assert_eq!(status, StatusCode::OK);
     println!("受付時間外: 403 queue_closed / 受付中（稼働前）: 200 / スケジュールなし: 200");

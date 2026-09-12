@@ -221,12 +221,19 @@ fn queue_notice(status: &StatusView) -> String {
     if status.queue_open {
         return matchmaker_notice(status);
     }
-    let when = status.queue_window.as_deref().map_or_else(
+    // **受付開始と稼働開始を分けて書く。**「受付 20:45〜翌02:00」と 1 つの枠にすると
+    // 20:45 から組まれると読まれる
+    let when = status.queue_schedule.as_ref().map_or_else(
         || String::from("受付が始まるまでお待ちください。"),
-        |window| {
+        |times| {
             format!(
-                "受付時間は <strong>{}</strong>（日本時間）です。",
-                escape(window)
+                "キュー受付は <strong>{days} {queue_open}</strong> から、\
+                 マッチメイキングは <strong>{start}</strong> からです\
+                 （終了 {end}、日本時間）。",
+                days = escape(&times.days),
+                queue_open = escape(&times.queue_open),
+                start = escape(&times.matchmaker_start),
+                end = escape(&times.end_text()),
             )
         },
     );
@@ -249,14 +256,14 @@ fn matchmaker_notice(status: &StatusView) -> String {
         || String::from("運営が再開するまでお待ちください。"),
         |window| {
             format!(
-                "稼働時間は <strong>{}</strong>（日本時間）です。",
+                "マッチメイキングは <strong>{}</strong>（日本時間）です。",
                 escape(window)
             )
         },
     );
     format!(
         "<div class=\"notice\" data-notice=\"matchmaker-stopped\" aria-live=\"polite\">\
-         <p><strong>いまマッチメイカは止まっています。</strong>{when}</p>\n\
+         <p><strong>いまマッチメイキングは止まっています。</strong>{when}</p>\n\
          <p class=\"fine-print\">キューに入ったままで構いません。動き出せば\
          そのまま組まれます。</p></div>\n"
     )
@@ -649,7 +656,20 @@ mod tests {
 
     use super::*;
     use crate::queue::model::RolePreference;
-    use crate::queue::routes::{DestinationView, EligibilityView, RoleCountView};
+    use crate::queue::routes::{
+        DestinationView, EligibilityView, QueueScheduleView, RoleCountView,
+    };
+
+    /// 既定の枠（水金土日 20:45 受付、21:00 稼働、翌 2:00 終了）。
+    fn nightly_times() -> QueueScheduleView {
+        QueueScheduleView {
+            days: "水金土日".to_owned(),
+            queue_open: "20:45".to_owned(),
+            matchmaker_start: "21:00".to_owned(),
+            end: "02:00".to_owned(),
+            end_next_day: true,
+        }
+    }
 
     fn status() -> StatusView {
         StatusView {
@@ -659,7 +679,7 @@ mod tests {
             matchmaker_open: true,
             matchmaker_window: None,
             queue_open: true,
-            queue_window: None,
+            queue_schedule: None,
             entry: None,
             queue_total: Some(9),
             in_range: Some(4),
@@ -718,7 +738,7 @@ mod tests {
         };
         let rendered = queue_page(Viewer::MEMBER, &closed, Utc::now(), None, &[]);
         assert!(
-            rendered.contains("いまマッチメイカは止まっています"),
+            rendered.contains("いまマッチメイキングは止まっています"),
             "{rendered}"
         );
         assert!(rendered.contains("水金土日 21:00〜翌02:00"), "{rendered}");
@@ -765,7 +785,7 @@ mod tests {
             &[],
         );
         assert!(
-            rendered.contains("いまマッチメイカは止まっています"),
+            rendered.contains("いまマッチメイキングは止まっています"),
             "{rendered}"
         );
         assert!(rendered.contains("data-view=\"queued\""), "{rendered}");
@@ -778,7 +798,7 @@ mod tests {
     fn a_closed_queue_is_announced_and_the_button_is_disabled() {
         let closed = StatusView {
             queue_open: false,
-            queue_window: Some("水金土日 20:45〜翌02:00".to_owned()),
+            queue_schedule: Some(nightly_times()),
             matchmaker_open: false,
             matchmaker_window: Some("水金土日 21:00〜翌02:00".to_owned()),
             ..status()
@@ -792,7 +812,14 @@ mod tests {
             rendered.contains("いまはキューの受付時間外です"),
             "{rendered}"
         );
-        assert!(rendered.contains("水金土日 20:45〜翌02:00"), "{rendered}");
+        assert!(
+            rendered.contains("キュー受付は <strong>水金土日 20:45</strong> から、マッチメイキングは <strong>21:00</strong> からです（終了 翌02:00、日本時間）"),
+            "受付開始と稼働開始を分けて書く: {rendered}"
+        );
+        assert!(
+            !rendered.contains("20:45〜"),
+            "受付を 1 つの枠にしない: {rendered}"
+        );
         assert!(
             rendered.contains("<button type=\"submit\" disabled>キューに入る</button>"),
             "{rendered}"
@@ -806,7 +833,7 @@ mod tests {
         // 受付は開いたが稼働はまだ（20:45〜21:00）: 停止の告知だけが出て、ボタンは押せる
         let early = StatusView {
             queue_open: true,
-            queue_window: Some("水金土日 20:45〜翌02:00".to_owned()),
+            queue_schedule: Some(nightly_times()),
             matchmaker_open: false,
             matchmaker_window: Some("水金土日 21:00〜翌02:00".to_owned()),
             ..status()
@@ -822,7 +849,7 @@ mod tests {
         // スケジュールを使っていない（枠が無い）ときの文言
         let unscheduled = StatusView {
             queue_open: false,
-            queue_window: None,
+            queue_schedule: None,
             ..status()
         };
         let rendered = queue_page(Viewer::MEMBER, &unscheduled, Utc::now(), None, &[]);

@@ -240,9 +240,12 @@ pub(super) struct StatusView {
     /// 受付は稼働開始の少し前（既定 20:45）から開き、稼働の終了と同時に閉じる。
     /// 手動の停止は関係ない（止まっていてもキューには入れる）。
     pub(super) queue_open: bool,
-    /// 受付枠（`水金土日 20:45〜翌02:00` の形）。スケジュールを使っていなければ `null`。
+    /// 受付と稼働の時刻。スケジュールを使っていなければ `null`。
+    ///
+    /// **「受付」と「マッチメイキング」を 1 つの枠にまとめない。**「受付 20:45〜翌02:00」と
+    /// 書くと 20:45 から組まれると読まれる。受付開始と稼働開始は別々に出す。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) queue_window: Option<String>,
+    pub(super) queue_schedule: Option<QueueScheduleView>,
     /// 自分のエントリ。キュー中でなければ `null`。
     pub(super) entry: Option<EntryView>,
     /// 自分の範囲内でキュー中の人数（相互条件、07 §3-1）。
@@ -448,17 +451,13 @@ async fn join_queue(
     let now = Utc::now();
     match app.queue.schedule().await {
         Ok(schedule) if !schedule.queue_is_open(now) => {
-            let window = window_text(
-                &schedule,
-                &schedule.queue_open_text(),
-                schedule.queue_window_crosses_midnight(),
-            );
+            let times = QueueScheduleView::from(&schedule);
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({
                     "error": "queue_closed",
-                    "message": format!("キューの受付時間外です。受付は {window}（日本時間）です。"),
-                    "queue_window": window,
+                    "message": times.closed_message(),
+                    "queue_schedule": times,
                 })),
             )
                 .into_response();
@@ -595,7 +594,7 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
     let queue_open = schedule
         .as_ref()
         .is_none_or(|schedule| schedule.queue_is_open(now));
-    let (matchmaker_window, queue_window) = schedule
+    let (matchmaker_window, queue_schedule) = schedule
         .filter(|schedule| schedule.enabled)
         .map(|schedule| {
             (
@@ -604,11 +603,7 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
                     &schedule.start_text(),
                     schedule.crosses_midnight(),
                 )),
-                Some(window_text(
-                    &schedule,
-                    &schedule.queue_open_text(),
-                    schedule.queue_window_crosses_midnight(),
-                )),
+                Some(QueueScheduleView::from(&schedule)),
             )
         })
         .unwrap_or_default();
@@ -619,7 +614,7 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
         matchmaker_open: stop.is_none(),
         matchmaker_window,
         queue_open,
-        queue_window,
+        queue_schedule,
         entry: entry.map(EntryView::from),
         in_range: in_range.as_ref().map(|summary| summary.total),
         queue_total: in_range.as_ref().map(|summary| summary.queue_total),
@@ -628,6 +623,56 @@ async fn status(app: &QueueState, player_id: PlayerId) -> Option<StatusView> {
         destination,
         removed_by_staff,
     })
+}
+
+/// 受付開始・稼働開始・終了を**別々に**持つ。画面と 403 の文言はここから作る。
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct QueueScheduleView {
+    /// 開催日（`水金土日`）。
+    pub(super) days: String,
+    /// キュー受付開始（`20:45`）。
+    pub(super) queue_open: String,
+    /// マッチメイキング開始（`21:00`）。
+    pub(super) matchmaker_start: String,
+    /// 終了（`02:00`）。受付も稼働もここで閉じる。
+    pub(super) end: String,
+    /// 終了が翌日か。
+    pub(super) end_next_day: bool,
+}
+
+impl From<&MatchmakerSchedule> for QueueScheduleView {
+    fn from(schedule: &MatchmakerSchedule) -> Self {
+        Self {
+            days: schedule.day_labels().join(""),
+            queue_open: schedule.queue_open_text(),
+            matchmaker_start: schedule.start_text(),
+            end: schedule.end_text(),
+            end_next_day: schedule.crosses_midnight(),
+        }
+    }
+}
+
+impl QueueScheduleView {
+    /// 終了時刻（`翌02:00`）。
+    pub(super) fn end_text(&self) -> String {
+        format!(
+            "{wrap}{end}",
+            wrap = if self.end_next_day { "翌" } else { "" },
+            end = self.end
+        )
+    }
+
+    /// 受付時間外に断るときの文言。**受付開始と稼働開始を分けて書く。**
+    pub(super) fn closed_message(&self) -> String {
+        format!(
+            "キューの受付時間外です。キュー受付は {days} {queue_open} から、\
+             マッチメイキングは {start} からです（終了 {end}、日本時間）。",
+            days = self.days,
+            queue_open = self.queue_open,
+            start = self.matchmaker_start,
+            end = self.end_text(),
+        )
+    }
 }
 
 /// 枠の文言（`水金土日 21:00〜翌02:00`）。稼働枠と受付枠で開始だけが違う。
