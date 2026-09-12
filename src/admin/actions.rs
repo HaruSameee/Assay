@@ -48,12 +48,14 @@ pub enum AdminActionKind {
     MatchmakerScheduled,
     /// 終わった試合の裁定をやり直した（終端イベントをもう 1 行積み、10 人ぶんが引き直される）。
     MatchReadjudicated,
+    /// ブロック解除の待機日数を変えた（既にあるブロックにも効く）。
+    BlockCooldownChanged,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
@@ -68,6 +70,7 @@ impl AdminActionKind {
         Self::DisputeResolved,
         Self::MatchmakerScheduled,
         Self::MatchReadjudicated,
+        Self::BlockCooldownChanged,
     ];
 
     /// DB に入る文字列。
@@ -84,6 +87,7 @@ impl AdminActionKind {
             Self::DisputeResolved => "dispute_resolved",
             Self::MatchmakerScheduled => "matchmaker_scheduled",
             Self::MatchReadjudicated => "match_readjudicated",
+            Self::BlockCooldownChanged => "block_cooldown_changed",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -104,6 +108,7 @@ impl AdminActionKind {
             "dispute_resolved" => Some(Self::DisputeResolved),
             "matchmaker_scheduled" => Some(Self::MatchmakerScheduled),
             "match_readjudicated" => Some(Self::MatchReadjudicated),
+            "block_cooldown_changed" => Some(Self::BlockCooldownChanged),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -125,6 +130,7 @@ impl AdminActionKind {
             Self::DisputeResolved => "係争を裁定",
             Self::MatchmakerScheduled => "稼働スケジュールを変更",
             Self::MatchReadjudicated => "終わった試合の裁定をやり直し",
+            Self::BlockCooldownChanged => "ブロック解除の待機日数を変更",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",

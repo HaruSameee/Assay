@@ -4,10 +4,16 @@ use uuid::Uuid;
 
 use crate::lifecycle::Timestamp;
 
-pub const BLOCK_COOLDOWN_DAYS: i64 = 5;
+/// ブロック解除の待機日数の既定値。**`current_block_cooldown` の coalesce と同じ値**
+/// （1 行も設定していなければこれ）。運営が変えられる（`/admin/block-cooldown`）。
+pub const DEFAULT_BLOCK_COOLDOWN_DAYS: i64 = 5;
 
-pub fn cooldown_ends_at(blocked_at: Timestamp) -> Timestamp {
-    blocked_at + Duration::days(BLOCK_COOLDOWN_DAYS)
+/// 待機日数の上限。SQL の CHECK と同じ。
+pub const MAX_BLOCK_COOLDOWN_DAYS: i64 = 365;
+
+/// 解除できるようになる時刻。**純粋関数。**日数は呼ぶ側が `current_block_cooldown` から渡す。
+pub fn cooldown_ends_at(blocked_at: Timestamp, cooldown_days: i64) -> Timestamp {
+    blocked_at + Duration::days(cooldown_days)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,11 +47,14 @@ pub struct CurrentBlock {
     pub display_name: Option<String>,
     pub trainer_name: Option<String>,
     pub blocked_at: Timestamp,
+    /// 読んだ時点の待機日数（`current_block_cooldown`）。**保存値ではない**ので、
+    /// 運営が日数を変えれば既にあるブロックの解除可能時刻も変わる。
+    pub cooldown_days: i64,
 }
 
 impl CurrentBlock {
     pub fn cooldown_ends_at(&self) -> Timestamp {
-        cooldown_ends_at(self.blocked_at)
+        cooldown_ends_at(self.blocked_at, self.cooldown_days)
     }
 
     pub fn can_unblock_at(&self, now: Timestamp) -> bool {

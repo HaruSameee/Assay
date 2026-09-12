@@ -432,6 +432,7 @@ mod tests {
             display_name: Some("Global Name".to_owned()),
             trainer_name: Some("trainer".to_owned()),
             blocked_at: chrono::Utc::now(),
+            cooldown_days: 5,
         }];
         let search = [
             BlockSearchResult {

@@ -2815,3 +2815,75 @@ async fn penalties_follow_the_final_outcome_of_a_readjudicated_match(owner: PgPo
 
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// ブロック解除の待機日数
+// ----------------------------------------------------------------------
+
+/// **待機日数は画面から変えられ、範囲外と理由なしは断る。**追記専用で履歴が出る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_block_cooldown_can_be_changed_from_the_panel(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/block-cooldown").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("現在の待機日数"), "{page}");
+    assert!(page.contains("5 日"), "既定は 5 日: {page}");
+    assert!(page.contains("まだ一度も変更していません"), "{page}");
+    let key = form_key(&page, "/admin/block-cooldown");
+
+    // 範囲外と理由なし
+    let (_, refused) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/block-cooldown",
+        &format!("cooldown_days=366&reason=x&key={key}"),
+    )
+    .await;
+    assert!(refused.contains("0 以上 365 以下"), "{refused}");
+    let (_, no_reason) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/block-cooldown",
+        &format!("cooldown_days=2&reason=&key={key}"),
+    )
+    .await;
+    assert!(no_reason.contains("理由を入力してください"), "{no_reason}");
+    assert_eq!(count(&db, "block_cooldown_changes").await, 0);
+
+    // 2 日にする
+    let (status, changed) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/block-cooldown",
+        &format!("cooldown_days=2&reason=%E6%A0%A1%E6%AD%A3&key={key}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        changed.contains("ブロック解除の待機日数を 2 日に変更しました"),
+        "{changed}"
+    );
+    assert!(changed.contains("<td class=\"num\">2 日</td>"), "{changed}");
+    assert_eq!(count(&db, "block_cooldown_changes").await, 1);
+    assert_eq!(db.blocks.cooldown_days().await.unwrap(), 2);
+
+    // 同じキーの再送は増えない
+    let (_, again) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/block-cooldown",
+        &format!("cooldown_days=2&reason=%E6%A0%A1%E6%AD%A3&key={key}"),
+    )
+    .await;
+    assert!(again.contains("既に記録されています"), "{again}");
+    assert_eq!(count(&db, "block_cooldown_changes").await, 1);
+
+    // 非管理者には無い
+    let (status, _) = get_html(&app, player(2), "/admin/block-cooldown").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    println!("待機日数: 5 → 2 日、範囲外/理由なし/重複キーは拒否");
+    db.done().await;
+}

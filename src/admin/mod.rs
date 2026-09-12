@@ -17,6 +17,7 @@
 //!   プロセス内に持つと、再起動で勝手に再開する。
 
 pub mod actions;
+pub mod block_cooldown;
 pub mod config;
 pub mod disputes;
 pub mod html;
@@ -30,6 +31,10 @@ pub mod season;
 pub use actions::{
     AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, MAX_BLOCK_ALLOWANCE, PauseState,
     QueueRemoval, normalize_reason, parse_block_allowance,
+};
+pub use block_cooldown::{
+    BlockCooldownChange, BlockCooldownError, BlockCooldownOutcome, BlockCooldownPreview,
+    parse_cooldown_days,
 };
 pub use config::{
     ADMIN_DISCORD_USER_IDS, AdminConfigError, AdminIds, admin_ids_from_env, parse_admin_ids,
@@ -48,8 +53,8 @@ pub use rating_params::{
 };
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
-    NewAdjustment, NewAdminAction, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams,
-    NewSeasonBoundary, QueuedEntry, QueuedRole, RemovalOutcome,
+    NewAdjustment, NewAdminAction, NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule,
+    NewRatingParams, NewSeasonBoundary, QueuedEntry, QueuedRole, RemovalOutcome,
 };
 pub use routes::{AdminState, router};
 pub use schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome, parse_days, parse_time};

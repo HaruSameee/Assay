@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use super::block_cooldown::{BlockCooldownChange, BlockCooldownOutcome, BlockCooldownPreview};
 use super::disputes::{
     DisputeOutcome, FinalOutcome, NewDisputeResolution, NewReadjudication, ReadjudicationOutcome,
 };
@@ -986,6 +987,117 @@ impl AdminRepository {
         .await?;
         tx.commit().await?;
         Ok(MatchingRangeOutcome::Changed { id })
+    }
+}
+
+// ----------------------------------------------------------------------
+// ブロック解除の待機日数の変更
+// ----------------------------------------------------------------------
+//
+// **現在値のテーブルは作らない。**日数は `block_cooldown_changes` の最新行から導出する
+// （`current_block_cooldown`）。解除可能時刻は読むたびに `blocked_at + 日数` で導出する
+// ので、既にあるブロックにも新しい日数が効く（`admin::block_cooldown`）。
+
+/// 追記する変更 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBlockCooldown {
+    /// 新しい日数。**検証済みの値を渡すこと**（`admin::parse_cooldown_days`）。
+    pub cooldown_days: i32,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**（状態ベースにしない）。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// 変更画面に出す値。**毎回数え直す**（保存しない）。
+    pub async fn block_cooldown_preview(&self) -> Result<BlockCooldownPreview, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        let current_days = crate::blocks::repository::block_cooldown_days_on(&mut conn).await?;
+        // いま有効なブロック = 相手ごとの最新イベントが blocked の組の数
+        let active_blocks = sqlx::query_scalar!(
+            "select count(*) as \"count!\" from ( \
+                 select distinct on (player_id, blocked_player_id) kind \
+                 from player_blocks order by player_id, blocked_player_id, id desc \
+             ) latest where latest.kind = 'blocked'"
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        let history = sqlx::query!(
+            "select id, cooldown_days, reason, created_by, created_at \
+             from block_cooldown_changes order by id desc limit 20"
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(BlockCooldownPreview {
+            current_days,
+            active_blocks: usize::try_from(active_blocks).unwrap_or(0),
+            history: history
+                .into_iter()
+                .map(|row| BlockCooldownChange {
+                    id: row.id,
+                    cooldown_days: row.cooldown_days,
+                    reason: row.reason,
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                })
+                .collect(),
+        })
+    }
+
+    /// 日数の変更を追記する。
+    ///
+    /// ブロック・解除の検証（`blocks::repository`）と同じ advisory lock を取るので、
+    /// 解除の可否判定の途中で日数が入れ替わることはない。
+    pub async fn change_block_cooldown(
+        &self,
+        input: &NewBlockCooldown,
+    ) -> Result<BlockCooldownOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        crate::persistence::repository::lock_vc_pool(&mut tx).await?;
+        let previous = crate::blocks::repository::block_cooldown_days_on(&mut tx).await?;
+        let inserted = sqlx::query_scalar!(
+            "insert into block_cooldown_changes \
+             (cooldown_days, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.cooldown_days,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(BlockCooldownOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::BlockCooldownChanged,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "block_cooldown_change_id": id,
+                    "previous_cooldown_days": previous,
+                    "cooldown_days": input.cooldown_days,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("block_cooldown:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(BlockCooldownOutcome::Changed { id })
     }
 }
 

@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::blocks::MAX_BLOCK_COOLDOWN_DAYS;
 use crate::blocks::{CurrentBlock, IncomingBlock, ReceivedBlockCount};
 use crate::queue::html::role_label;
 use crate::queue::{MAX_RANGE, MIN_RANGE};
@@ -14,6 +15,7 @@ use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
+use super::block_cooldown::BlockCooldownPreview;
 use super::disputes::DisputeDecision;
 use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
@@ -497,6 +499,92 @@ pub struct QueueView<'a> {
 }
 
 /// 管理パネル内の行き来。画面を跨いでも当日の導線を見失わないようにする。
+pub struct BlockCooldownView<'a> {
+    /// 現在値・有効なブロック数・履歴。すべて導出値。
+    pub preview: &'a BlockCooldownPreview,
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    pub notice: Option<Notice>,
+}
+
+fn block_cooldown_history(preview: &BlockCooldownPreview) -> String {
+    if preview.history.is_empty() {
+        return "<p class=\"muted\">まだ一度も変更していません（既定値のまま）。</p>\n".to_owned();
+    }
+    let rows = preview
+        .history
+        .iter()
+        .map(|change| {
+            format!(
+                "<tr><td>{at}</td><td class=\"num\">{days} 日</td>\
+                 <td>{reason}</td><td>{by}</td></tr>\n",
+                at = escape(&display_time(change.created_at)),
+                days = change.cooldown_days,
+                reason = escape(&change.reason),
+                by = escape(&change.created_by),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>待機日数</th><th>理由</th><th>操作者</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+pub fn block_cooldown_page(view: &BlockCooldownView<'_>) -> String {
+    let body = format!(
+        "<p class=\"lead\">ブロックしてから<strong>解除できるようになるまでの日数</strong>です。\
+         ブロック枠（人数）はプレイヤーごとに<a href=\"/admin/players\">登録者一覧</a>から変えます。</p>\n\
+         <p class=\"notice\"><strong>既にあるブロックにも効きます。</strong>解除できる時刻は\
+         「ブロックした時刻 + この日数」を見るたびに計算するので、縮めれば待っている人が\
+         すぐ解除でき、伸ばせば解除できたはずの人がまた待ちます。0 日は「待たない」。\
+         試合とレートには何も影響しません。</p>\n\
+         <p class=\"notice\">追記専用です。間違えたら<strong>元の値をもう 1 行追記すれば戻ります</strong>。\
+         運営の管理解除（プレイヤー画面）は日数に関係なくできます。</p>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>項目</th><th>値</th></tr></thead>\n<tbody>\n\
+         <tr><td><strong>現在の待機日数</strong></td><td class=\"num\">{days} 日</td></tr>\n\
+         <tr><td>いま有効なブロックの件数（解除可能時刻が変わります）</td>\
+         <td class=\"num\">{active}</td></tr>\n\
+         </tbody>\n</table></div>\n\
+         <form method=\"post\" action=\"/admin/block-cooldown\">\
+         <input type=\"hidden\" name=\"key\" value=\"block-cooldown:{key}\">\
+         <label for=\"cooldown_days\">待機日数（0〜{max}）</label>\
+         <input id=\"cooldown_days\" name=\"cooldown_days\" type=\"text\" inputmode=\"numeric\" \
+         autocomplete=\"off\" value=\"{days}\" required>\
+         <label for=\"reason\">理由（記録に残ります）</label>\
+         <input id=\"reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">待機日数を変更する</button>\
+         </div></form>\n\
+         <h2>変更履歴</h2>\n{history}",
+        days = view.preview.current_days,
+        active = view.preview.active_blocks,
+        key = escape(view.form_key),
+        max = MAX_BLOCK_COOLDOWN_DAYS,
+        history = block_cooldown_history(view.preview),
+    );
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / ブロック解除の待機日数",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-block-cooldown-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-block-cooldown-title\">ブロック解除の待機日数を変える</h1>\n\
+             {nav}\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/block-cooldown"),
+            notice = notice_html(view.notice.as_ref()),
+        ),
+    )
+}
+
 fn admin_nav(current: &str) -> String {
     let link = |href: &str, label: &str| {
         if href == current {
@@ -506,7 +594,7 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/players", "登録者一覧"),
         link("/admin/queue", "キューと運用"),
@@ -514,6 +602,7 @@ fn admin_nav(current: &str) -> String {
         link("/admin/season", "シーズン"),
         link("/admin/rating-params", "レート増減幅"),
         link("/admin/matching-range", "マッチング範囲"),
+        link("/admin/block-cooldown", "ブロック解除の待機日数"),
         link("/admin/quiet-reports", "聞き専報告"),
     )
 }
@@ -1652,6 +1741,7 @@ mod tests {
 
     use super::*;
     use crate::admin::actions::{AdminActionKind, DEFAULT_BLOCK_ALLOWANCE};
+    use crate::admin::block_cooldown::BlockCooldownChange;
     use crate::admin::repository::QueuedRole;
 
     /// 停止していないマッチメイカ。既存のテストはこの状態を前提にしている
@@ -2014,6 +2104,7 @@ mod tests {
             display_name: Some("Global Outgoing".to_owned()),
             trainer_name: None,
             blocked_at: Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap(),
+            cooldown_days: 5,
         }];
         let incoming = [IncomingBlock {
             player_id: Uuid::from_u128(9),
@@ -2067,6 +2158,56 @@ mod tests {
     }
 
     /// **既定の枠がフォームに反映される。**何も設定していなくても、
+    /// 待機日数の画面: 現在値・有効なブロック数・履歴・フォーム。
+    #[test]
+    fn the_block_cooldown_page_shows_the_current_days_and_history() {
+        let preview = BlockCooldownPreview {
+            current_days: 5,
+            active_blocks: 3,
+            history: vec![BlockCooldownChange {
+                id: 1,
+                cooldown_days: 5,
+                reason: "戻す".to_owned(),
+                created_by: "discord:1".to_owned(),
+                created_at: Utc.with_ymd_and_hms(2026, 9, 13, 12, 0, 0).unwrap(),
+            }],
+        };
+        let rendered = block_cooldown_page(&BlockCooldownView {
+            preview: &preview,
+            form_key: "k",
+            notice: None,
+        });
+        assert!(
+            rendered.contains("ブロック解除の待機日数を変える"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<td class=\"num\">5 日</td>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<td class=\"num\">3</td>"), "{rendered}");
+        assert!(rendered.contains("name=\"cooldown_days\""), "{rendered}");
+        assert!(
+            rendered.contains("value=\"block-cooldown:k\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("待機日数（0〜365）"), "{rendered}");
+        assert!(
+            rendered.contains("既にあるブロックにも効きます"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<td>戻す</td>"), "{rendered}");
+        // ナビに載る
+        assert!(
+            rendered.contains("<strong>ブロック解除の待機日数</strong>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("href=\"/admin/matching-range\""),
+            "{rendered}"
+        );
+    }
+
     /// 水金土日 21:00〜02:00 にチェックが入った状態で開く。
     #[test]
     fn the_schedule_form_is_prefilled_with_the_current_window() {

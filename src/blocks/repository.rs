@@ -23,6 +23,9 @@ impl BlockRepository {
     }
 
     pub async fn current_for(&self, player_id: PlayerId) -> Result<Vec<CurrentBlock>, sqlx::Error> {
+        // 待機日数は**読むたびに**現在値を引く（運営が変えれば既にあるブロックにも効く）
+        let mut conn = self.pool.acquire().await?;
+        let cooldown_days = block_cooldown_days_on(&mut conn).await?;
         let rows = sqlx::query!(
             "select latest.blocked_player_id, latest.created_at as \"blocked_at!\", \
                     snapshot.display_name as \"display_name?\", target.trainer_name \
@@ -51,8 +54,15 @@ impl BlockRepository {
                 display_name: row.display_name,
                 trainer_name: row.trainer_name,
                 blocked_at: row.blocked_at,
+                cooldown_days,
             })
             .collect())
+    }
+
+    /// いま効いている解除の待機日数（`current_block_cooldown`）。
+    pub async fn cooldown_days(&self) -> Result<i64, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        block_cooldown_days_on(&mut conn).await
     }
 
     /// ブロック相手を探す。**トレーナー名・Discord 表示名・Discord ユーザー ID の 3 つで引く。**
@@ -236,7 +246,8 @@ impl BlockRepository {
         else {
             return Err(UserBlockError::NotBlocked);
         };
-        let available_at = cooldown_ends_at(blocked_at);
+        let cooldown_days = block_cooldown_days_on(&mut tx).await?;
+        let available_at = cooldown_ends_at(blocked_at, cooldown_days);
         if created_at < available_at {
             return Err(UserBlockError::Cooldown { available_at });
         }
@@ -377,6 +388,16 @@ async fn active_count_on(
     )
     .fetch_one(connection)
     .await
+}
+
+/// 現在の解除待機日数。`current_block_cooldown` の 1 行（1 行も無ければ既定の 5 日）。
+pub(crate) async fn block_cooldown_days_on(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
+    let days = sqlx::query_scalar!(
+        "select cooldown_days as \"cooldown_days!\" from current_block_cooldown"
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(i64::from(days))
 }
 
 async fn block_allowance_on(

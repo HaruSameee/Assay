@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select cooldown_days as \"cooldown_days!\" from current_block_cooldown",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cooldown_days!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "current_block_cooldown",
+            "name": "cooldown_days"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "fa1ee9b54ebb932e432da74365fac15a37d89a3dd710e93dcd11f0317a844d57"
+}

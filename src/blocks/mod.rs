@@ -8,7 +8,8 @@ pub mod model;
 pub mod repository;
 
 pub use model::{
-    AdminBlockOverrideError, BLOCK_COOLDOWN_DAYS, BlockKind, BlockSearchResult, CurrentBlock,
-    IncomingBlock, ReceivedBlockCount, UserBlockError, cooldown_ends_at,
+    AdminBlockOverrideError, BlockKind, BlockSearchResult, CurrentBlock,
+    DEFAULT_BLOCK_COOLDOWN_DAYS, IncomingBlock, MAX_BLOCK_COOLDOWN_DAYS, ReceivedBlockCount,
+    UserBlockError, cooldown_ends_at,
 };
 pub use repository::BlockRepository;

@@ -42,18 +42,19 @@ use super::disputes::{
 };
 use crate::nullified::NullifiedReportRepository;
 
+use super::block_cooldown::{BlockCooldownOutcome, parse_cooldown_days};
 use super::html::{
-    MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView, QueueView, QuietReportsView,
-    RatingParamsView, ReportsView, RosterView, ScheduleView, SearchView, SeasonView,
-    matching_range_page, player_page, queue_page, quiet_reports_page, rating_params_page,
-    reports_page, roster_page, search_page, season_page,
+    BlockCooldownView, MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView,
+    QueueView, QuietReportsView, RatingParamsView, ReportsView, RosterView, ScheduleView,
+    SearchView, SeasonView, block_cooldown_page, matching_range_page, player_page, queue_page,
+    quiet_reports_page, rating_params_page, reports_page, roster_page, search_page, season_page,
 };
 use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewMatchingRange, NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary, NewStaffReport,
-    RemovalOutcome, StaffReportOutcome,
+    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary,
+    NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::schedule::{MatchmakerSchedule, ScheduleOutcome, parse_days, parse_time};
 use super::season::{
@@ -147,6 +148,11 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/admin/matching-range",
             get(show_matching_range).post(change_matching_range),
+        )
+        // ブロック解除の待機日数。1 段階（試合に影響しない。追記で戻せる）
+        .route(
+            "/admin/block-cooldown",
+            get(show_block_cooldown).post(change_block_cooldown),
         )
         // 聞き専報告。**閲覧だけ**（運営が代理で入れる経路は作らない）
         .route("/admin/quiet-reports", get(show_quiet_reports))
@@ -1727,6 +1733,98 @@ async fn change_matching_range(
         }
     };
     render_matching_range(&app, Some(notice), None).await
+}
+
+// ----------------------------------------------------------------------
+// ブロック解除の待機日数
+// ----------------------------------------------------------------------
+//
+// マッチング範囲と同じ 1 段階。試合には何も影響せず、追記で戻せる。
+// **既にあるブロックにも効く**ので、画面にはいま有効なブロックの件数を出す。
+
+async fn render_block_cooldown(
+    app: &AdminState,
+    notice: Option<Notice>,
+    key: Option<&str>,
+) -> Response {
+    let preview = match app.store.block_cooldown_preview().await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not read the block cooldown preview");
+            return internal_error();
+        }
+    };
+    let generated = form_key();
+    Html(block_cooldown_page(&BlockCooldownView {
+        preview: &preview,
+        form_key: key.unwrap_or(&generated),
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_block_cooldown(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_block_cooldown(&app, None, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockCooldownForm {
+    #[serde(default)]
+    cooldown_days: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn change_block_cooldown(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<BlockCooldownForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let cooldown_days = match parse_cooldown_days(&form.cooldown_days) {
+        Ok(days) => days,
+        Err(error) => {
+            let notice = fail(error.to_string());
+            return render_block_cooldown(&app, Some(notice), Some(&form.key)).await;
+        }
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        let notice = fail("理由を入力してください。".to_owned());
+        return render_block_cooldown(&app, Some(notice), Some(&form.key)).await;
+    };
+
+    let input = NewBlockCooldown {
+        cooldown_days,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.change_block_cooldown(&input).await {
+        Ok(BlockCooldownOutcome::Changed { id }) => info(format!(
+            "ブロック解除の待機日数を {cooldown_days} 日に変更しました（#{id}）。\
+             既にあるブロックにもこの日数で効きます。試合は何も変わりません。"
+        )),
+        Ok(BlockCooldownOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not change the block cooldown");
+            return internal_error();
+        }
+    };
+    render_block_cooldown(&app, Some(notice), None).await
 }
 
 // ----------------------------------------------------------------------

@@ -3,7 +3,8 @@
 use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use unite_matchsystem::blocks::{BLOCK_COOLDOWN_DAYS, BlockRepository, UserBlockError};
+use unite_matchsystem::admin::{AdminRepository, BlockCooldownOutcome, NewBlockCooldown};
+use unite_matchsystem::blocks::{BlockRepository, DEFAULT_BLOCK_COOLDOWN_DAYS, UserBlockError};
 use unite_matchsystem::lifecycle::PlayerId;
 use unite_matchsystem::profiles::ProfileRepository;
 use uuid::Uuid;
@@ -69,7 +70,7 @@ async fn user_blocks_are_append_only_capacity_limited_and_cooldown_limited(owner
         .unwrap_err();
     assert!(matches!(cooldown, UserBlockError::Cooldown { .. }));
 
-    let available_at = at(0) + TimeDelta::days(BLOCK_COOLDOWN_DAYS);
+    let available_at = at(0) + TimeDelta::days(DEFAULT_BLOCK_COOLDOWN_DAYS);
     blocks
         .unblock(player(1), player(2), "unblock-after-cooldown", available_at)
         .await
@@ -90,6 +91,130 @@ async fn user_blocks_are_append_only_capacity_limited_and_cooldown_limited(owner
             );
         }
     }
+    app.close().await;
+}
+
+/// **待機日数は運営が変えられ、既にあるブロックにも効く。**
+///
+/// 既定は 5 日（SQL の coalesce と Rust の定数が一致していることもここで見る）。
+/// 2 日に縮めれば 2 日で解除でき、0 日ならすぐ解除できる。伸ばせば解除できたはずの
+/// 人がまた待つ。変更は運営操作ログにも残る。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_cooldown_is_configurable_and_applies_to_existing_blocks(owner: PgPool) {
+    let app = app_pool(&owner).await;
+    let blocks = BlockRepository::new(app.clone());
+    let admin = AdminRepository::new(app.clone());
+
+    assert_eq!(
+        blocks.cooldown_days().await.unwrap(),
+        DEFAULT_BLOCK_COOLDOWN_DAYS,
+        "SQL と Rust の既定値がずれている"
+    );
+    blocks
+        .block(player(1), player(2), "block-one", at(0))
+        .await
+        .unwrap();
+    let current = blocks.current_for(player(1)).await.unwrap();
+    assert_eq!(current[0].cooldown_days, 5);
+    assert_eq!(current[0].cooldown_ends_at(), at(0) + TimeDelta::days(5));
+
+    // 2 日に縮める → 既にあるブロックが 2 日で解除できる
+    let change = |days: i32, key: &str| NewBlockCooldown {
+        cooldown_days: days,
+        reason: "校正".to_owned(),
+        actor_discord_user_id: 42,
+        created_at: at(60),
+        idempotency_key: key.to_owned(),
+    };
+    assert_eq!(
+        admin
+            .change_block_cooldown(&change(2, "two"))
+            .await
+            .unwrap(),
+        BlockCooldownOutcome::Changed { id: 1 }
+    );
+    assert_eq!(
+        admin
+            .change_block_cooldown(&change(2, "two"))
+            .await
+            .unwrap(),
+        BlockCooldownOutcome::Duplicate,
+        "同じ冪等キーは no-op"
+    );
+    assert_eq!(blocks.cooldown_days().await.unwrap(), 2);
+    let current = blocks.current_for(player(1)).await.unwrap();
+    assert_eq!(current[0].cooldown_ends_at(), at(0) + TimeDelta::days(2));
+    let early = blocks
+        .unblock(
+            player(1),
+            player(2),
+            "unblock-day-1",
+            at(0) + TimeDelta::days(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(early, UserBlockError::Cooldown { .. }));
+
+    // 伸ばし直せば、また待つ
+    admin
+        .change_block_cooldown(&change(10, "ten"))
+        .await
+        .unwrap();
+    let late = blocks
+        .unblock(
+            player(1),
+            player(2),
+            "unblock-day-3",
+            at(0) + TimeDelta::days(3),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(late, UserBlockError::Cooldown { available_at } if available_at == at(0) + TimeDelta::days(10))
+    );
+
+    // 0 日は「待たない」
+    admin
+        .change_block_cooldown(&change(0, "zero"))
+        .await
+        .unwrap();
+    blocks
+        .unblock(
+            player(1),
+            player(2),
+            "unblock-now",
+            at(0) + TimeDelta::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(blocks.current_for(player(1)).await.unwrap().is_empty());
+
+    // 運営操作ログ（前の値と新しい値）
+    let logged: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "select payload from admin_actions where kind = 'block_cooldown_changed' order by id",
+    )
+    .fetch_all(&app)
+    .await
+    .unwrap();
+    assert_eq!(logged.len(), 3);
+    assert_eq!(logged[0].0["previous_cooldown_days"], 5);
+    assert_eq!(logged[0].0["cooldown_days"], 2);
+    assert_eq!(logged[2].0["cooldown_days"], 0);
+    // 履歴は新しい順
+    let preview = admin.block_cooldown_preview().await.unwrap();
+    assert_eq!(preview.current_days, 0);
+    assert_eq!(preview.active_blocks, 0);
+    assert_eq!(
+        preview
+            .history
+            .iter()
+            .map(|change| change.cooldown_days)
+            .collect::<Vec<_>>(),
+        vec![0, 10, 2]
+    );
     app.close().await;
 }
 
@@ -122,7 +247,7 @@ async fn received_block_counts_are_derived_from_current_events_and_sorted(owner:
             player(4),
             player(7),
             "four-seven-unblock",
-            at(3) + TimeDelta::days(BLOCK_COOLDOWN_DAYS),
+            at(3) + TimeDelta::days(DEFAULT_BLOCK_COOLDOWN_DAYS),
         )
         .await
         .unwrap();

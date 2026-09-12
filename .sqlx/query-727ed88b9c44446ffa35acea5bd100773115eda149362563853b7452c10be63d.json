@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into block_cooldown_changes (cooldown_days, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5) on conflict (idempotency_key) do nothing returning id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "block_cooldown_changes",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "727ed88b9c44446ffa35acea5bd100773115eda149362563853b7452c10be63d"
+}

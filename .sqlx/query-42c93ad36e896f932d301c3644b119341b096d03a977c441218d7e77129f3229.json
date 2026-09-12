@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(*) as \"count!\" from ( select distinct on (player_id, blocked_player_id) kind from player_blocks order by player_id, blocked_player_id, id desc ) latest where latest.kind = 'blocked'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "42c93ad36e896f932d301c3644b119341b096d03a977c441218d7e77129f3229"
+}
