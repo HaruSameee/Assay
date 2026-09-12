@@ -398,7 +398,9 @@ async fn a_run_with_too_few_players_changes_nothing(owner: PgPool) {
             unmatched: 9,
             longest_unmatched_wait_seconds: Some(600),
             paused: false,
-            boosted: 0,
+            // 9 人とも 1500 で同率首位なので、全員が「いちばん上」として動く対象になる
+            // （同じだけ動くので相対位置は変わらない）
+            boosted: 9,
             direction: outcome.direction, // 方向はランダム（どちらでも同じ結果）
         }
     );
@@ -651,18 +653,20 @@ async fn the_production_entry_point_draws_the_direction_at_random(owner: PgPool)
 
 /// **1486 以下の人は、取り残されるたびに判定用レートが +14 され、上の帯と組める。**
 ///
-/// 9 人が 1560、1 人が 1486。そのままでは 74 離れていて組めない。スキャンのたびに
+/// 9 人が 1560、1 人が 1486、いちばん上に 1700 が 1 人（1560 の 9 人が「いちばん上」に
+/// ならないように）。1486 はそのままでは 74 離れていて組めない。スキャンのたびに
 /// `queue_entries.unmatched_scans` が進み、2 回目で 1514（差 46）になって 3 回目の
 /// スキャンで組まれる。formation に凍結されるのは実レートの 1486。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
 async fn a_stranded_low_rated_player_is_lifted_until_a_match_forms(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
-    seed_players(&db, 10).await;
+    seed_players(&db, 11).await;
     for n in 2..=10 {
         adjust_rating(&db, player(n), 60.0).await;
     }
+    adjust_rating(&db, player(11), 200.0).await;
     adjust_rating(&db, player(1), -14.0).await;
-    enqueue_full_rosters(&db, 10, at(0)).await;
+    enqueue_full_rosters(&db, 11, at(0)).await;
     let matchmaker = db.matchmaker(1);
 
     // 止まっている間（月曜の昼）は数えない
@@ -676,11 +680,11 @@ async fn a_stranded_low_rated_player_is_lifted_until_a_match_forms(owner: PgPool
         .unwrap();
     assert_eq!(scans, 0, "止まっている間は進まない");
 
-    // 1 回目: 1486 → 誰も組めない。全員 1 回取り残され、底上げ対象は 1 人
+    // 1 回目: 1486 → 誰も組めない。全員 1 回取り残され、動くのは 1486 と 1700 の 2 人
     let first = matchmaker.run_once(at(180)).await.unwrap();
     assert!(first.created.is_empty());
-    assert_eq!(first.unmatched, 10);
-    assert_eq!(first.boosted, 1, "1486 以下は 1 人だけ");
+    assert_eq!(first.unmatched, 11);
+    assert_eq!(first.boosted, 2, "1486 以下 1 人 + いちばん上 1 人");
     // 2 回目: 判定用 1500（差 60）→ まだ組めない
     let second = matchmaker.run_once(at(360)).await.unwrap();
     assert!(second.created.is_empty());
@@ -691,11 +695,11 @@ async fn a_stranded_low_rated_player_is_lifted_until_a_match_forms(owner: PgPool
             .unwrap();
     assert!(scans.iter().all(|(_, n)| *n == 2), "{scans:?}");
 
-    // 3 回目: 判定用 1514（差 46）→ 組める
+    // 3 回目: 判定用 1514（差 46）→ 1560 の 9 人と組める。1700（判定用 1672）は残る
     let third = matchmaker.run_once(at(540)).await.unwrap();
     assert_eq!(third.created.len(), 1, "{third:?}");
-    assert_eq!(third.boosted, 0);
-    assert_eq!(count(&db, "queue_entries").await, 0);
+    assert_eq!(third.boosted, 1, "残った 1700 がいちばん上");
+    assert_eq!(count(&db, "queue_entries").await, 1);
     let frozen: f64 =
         sqlx::query_scalar("select mu_at_match * 60.0 from formation_players where player_id = $1")
             .bind(player(1).0)
@@ -720,14 +724,53 @@ async fn a_stranded_low_rated_player_is_lifted_until_a_match_forms(owner: PgPool
     db.done().await;
 }
 
-/// **1487 以上は何回取り残されても上がらない**（カウンタは進むが判定に使わない）。
+/// **いちばん上の人は、取り残されるたびに判定用レートが −14 され、下の帯と組める。**
+/// 前の逆。9 人が 1600、1 人が 1674。3 回目のスキャン（1646、差 46）で組まれ、
+/// formation に凍結されるのは実レートの 1674。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_stranded_top_rated_player_is_pulled_down_until_a_match_forms(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    for n in 2..=10 {
+        adjust_rating(&db, player(n), 100.0).await;
+    }
+    adjust_rating(&db, player(1), 174.0).await;
+    enqueue_full_rosters(&db, 10, at(0)).await;
+    let matchmaker = db.matchmaker(1);
+
+    let first = matchmaker.run_once(at(180)).await.unwrap();
+    assert!(first.created.is_empty());
+    assert_eq!(first.boosted, 1, "いちばん上の 1 人だけ");
+    let second = matchmaker.run_once(at(360)).await.unwrap();
+    assert!(second.created.is_empty(), "1660 は差 60 でまだ遠い");
+    let third = matchmaker.run_once(at(540)).await.unwrap();
+    assert_eq!(third.created.len(), 1, "{third:?}");
+    assert_eq!(count(&db, "queue_entries").await, 0);
+    let frozen: f64 =
+        sqlx::query_scalar("select mu_at_match * 60.0 from formation_players where player_id = $1")
+            .bind(player(1).0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        (frozen - 1674.0).abs() < 1e-6,
+        "凍結するのは実レート: {frozen}"
+    );
+    println!("1674 の人: 2 回取り残されて 1646 相当になり 3 回目で成立。凍結 {frozen}");
+    db.done().await;
+}
+
+/// **1487 以上で、いちばん上でもない人は何回取り残されても動かない**（カウンタは進むが
+/// 判定に使わない）。1487 が 1 人、いちばん上 1700 が 1 人、あいだの 1560 が 8 人。
+/// 動くのは 1700 だけで、1487 は上がらず 1560 の帯に届かない（上が降りてきても 9 人止まり）。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
 async fn the_lift_stops_at_fourteen_eighty_seven(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     seed_players(&db, 10).await;
-    for n in 2..=10 {
+    for n in 3..=10 {
         adjust_rating(&db, player(n), 60.0).await;
     }
+    adjust_rating(&db, player(2), 200.0).await;
     adjust_rating(&db, player(1), -13.0).await;
     enqueue_full_rosters(&db, 10, at(0)).await;
     let matchmaker = db.matchmaker(1);
@@ -735,7 +778,7 @@ async fn the_lift_stops_at_fourteen_eighty_seven(owner: PgPool) {
     for round in 1..=5 {
         let outcome = matchmaker.run_once(at(180 * round)).await.unwrap();
         assert!(outcome.created.is_empty(), "round {round}: {outcome:?}");
-        assert_eq!(outcome.boosted, 0);
+        assert_eq!(outcome.boosted, 1, "動くのはいちばん上の 1 人だけ");
     }
     let scans: i32 =
         sqlx::query_scalar("select unmatched_scans from queue_entries where player_id = $1")

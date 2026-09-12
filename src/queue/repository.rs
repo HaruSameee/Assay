@@ -305,11 +305,13 @@ impl QueueRepository {
         )
         .fetch_all(&self.pool)
         .await?;
+        // 「いちばん上」はキュー全員の実レートから決める（マッチメイカと同じ）
+        let top = crate::matchmaker::top_rating(rows.iter().map(|row| &row.rating));
         Ok(rows
             .into_iter()
             .map(|row| QueuedPlayer {
                 player_id: PlayerId(row.player_id),
-                rating: crate::matchmaker::matching_rating(row.rating, row.unmatched_scans),
+                rating: crate::matchmaker::matching_rating(row.rating, row.unmatched_scans, top),
                 up_range: ranges.up,
                 down_range: ranges.clamp_down(row.down_range),
                 first_choice: row.first_choice,

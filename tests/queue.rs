@@ -1217,15 +1217,24 @@ async fn the_in_range_count_uses_the_lifted_rating(owner: PgPool) {
     let (_, from_low) = get_queue(&app, Some(low)).await;
     assert_eq!(from_low["in_range"], 1, "{from_low}");
 
-    // 1550 の人が取り残されても上がらない（1487 以上）
-    sqlx::query("update queue_entries set unmatched_scans = 9 where player_id = $1")
+    // 逆側: 1486 は戻し（0 回）、いちばん上の 1550 が 2 回取り残された → 1522（差 36）
+    sqlx::query("update queue_entries set unmatched_scans = 0 where player_id = $1")
+        .bind(low.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (_, from_low) = get_queue(&app, Some(low)).await;
+    assert_eq!(from_low["in_range"], 0, "{from_low}");
+    sqlx::query("update queue_entries set unmatched_scans = 2 where player_id = $1")
         .bind(high.0)
         .execute(&db.pool)
         .await
         .unwrap();
     let (_, from_low) = get_queue(&app, Some(low)).await;
     assert_eq!(from_low["in_range"], 1, "{from_low}");
-    println!("1486 + 2 回 → 1514 として範囲内に数える");
+    let (_, from_high) = get_queue(&app, Some(high)).await;
+    assert_eq!(from_high["in_range"], 1, "{from_high}");
+    println!("1486 + 2 回 → 1514 / いちばん上 1550 − 2 回 → 1522 として範囲内に数える");
     db.done().await;
 }
 

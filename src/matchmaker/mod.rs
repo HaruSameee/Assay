@@ -21,7 +21,9 @@ pub mod repository;
 pub mod runner;
 pub mod select;
 
-pub use boost::{BOOST_MAX_RATING, BOOST_PER_UNMATCHED_SCAN, matching_rating};
+pub use boost::{
+    BOOST_MAX_RATING, BOOST_PER_UNMATCHED_SCAN, is_shifted, matching_rating, top_rating,
+};
 pub use repository::{
     ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerRepository,
     MatchmakerSummary, RecentCompletionCounts, RunOutcome, SelectionMetrics, teams_are_swapped,

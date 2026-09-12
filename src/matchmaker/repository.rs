@@ -813,7 +813,8 @@ async fn load_candidates(
 ///
 /// **このスキャンで見た人だけ**（`candidates` はスキャン開始時に読んだ行）。スキャン中に
 /// 入ってきた人は次回から数える。止まっている間は呼ばない（呼び出し側が
-/// `matchmaker_stop_on` の後ろに置く）。戻り値は底上げの対象になる人数（ログ用）。
+/// `matchmaker_stop_on` の後ろに置く）。戻り値は次のスキャンで判定用レートが
+/// 動く人数（1486 以下と、残った中でいちばん上。ログ用）。
 async fn count_unmatched_scans(
     conn: &mut PgConnection,
     unmatched: &[Candidate],
@@ -832,9 +833,10 @@ async fn count_unmatched_scans(
     )
     .execute(&mut *conn)
     .await?;
+    let top = super::boost::top_rating(unmatched.iter().map(|candidate| &candidate.rating));
     Ok(unmatched
         .iter()
-        .filter(|candidate| candidate.rating <= super::boost::BOOST_MAX_RATING)
+        .filter(|candidate| super::boost::is_shifted(candidate.rating, top))
         .count())
 }
 

@@ -151,15 +151,16 @@ pub struct Candidate {
     /// フレックス補償の対象か（07 §5。`formation_players` から導出済み）。
     pub flex_compensation: bool,
     /// マッチメイカが走って、この人を見て、組まなかった回数（`queue_entries.unmatched_scans`）。
-    /// 1486 以下の人の[`Self::matching_rating`]にだけ効く。
+    /// 1486 以下の人と、そのスキャンでいちばん上の人の[`Self::matching_rating`]にだけ効く。
     pub unmatched_scans: i32,
 }
 
 impl Candidate {
-    /// **マッチング範囲の判定に使うレート。**低レート帯の取り残し対策の底上げ込み
-    /// （[`super::boost`]）。実レートは [`Self::rating`] のまま formation に凍結する。
-    pub fn matching_rating(&self) -> f64 {
-        super::boost::matching_rating(self.rating, self.unmatched_scans)
+    /// **マッチング範囲の判定に使うレート。**端の取り残し対策の寄せ込み
+    /// （[`super::boost`]。`top_rating` はそのスキャンの候補の実レートの最大）。
+    /// 実レートは [`Self::rating`] のまま formation に凍結する。
+    pub fn matching_rating(&self, top_rating: f64) -> f64 {
+        super::boost::matching_rating(self.rating, self.unmatched_scans, top_rating)
     }
 }
 
@@ -369,11 +370,13 @@ fn select_matches_inner<O: SelectionObserver>(
     observer: &mut O,
 ) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
+    // 「いちばん上」は**このスキャンの候補全員**から 1 回だけ決める（`super::boost`）
+    let top = super::boost::top_rating(candidates.iter().map(|candidate| &candidate.rating));
     // 決定的にするため、レート降順・同点は player_id 昇順で固定する。
-    // **判定用のレート**で並べる（低レート帯の底上げ込み。`Candidate::matching_rating`）
+    // **判定用のレート**で並べる（端の寄せ込み。`Candidate::matching_rating`）
     pool.sort_by(|a, b| {
-        b.matching_rating()
-            .partial_cmp(&a.matching_rating())
+        b.matching_rating(top)
+            .partial_cmp(&a.matching_rating(top))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.player_id.0.cmp(&b.player_id.0))
     });
@@ -381,7 +384,7 @@ fn select_matches_inner<O: SelectionObserver>(
     let mut matches = Vec::new();
     while pool.len() >= MATCH_SIZE {
         let Some((taken, proposal)) =
-            find_one(&pool, ally_blocks, now, ranges, direction, observer)
+            find_one(&pool, top, ally_blocks, now, ranges, direction, observer)
         else {
             break;
         };
@@ -405,6 +408,7 @@ fn select_matches_inner<O: SelectionObserver>(
 /// 下からはその逆で、最低レートの人を基準にした窓から試す。
 fn find_one<O: SelectionObserver>(
     pool: &[&Candidate],
+    top: f64,
     ally_blocks: &AllyBlocks,
     now: Timestamp,
     ranges: MatchingRanges,
@@ -416,11 +420,11 @@ fn find_one<O: SelectionObserver>(
         observer.record_anchor();
         // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
         // ここで 2 条件を満たしていれば部分集合はどれも満たす
-        let floor = pool[anchor].matching_rating();
+        let floor = pool[anchor].matching_rating(top);
         let window_started = observer.begin_measurement();
         let window: Vec<usize> = (0..pool.len())
             .filter(|&i| {
-                let above = pool[i].matching_rating() - floor;
+                let above = pool[i].matching_rating(top) - floor;
                 above >= 0.0 && above <= span && above <= f64::from(pool[i].down_range)
             })
             .collect();
@@ -1242,7 +1246,7 @@ mod tests {
 
         // 取り残し 1 回（1500、差 60）でもまだ 50 より遠い
         roster[0].unmatched_scans = 1;
-        assert_eq!(roster[0].matching_rating(), 1500.0);
+        assert_eq!(roster[0].matching_rating(1560.0), 1500.0);
         assert!(select_matches(&roster, now()).is_empty());
 
         // 2 回（1514）で差 46 になり組める
@@ -1264,7 +1268,41 @@ mod tests {
         // 1487 の人は何回取り残されても上がらない
         roster[0] = who(1, 1487.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
         roster[0].unmatched_scans = 10;
-        assert_eq!(roster[0].matching_rating(), 1487.0);
+        assert_eq!(roster[0].matching_rating(1560.0), 1487.0);
+        assert!(select_matches(&roster, now()).is_empty());
+    }
+
+    /// **いちばん上の人は取り残された回数 x 14 だけ判定用レートが下がり、下の帯と組める。**
+    /// 前の逆。凍結されるレートは実レートのまま。
+    #[test]
+    fn a_stranded_top_rated_player_is_pulled_down_into_the_window_below() {
+        let mut roster = full_roster(1, 1600.0);
+        // 1 番だけ 1674（74 上）。そのままでは組めない
+        roster[0] = who(1, 1674.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        assert!(select_matches(&roster, now()).is_empty());
+
+        // 1 回（1660、差 60）でもまだ遠い
+        roster[0].unmatched_scans = 1;
+        assert_eq!(roster[0].matching_rating(1674.0), 1660.0);
+        assert!(select_matches(&roster, now()).is_empty());
+
+        // 2 回（1646、差 46）で組める
+        roster[0].unmatched_scans = 2;
+        let matches = select_matches(&roster, now());
+        assert_eq!(matches.len(), 1);
+        let pulled = matches[0]
+            .players
+            .iter()
+            .find(|player| player.player_id == PlayerId(Uuid::from_u128(1)))
+            .expect("the top player is in the match");
+        assert_eq!(pulled.rating, 1674.0, "凍結するのは実レート");
+        assert_eq!(matches[0].rating_span(), 74.0);
+
+        // 2 番目（1673）は、上に 1 人いる限り何回取り残されても動かない
+        roster[0] = who(1, 1680.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[1] = who(2, 1673.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[1]]);
+        roster[1].unmatched_scans = 10;
+        assert_eq!(roster[1].matching_rating(1680.0), 1673.0);
         assert!(select_matches(&roster, now()).is_empty());
     }
 
