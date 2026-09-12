@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update queue_entries set unmatched_scans = unmatched_scans + 1 where player_id = any($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8cac6fa9e421e99dd1a086668b565e02710275118616a1c743b41ee46519a5ee"
+}

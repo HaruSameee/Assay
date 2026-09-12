@@ -1182,6 +1182,53 @@ async fn exactly_fifty_apart_counts_but_one_hundred_does_not(owner: PgPool) {
     db.done().await;
 }
 
+/// **「範囲内 N 人」はマッチメイカと同じ判定用レートで数える。**
+///
+/// 1486 の人が 2 回取り残されていれば、マッチメイカは 1514 として見る。画面の人数も
+/// 同じ値で数えないと「範囲内 0 人」のまま突然組まれる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn the_in_range_count_uses_the_lifted_rating(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let low = player(1); // 1486
+    let high = player(2); // 1550
+    adjust_rating(&db, low, -14.0).await;
+    adjust_rating(&db, high, 50.0).await;
+    for who in [low, high] {
+        register(&db, who, Rank::Legend).await;
+        let (status, _) = post_queue(&app, who, json!({ "roles": [wish("jungle", 1)] })).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    // 差 64: どちらからも見えない
+    let (_, from_high) = get_queue(&app, Some(high)).await;
+    assert_eq!(from_high["in_range"], 0, "{from_high}");
+
+    // マッチメイカに 2 回取り残された（1486 → 判定用 1514、差 36）
+    sqlx::query("update queue_entries set unmatched_scans = 2 where player_id = $1")
+        .bind(low.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (_, from_high) = get_queue(&app, Some(high)).await;
+    assert_eq!(from_high["in_range"], 1, "{from_high}");
+    let (_, from_low) = get_queue(&app, Some(low)).await;
+    assert_eq!(from_low["in_range"], 1, "{from_low}");
+
+    // 1550 の人が取り残されても上がらない（1487 以上）
+    sqlx::query("update queue_entries set unmatched_scans = 9 where player_id = $1")
+        .bind(high.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (_, from_low) = get_queue(&app, Some(low)).await;
+    assert_eq!(from_low["in_range"], 1, "{from_low}");
+    println!("1486 + 2 回 → 1514 として範囲内に数える");
+    db.done().await;
+}
+
 /// キュー画面のヘッダーも共通のもの。管理者リストの有無だけで管理の導線が変わる。
 ///
 /// `player(11)` は `reference` フィクスチャの discord_user_id を持つ。判定に使うのは

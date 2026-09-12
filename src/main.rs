@@ -381,6 +381,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             formed = outcome.created.len(),
                             vc_exhausted = outcome.vc_exhausted,
                             paused = outcome.paused,
+                            boosted = outcome.boosted,
                             "matchmaker run finished"
                         );
                         if let Err(error) = matchmaker_log_adapter

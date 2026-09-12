@@ -292,12 +292,14 @@ impl QueueRepository {
         ranges: MatchingRanges,
     ) -> Result<Vec<QueuedPlayer>, QueueError> {
         // 第1希望のロールは**同じクエリに畳む**。範囲内の人数もロール別の内訳も
-        // この1本の結果から数えるので、10秒ポーリングで往復が増えない
+        // この1本の結果から数えるので、10秒ポーリングで往復が増えない。
+        // レートは**判定用**（低レート帯の底上げ込み。`matchmaker::boost`）。マッチメイカが
+        // 見るのと同じ値で数えないと、「範囲内 N 人」と実際に組まれる相手がずれる
         let rows = sqlx::query!(
             "select q.player_id, q.down_range, \
                     (select r.role from queue_entry_roles r \
                      where r.entry_id = q.id and r.priority = 1) as first_choice, \
-                    v.rating as \"rating!\" \
+                    v.rating as \"rating!\", q.unmatched_scans \
              from queue_entries q \
              join player_current_ratings v on v.player_id = q.player_id",
         )
@@ -307,7 +309,7 @@ impl QueueRepository {
             .into_iter()
             .map(|row| QueuedPlayer {
                 player_id: PlayerId(row.player_id),
-                rating: row.rating,
+                rating: crate::matchmaker::matching_rating(row.rating, row.unmatched_scans),
                 up_range: ranges.up,
                 down_range: ranges.clamp_down(row.down_range),
                 first_choice: row.first_choice,

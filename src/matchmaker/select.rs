@@ -150,6 +150,17 @@ pub struct Candidate {
     pub roles: Vec<RoleWish>,
     /// フレックス補償の対象か（07 §5。`formation_players` から導出済み）。
     pub flex_compensation: bool,
+    /// マッチメイカが走って、この人を見て、組まなかった回数（`queue_entries.unmatched_scans`）。
+    /// 1486 以下の人の[`Self::matching_rating`]にだけ効く。
+    pub unmatched_scans: i32,
+}
+
+impl Candidate {
+    /// **マッチング範囲の判定に使うレート。**低レート帯の取り残し対策の底上げ込み
+    /// （[`super::boost`]）。実レートは [`Self::rating`] のまま formation に凍結する。
+    pub fn matching_rating(&self) -> f64 {
+        super::boost::matching_rating(self.rating, self.unmatched_scans)
+    }
 }
 
 /// 希望ロール 1 つ。
@@ -358,10 +369,11 @@ fn select_matches_inner<O: SelectionObserver>(
     observer: &mut O,
 ) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
-    // 決定的にするため、レート降順・同点は player_id 昇順で固定する
+    // 決定的にするため、レート降順・同点は player_id 昇順で固定する。
+    // **判定用のレート**で並べる（低レート帯の底上げ込み。`Candidate::matching_rating`）
     pool.sort_by(|a, b| {
-        b.rating
-            .partial_cmp(&a.rating)
+        b.matching_rating()
+            .partial_cmp(&a.matching_rating())
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.player_id.0.cmp(&b.player_id.0))
     });
@@ -404,11 +416,11 @@ fn find_one<O: SelectionObserver>(
         observer.record_anchor();
         // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
         // ここで 2 条件を満たしていれば部分集合はどれも満たす
-        let floor = pool[anchor].rating;
+        let floor = pool[anchor].matching_rating();
         let window_started = observer.begin_measurement();
         let window: Vec<usize> = (0..pool.len())
             .filter(|&i| {
-                let above = pool[i].rating - floor;
+                let above = pool[i].matching_rating() - floor;
                 above >= 0.0 && above <= span && above <= f64::from(pool[i].down_range)
             })
             .collect();
@@ -732,6 +744,7 @@ mod tests {
                 })
                 .collect(),
             flex_compensation: false,
+            unmatched_scans: 0,
         }
     }
 
@@ -1216,6 +1229,43 @@ mod tests {
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].rating_span(), 50.0);
+    }
+
+    /// **1486 以下の人は取り残された回数 x 14 だけ判定用レートが上がり、上の帯と組める。**
+    /// 凍結されるレートは実レートのまま（`ProposedPlayer::rating`）。
+    #[test]
+    fn a_stranded_low_rated_player_is_lifted_into_the_window_above() {
+        let mut roster = full_roster(1, 1560.0);
+        // 1 番だけ 1486（74 下）。そのままでは 51 以上離れていて組めない
+        roster[0] = who(1, 1486.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        assert!(select_matches(&roster, now()).is_empty());
+
+        // 取り残し 1 回（1500、差 60）でもまだ 50 より遠い
+        roster[0].unmatched_scans = 1;
+        assert_eq!(roster[0].matching_rating(), 1500.0);
+        assert!(select_matches(&roster, now()).is_empty());
+
+        // 2 回（1514）で差 46 になり組める
+        roster[0].unmatched_scans = 2;
+        let matches = select_matches(&roster, now());
+        assert_eq!(matches.len(), 1);
+        let lifted = matches[0]
+            .players
+            .iter()
+            .find(|player| player.player_id == PlayerId(Uuid::from_u128(1)))
+            .expect("the lifted player is in the match");
+        assert_eq!(lifted.rating, 1486.0, "凍結するのは実レート");
+        assert_eq!(
+            matches[0].rating_span(),
+            74.0,
+            "実レートの幅は 50 を超えてよい"
+        );
+
+        // 1487 の人は何回取り残されても上がらない
+        roster[0] = who(1, 1487.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 10;
+        assert_eq!(roster[0].matching_rating(), 1487.0);
+        assert!(select_matches(&roster, now()).is_empty());
     }
 
     /// **seed の差 100 で 1500 群と 1600 群が分離する。**今回の変更の狙い。

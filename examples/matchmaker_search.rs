@@ -56,6 +56,7 @@ fn queue(count: usize, spread: f64) -> Vec<Candidate> {
                 },
             ],
             flex_compensation: index % 9 == 0,
+            unmatched_scans: 0,
         })
         .collect()
 }

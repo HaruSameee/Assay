@@ -15,11 +15,13 @@
 //!   `awaiting_host` になり、既存の `resume_unfinished`（5 秒スキャン）が拾って
 //!   割り当て表とホスト打診を出す。**復帰の入口を 2 つ作らない**（00 §7 の申し送り）。
 
+pub mod boost;
 pub mod flow;
 pub mod repository;
 pub mod runner;
 pub mod select;
 
+pub use boost::{BOOST_MAX_RATING, BOOST_PER_UNMATCHED_SCAN, matching_rating};
 pub use repository::{
     ActiveFormationCounts, AssignedFormation, FirstChoiceRoleCounts, MatchmakerRepository,
     MatchmakerSummary, RecentCompletionCounts, RunOutcome, SelectionMetrics, teams_are_swapped,

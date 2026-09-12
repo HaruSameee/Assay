@@ -56,6 +56,9 @@ pub struct RunOutcome {
     /// 運営がマッチメイカを止めていたか。**止まっていてもループは回る**ので、
     /// キューの人数と待ち時間は普段どおり数える（何人待たせているかが見えなくなる）。
     pub paused: bool,
+    /// 取り残されたうち、次のスキャンで判定用レートが底上げされる人数
+    /// （実レート 1486 以下。[`super::boost`]）。ログに出す。
+    pub boosted: usize,
     /// このスキャンで基準を試した順（上から / 下から）。ログに出す。
     pub direction: ScanDirection,
 }
@@ -324,6 +327,8 @@ impl MatchmakerRepository {
 
         let proposals = select_matches_scanning(&candidates, &ally_blocks, now, ranges, direction);
         if proposals.is_empty() {
+            // 誰も組まれなかった。全員が「取り残された 1 回」
+            outcome.boosted = count_unmatched_scans(&mut tx, &candidates).await?;
             tx.commit().await?;
             return Ok(outcome);
         }
@@ -408,6 +413,8 @@ impl MatchmakerRepository {
             .collect();
         outcome.unmatched = unmatched.len();
         outcome.longest_unmatched_wait_seconds = longest_wait(&unmatched, now);
+        // 取り残された人のカウンタを進める。成立した人の行はもう無い
+        outcome.boosted = count_unmatched_scans(&mut tx, &unmatched).await?;
 
         tx.commit().await?;
         Ok(outcome)
@@ -736,7 +743,7 @@ async fn load_candidates(
     ranges: MatchingRanges,
 ) -> Result<Vec<Candidate>, RepositoryError> {
     let rows = sqlx::query!(
-        "select q.id, q.player_id, q.down_range, q.enqueued_at, \
+        "select q.id, q.player_id, q.down_range, q.enqueued_at, q.unmatched_scans, \
                 v.rating as \"rating!\", v.sigma as \"sigma!\", \
                 latest.formation_id as \"latest_formation?\", \
                 latest.created_at as \"latest_matched_at?\", \
@@ -796,9 +803,39 @@ async fn load_candidates(
                 enqueued_at: row.enqueued_at,
                 roles: by_entry.remove(&row.id).unwrap_or_default(),
                 flex_compensation: flex_compensation_owed(&history),
+                unmatched_scans: row.unmatched_scans,
             }
         })
         .collect())
+}
+
+/// 取り残された人の `queue_entries.unmatched_scans` を 1 進める。
+///
+/// **このスキャンで見た人だけ**（`candidates` はスキャン開始時に読んだ行）。スキャン中に
+/// 入ってきた人は次回から数える。止まっている間は呼ばない（呼び出し側が
+/// `matchmaker_stop_on` の後ろに置く）。戻り値は底上げの対象になる人数（ログ用）。
+async fn count_unmatched_scans(
+    conn: &mut PgConnection,
+    unmatched: &[Candidate],
+) -> Result<usize, RepositoryError> {
+    if unmatched.is_empty() {
+        return Ok(0);
+    }
+    let player_ids: Vec<uuid::Uuid> = unmatched
+        .iter()
+        .map(|candidate| candidate.player_id.0)
+        .collect();
+    sqlx::query!(
+        "update queue_entries set unmatched_scans = unmatched_scans + 1 \
+         where player_id = any($1)",
+        &player_ids,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(unmatched
+        .iter()
+        .filter(|candidate| candidate.rating <= super::boost::BOOST_MAX_RATING)
+        .count())
 }
 
 async fn load_active_ally_blocks(
@@ -884,6 +921,7 @@ mod tests {
                         priority: 1,
                     }],
                     flex_compensation: false,
+                    unmatched_scans: 0,
                 }
             })
             .collect()

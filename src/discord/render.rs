@@ -905,6 +905,7 @@ mod tests {
             unmatched: 13,
             longest_unmatched_wait_seconds: Some(12 * 60),
             paused: false,
+            boosted: 0,
             direction: ScanDirection::BottomUp,
         };
         let at = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
@@ -1016,6 +1017,7 @@ mod tests {
             unmatched: 13,
             longest_unmatched_wait_seconds: Some(12 * 60),
             paused: false,
+            boosted: 0,
             direction: ScanDirection::BottomUp,
         };
         let summary = MatchmakerSummary {

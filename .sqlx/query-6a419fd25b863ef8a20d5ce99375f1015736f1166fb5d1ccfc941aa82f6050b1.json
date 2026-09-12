@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, v.rating as \"rating!\", v.sigma as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q join player_current_ratings v on v.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
+  "query": "select q.id, q.player_id, q.down_range, q.enqueued_at, q.unmatched_scans, v.rating as \"rating!\", v.sigma as \"sigma!\", latest.formation_id as \"latest_formation?\", latest.created_at as \"latest_matched_at?\", latest.role_was_flexed as \"latest_role_was_flexed?\" from queue_entries q join player_current_ratings v on v.player_id = q.player_id left join lateral ( select fp.formation_id, f.created_at, fp.role_was_flexed from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = q.player_id order by f.created_at desc, f.id desc limit 1 ) latest on true order by q.enqueued_at, q.id",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "unmatched_scans",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "unmatched_scans"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "rating!",
         "type_info": "Float8",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "sigma!",
         "type_info": "Float8",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "latest_formation?",
         "type_info": "Uuid",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "latest_matched_at?",
         "type_info": "Timestamptz",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "latest_role_was_flexed?",
         "type_info": "Bool",
         "origin": {
@@ -111,6 +122,7 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       false,
@@ -118,5 +130,5 @@
       false
     ]
   },
-  "hash": "216b9463bb58c76c304393855a9667b7de98ddf5647cecb3e3532978b2da8254"
+  "hash": "6a419fd25b863ef8a20d5ce99375f1015736f1166fb5d1ccfc941aa82f6050b1"
 }
