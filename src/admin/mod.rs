@@ -21,13 +21,13 @@ pub mod block_cooldown;
 pub mod config;
 pub mod disputes;
 pub mod html;
-pub mod ip_bans;
 pub mod matching_range;
 pub mod rating_params;
 pub mod repository;
 pub mod routes;
 pub mod schedule;
 pub mod season;
+pub mod shadow_bans;
 
 pub use actions::{
     AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, MAX_BLOCK_ALLOWANCE, PauseState,
@@ -44,7 +44,6 @@ pub use disputes::{
     DisputeDecision, DisputeOutcome, FinalOutcome, NewDisputeResolution, NewReadjudication,
     ReadjudicationOutcome, parse_decision,
 };
-pub use ip_bans::{IpBan, IpBanChange, IpBanKind, IpBanOutcome, IpBanPreview, normalize_ip};
 pub use matching_range::{
     MatchingRangeChange, MatchingRangeError, MatchingRangeOutcome, MatchingRangePreview,
     parse_ranges,
@@ -55,13 +54,15 @@ pub use rating_params::{
 };
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
-    NewAdjustment, NewAdminAction, NewBlockCooldown, NewIpBan, NewMatchingRange,
-    NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary, QueuedEntry, QueuedRole,
-    RemovalOutcome,
+    NewAdjustment, NewAdminAction, NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule,
+    NewRatingParams, NewSeasonBoundary, NewShadowBan, QueuedEntry, QueuedRole, RemovalOutcome,
 };
 pub use routes::{AdminState, router};
 pub use schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome, parse_days, parse_time};
 pub use season::{
     MAX_SEASON_LABEL_LENGTH, SeasonBoundary, SeasonOutcome, SeasonPreview, confirmation_matches,
     normalize_label,
+};
+pub use shadow_bans::{
+    BanSubject, ShadowBan, ShadowBanChange, ShadowBanKind, ShadowBanOutcome, ShadowBanPreview,
 };

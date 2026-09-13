@@ -44,24 +44,24 @@ use crate::nullified::NullifiedReportRepository;
 
 use super::block_cooldown::{BlockCooldownOutcome, parse_cooldown_days};
 use super::html::{
-    BlockCooldownView, IpBansView, MatchingRangeView, MatchmakerView, Notice, NoticeKind,
-    PlayerView, QueueView, QuietReportsView, RatingParamsView, ReportsView, RosterView,
-    ScheduleView, SearchView, SeasonView, block_cooldown_page, ip_bans_page, matching_range_page,
-    player_page, queue_page, quiet_reports_page, rating_params_page, reports_page, roster_page,
-    search_page, season_page,
+    BlockCooldownView, MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView,
+    QueueView, QuietReportsView, RatingParamsView, ReportsView, RosterView, ScheduleView,
+    SearchView, SeasonView, ShadowBansView, block_cooldown_page, matching_range_page, player_page,
+    queue_page, quiet_reports_page, rating_params_page, reports_page, roster_page, search_page,
+    season_page, shadow_bans_page,
 };
-use super::ip_bans::{IpBanKind, IpBanOutcome, normalize_ip};
 use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewBlockCooldown, NewIpBan, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams,
-    NewSeasonBoundary, NewStaffReport, RemovalOutcome, StaffReportOutcome,
+    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary,
+    NewShadowBan, NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::schedule::{MatchmakerSchedule, ScheduleOutcome, parse_days, parse_time};
 use super::season::{
     MAX_SEASON_LABEL_LENGTH, SeasonOutcome, confirmation_matches, normalize_label,
 };
+use super::shadow_bans::{BanSubject, ShadowBanKind, ShadowBanOutcome};
 
 /// 検索のヒット上限と、一覧に出す直近ログの件数。
 const SEARCH_LIMIT: i64 = 25;
@@ -156,8 +156,11 @@ pub fn router(state: AdminState) -> Router {
             "/admin/block-cooldown",
             get(show_block_cooldown).post(change_block_cooldown),
         )
-        // IP のシャドウバン。1 段階（試合に影響しない。解除で戻せる）
-        .route("/admin/ip-bans", get(show_ip_bans).post(change_ip_ban))
+        // シャドウバン（IP / Discord ユーザー ID）。1 段階（試合に影響しない。解除で戻せる）
+        .route(
+            "/admin/shadow-bans",
+            get(show_shadow_bans).post(change_shadow_ban),
+        )
         // 聞き専報告。**閲覧だけ**（運営が代理で入れる経路は作らない）
         .route("/admin/quiet-reports", get(show_quiet_reports))
         .route("/admin/season/confirm", post(confirm_season))
@@ -1840,21 +1843,25 @@ async fn change_block_cooldown(
 }
 
 // ----------------------------------------------------------------------
-// IP のシャドウバン
+// シャドウバン（IP / Discord ユーザー ID）
 // ----------------------------------------------------------------------
 //
 // 断らずに組まれないようにする。効くのは次の投入から。解除で戻せる。
 
-async fn render_ip_bans(app: &AdminState, notice: Option<Notice>, key: Option<&str>) -> Response {
-    let preview = match app.store.ip_ban_preview().await {
+async fn render_shadow_bans(
+    app: &AdminState,
+    notice: Option<Notice>,
+    key: Option<&str>,
+) -> Response {
+    let preview = match app.store.shadow_ban_preview().await {
         Ok(preview) => preview,
         Err(err) => {
-            error!(%err, "could not read the ip ban preview");
+            error!(%err, "could not read the shadow ban preview");
             return internal_error();
         }
     };
     let generated = form_key();
-    Html(ip_bans_page(&IpBansView {
+    Html(shadow_bans_page(&ShadowBansView {
         preview: &preview,
         form_key: key.unwrap_or(&generated),
         notice,
@@ -1862,83 +1869,91 @@ async fn render_ip_bans(app: &AdminState, notice: Option<Notice>, key: Option<&s
     .into_response()
 }
 
-async fn show_ip_bans(State(app): State<AdminState>, session: Option<CurrentSession>) -> Response {
+async fn show_shadow_bans(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
     if let Err(error) = actor(&app, session).await {
         return error.into();
     }
-    render_ip_bans(&app, None, None).await
+    render_shadow_bans(&app, None, None).await
 }
 
 #[derive(Debug, Deserialize)]
-struct IpBanForm {
+struct ShadowBanForm {
     /// `ban` / `unban`。
     #[serde(default)]
     action: String,
+    /// IP か Discord ユーザー ID（見分けは `BanSubject::parse`）。
     #[serde(default)]
-    ip: String,
+    subject: String,
     #[serde(default)]
     reason: String,
     #[serde(default)]
     key: String,
 }
 
-async fn change_ip_ban(
+async fn change_shadow_ban(
     State(app): State<AdminState>,
     session: Option<CurrentSession>,
-    Form(form): Form<IpBanForm>,
+    Form(form): Form<ShadowBanForm>,
 ) -> Response {
     let actor = match actor(&app, session).await {
         Ok(actor) => actor,
         Err(error) => return error.into(),
     };
     let kind = match form.action.as_str() {
-        "ban" => IpBanKind::Banned,
-        "unban" => IpBanKind::Unbanned,
+        "ban" => ShadowBanKind::Banned,
+        "unban" => ShadowBanKind::Unbanned,
         _ => {
             let notice = fail("操作の種類が不正です。".to_owned());
-            return render_ip_bans(&app, Some(notice), Some(&form.key)).await;
+            return render_shadow_bans(&app, Some(notice), Some(&form.key)).await;
         }
     };
-    let Some(ip) = normalize_ip(&form.ip) else {
-        let notice = fail("IP を入力してください（空白を含まない 64 文字以内）。".to_owned());
-        return render_ip_bans(&app, Some(notice), Some(&form.key)).await;
+    let Some(subject) = BanSubject::parse(&form.subject) else {
+        let notice = fail(
+            "IP か Discord ユーザー ID を入力してください（空白を含まない 64 文字以内）。"
+                .to_owned(),
+        );
+        return render_shadow_bans(&app, Some(notice), Some(&form.key)).await;
     };
     let Some(reason) = normalize_reason(&form.reason) else {
         let notice = fail("理由を入力してください。".to_owned());
-        return render_ip_bans(&app, Some(notice), Some(&form.key)).await;
+        return render_shadow_bans(&app, Some(notice), Some(&form.key)).await;
     };
 
-    let input = NewIpBan {
-        ip: ip.clone(),
+    let label = format!("{} {}", subject.kind_label(), subject.value());
+    let input = NewShadowBan {
+        idempotency_key: format!("{}:{}:{}", form.key, subject.kind_str(), subject.value()),
+        subject,
         kind,
         reason,
         actor_discord_user_id: actor.discord_user_id,
         created_at: Utc::now(),
-        idempotency_key: format!("{}:{}", form.key, ip),
     };
-    let notice = match app.store.change_ip_ban(&input).await {
-        Ok(IpBanOutcome::Changed { id }) if kind == IpBanKind::Banned => info(format!(
-            "{ip} をシャドウバンしました（#{id}）。この IP からの次の投入以降は組まれません。\
+    let notice = match app.store.change_shadow_ban(&input).await {
+        Ok(ShadowBanOutcome::Changed { id }) if kind == ShadowBanKind::Banned => info(format!(
+            "{label} をシャドウバンしました（#{id}）。次の投入以降は組まれません。\
              いまキューにいる行は変わりません。"
         )),
-        Ok(IpBanOutcome::Changed { id }) => info(format!(
-            "{ip} のシャドウバンを解除しました（#{id}）。次の投入から組まれます。"
+        Ok(ShadowBanOutcome::Changed { id }) => info(format!(
+            "{label} のシャドウバンを解除しました（#{id}）。次の投入から組まれます。"
         )),
-        Ok(IpBanOutcome::Unchanged) if kind == IpBanKind::Banned => {
-            info(format!("{ip} は既に BAN 中です。行は増やしていません。"))
+        Ok(ShadowBanOutcome::Unchanged) if kind == ShadowBanKind::Banned => {
+            info(format!("{label} は既に BAN 中です。行は増やしていません。"))
         }
-        Ok(IpBanOutcome::Unchanged) => {
-            info(format!("{ip} は BAN していません。行は増やしていません。"))
-        }
-        Ok(IpBanOutcome::Duplicate) => {
+        Ok(ShadowBanOutcome::Unchanged) => info(format!(
+            "{label} は BAN していません。行は増やしていません。"
+        )),
+        Ok(ShadowBanOutcome::Duplicate) => {
             info("この操作は既に記録されています。行は増やしていません。".to_owned())
         }
         Err(err) => {
-            error!(%err, "could not change the ip ban");
+            error!(%err, "could not change the shadow ban");
             return internal_error();
         }
     };
-    render_ip_bans(&app, Some(notice), None).await
+    render_shadow_bans(&app, Some(notice), None).await
 }
 
 // ----------------------------------------------------------------------

@@ -21,8 +21,10 @@ use super::block_cooldown::{BlockCooldownChange, BlockCooldownOutcome, BlockCool
 use super::disputes::{
     DisputeOutcome, FinalOutcome, NewDisputeResolution, NewReadjudication, ReadjudicationOutcome,
 };
-use super::ip_bans::{IpBan, IpBanChange, IpBanKind, IpBanOutcome, IpBanPreview};
 use super::matching_range::{MatchingRangeChange, MatchingRangeOutcome, MatchingRangePreview};
+use super::shadow_bans::{
+    BanSubject, ShadowBan, ShadowBanChange, ShadowBanKind, ShadowBanOutcome, ShadowBanPreview,
+};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
 use crate::queue::MatchingRanges;
@@ -1151,20 +1153,20 @@ impl AdminRepository {
 }
 
 // ----------------------------------------------------------------------
-// IP のシャドウバン
+// シャドウバン（IP / Discord ユーザー ID）
 // ----------------------------------------------------------------------
 //
-// **現在値のテーブルは作らない。**BAN 中かは `ip_ban_changes` の IP ごとの最新行
-// （`current_ip_bans`）。キューの行に写した `shadow_banned` は投入時点の判定で、
-// ここで書き換えない（`admin::ip_bans`）。
+// **現在値のテーブルは作らない。**BAN 中かは `shadow_ban_changes` の対象ごとの最新行
+// （`current_shadow_bans`）。キューの行に写した `shadow_banned` は投入時点の判定で、
+// ここで書き換えない（`admin::shadow_bans`）。
 
 /// 追記する変更 1 件（BAN / 解除）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewIpBan {
-    /// 対象の IP。**整えた値を渡すこと**（`admin::normalize_ip`）。
-    pub ip: String,
+pub struct NewShadowBan {
+    /// 対象。**整えた値を渡すこと**（`BanSubject::parse`）。
+    pub subject: BanSubject,
     /// BAN するか解くか。
-    pub kind: IpBanKind,
+    pub kind: ShadowBanKind,
     /// 運営が書いた理由。
     pub reason: String,
     /// 操作した運営。
@@ -1177,11 +1179,12 @@ pub struct NewIpBan {
 
 impl AdminRepository {
     /// 画面に出す値。**毎回数え直す**（保存しない）。
-    pub async fn ip_ban_preview(&self) -> Result<IpBanPreview, sqlx::Error> {
+    pub async fn shadow_ban_preview(&self) -> Result<ShadowBanPreview, sqlx::Error> {
         let current = sqlx::query!(
-            "select ip as \"ip!\", reason as \"reason!\", created_by as \"created_by!\", \
+            "select subject_kind as \"subject_kind!\", subject as \"subject!\", \
+                    reason as \"reason!\", created_by as \"created_by!\", \
                     banned_at as \"banned_at!\" \
-             from current_ip_bans order by banned_at desc, ip"
+             from current_shadow_bans order by banned_at desc, subject_kind, subject"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1191,29 +1194,31 @@ impl AdminRepository {
         .fetch_one(&self.pool)
         .await?;
         let history = sqlx::query!(
-            "select id, ip, kind, reason, created_by, created_at \
-             from ip_ban_changes order by id desc limit 50"
+            "select id, subject_kind, subject, kind, reason, created_by, created_at \
+             from shadow_ban_changes order by id desc limit 50"
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(IpBanPreview {
+        Ok(ShadowBanPreview {
             current: current
                 .into_iter()
-                .map(|row| IpBan {
-                    ip: row.ip,
-                    reason: row.reason,
-                    created_by: row.created_by,
-                    banned_at: row.banned_at,
+                .filter_map(|row| {
+                    Some(ShadowBan {
+                        subject: BanSubject::from_row(&row.subject_kind, &row.subject)?,
+                        reason: row.reason,
+                        created_by: row.created_by,
+                        banned_at: row.banned_at,
+                    })
                 })
                 .collect(),
             shadow_banned_in_queue: usize::try_from(shadow_banned_in_queue).unwrap_or(0),
             history: history
                 .into_iter()
                 .filter_map(|row| {
-                    Some(IpBanChange {
+                    Some(ShadowBanChange {
                         id: row.id,
-                        ip: row.ip,
-                        kind: IpBanKind::parse(&row.kind)?,
+                        subject: BanSubject::from_row(&row.subject_kind, &row.subject)?,
+                        kind: ShadowBanKind::parse(&row.kind)?,
                         reason: row.reason,
                         created_by: row.created_by,
                         created_at: row.created_at,
@@ -1225,30 +1230,38 @@ impl AdminRepository {
 
     /// BAN / 解除を追記する。**既にその状態なら行を積まない**（`Unchanged`）。
     ///
-    /// キュー投入の判定（`current_ip_bans` の読み取り）と同じ advisory lock は取らない:
+    /// キュー投入の判定（`current_shadow_bans` の読み取り）と同じ advisory lock は取らない:
     /// 投入は「投入時点の判定の写し」を持つだけで、直列化しても意味が変わらない。
-    pub async fn change_ip_ban(&self, input: &NewIpBan) -> Result<IpBanOutcome, AdminStoreError> {
+    pub async fn change_shadow_ban(
+        &self,
+        input: &NewShadowBan,
+    ) -> Result<ShadowBanOutcome, AdminStoreError> {
         let mut tx = self.pool.begin().await?;
+        let subject_kind = input.subject.kind_str();
+        let subject = input.subject.value();
         // 同じキーの再送は「既にその状態」に落ちる（状態を見てから冪等キーを見る）
         let currently_banned = sqlx::query_scalar!(
-            "select exists(select 1 from current_ip_bans where ip = $1) as \"banned!\"",
-            input.ip,
+            "select exists(select 1 from current_shadow_bans \
+                           where subject_kind = $1 and subject = $2) as \"banned!\"",
+            subject_kind,
+            subject,
         )
         .fetch_one(&mut *tx)
         .await?;
-        let wants_ban = input.kind == IpBanKind::Banned;
+        let wants_ban = input.kind == ShadowBanKind::Banned;
         if currently_banned == wants_ban {
             tx.commit().await?;
-            return Ok(IpBanOutcome::Unchanged);
+            return Ok(ShadowBanOutcome::Unchanged);
         }
 
         let inserted = sqlx::query_scalar!(
-            "insert into ip_ban_changes \
-             (ip, kind, reason, created_by, idempotency_key, created_at) \
-             values ($1, $2, $3, $4, $5, $6) \
+            "insert into shadow_ban_changes \
+             (subject_kind, subject, kind, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7) \
              on conflict (idempotency_key) do nothing \
              returning id",
-            input.ip,
+            subject_kind,
+            subject,
             input.kind.as_str(),
             input.reason,
             format!("discord:{}", input.actor_discord_user_id),
@@ -1259,31 +1272,34 @@ impl AdminRepository {
         .await?;
         let Some(id) = inserted else {
             tx.commit().await?;
-            return Ok(IpBanOutcome::Duplicate);
+            return Ok(ShadowBanOutcome::Duplicate);
         };
 
         append_action_on(
             &mut tx,
             &NewAdminAction {
                 kind: if wants_ban {
-                    AdminActionKind::IpBanned
+                    AdminActionKind::ShadowBanned
                 } else {
-                    AdminActionKind::IpUnbanned
+                    AdminActionKind::ShadowBanLifted
                 },
                 actor_discord_user_id: input.actor_discord_user_id,
+                // 対象は payload に持つ（admin_actions_target_matches_kind は、この種別では
+                // target_player_id を null に限る）
                 target_player_id: None,
                 reason: Some(input.reason.clone()),
                 payload: serde_json::json!({
-                    "ip_ban_change_id": id,
-                    "ip": input.ip,
+                    "shadow_ban_change_id": id,
+                    "subject_kind": subject_kind,
+                    "subject": subject,
                 }),
                 occurred_at: input.created_at,
-                idempotency_key: format!("ip_ban:{}", input.idempotency_key),
+                idempotency_key: format!("shadow_ban:{}", input.idempotency_key),
             },
         )
         .await?;
         tx.commit().await?;
-        Ok(IpBanOutcome::Changed { id })
+        Ok(ShadowBanOutcome::Changed { id })
     }
 }
 

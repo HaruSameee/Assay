@@ -485,13 +485,17 @@ async fn join_queue(
         Err(error) => error!(%error, "could not read the schedule; letting the player in"),
     }
 
-    // 接続元が BAN 中なら、断らずに「組まれない行」として入れる（シャドウバン）。
-    // 判定に失敗したら入れる側に倒す（読み取り失敗で BAN を広げない）
+    // 接続元の IP か本人の Discord ID が BAN 中なら、断らずに「組まれない行」として
+    // 入れる（シャドウバン）。判定に失敗したら入れる側に倒す（読み取り失敗で BAN を広げない）
     let address = ClientAddress::from_headers(&headers);
-    let shadow_banned = match app.queue.is_ip_banned(&address.best_guess()).await {
+    let shadow_banned = match app
+        .queue
+        .is_shadow_banned(player_id, &address.best_guess())
+        .await
+    {
         Ok(banned) => banned,
         Err(error) => {
-            error!(%error, "could not check the ip ban list; letting the player in");
+            error!(%error, "could not check the shadow ban list; letting the player in");
             false
         }
     };

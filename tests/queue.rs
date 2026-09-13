@@ -27,7 +27,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
-use unite_matchsystem::admin::{AdminRepository, IpBanKind, NewIpBan, parse_admin_ids};
+use unite_matchsystem::admin::{
+    AdminRepository, BanSubject, NewShadowBan, ShadowBanKind, parse_admin_ids,
+};
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
@@ -1883,9 +1885,9 @@ async fn a_banned_ip_is_let_in_but_never_counted(owner: PgPool) {
     register(&db, bystander, Rank::Legend).await;
 
     admin
-        .change_ip_ban(&NewIpBan {
-            ip: "198.51.100.7".to_owned(),
-            kind: IpBanKind::Banned,
+        .change_shadow_ban(&NewShadowBan {
+            subject: BanSubject::Ip("198.51.100.7".to_owned()),
+            kind: ShadowBanKind::Banned,
             reason: "荒らし".to_owned(),
             actor_discord_user_id: 42,
             created_at: Utc::now(),
@@ -1933,9 +1935,9 @@ async fn a_banned_ip_is_let_in_but_never_counted(owner: PgPool) {
 
     // 解除しても、いまの行は変わらない。入り直せば判定し直される
     admin
-        .change_ip_ban(&NewIpBan {
-            ip: "198.51.100.7".to_owned(),
-            kind: IpBanKind::Unbanned,
+        .change_shadow_ban(&NewShadowBan {
+            subject: BanSubject::Ip("198.51.100.7".to_owned()),
+            kind: ShadowBanKind::Unbanned,
             reason: "解除".to_owned(),
             actor_discord_user_id: 42,
             created_at: Utc::now(),
@@ -1967,6 +1969,82 @@ async fn a_banned_ip_is_let_in_but_never_counted(owner: PgPool) {
     let (_, other) = get_queue(&app, Some(bystander)).await;
     assert_eq!(other["in_range"], 1, "{other}");
     println!("BAN 中の IP: 投入 200 / 相手から見えない / 解除後の入り直しで戻る");
+    db.done().await;
+}
+
+/// **Discord ユーザー ID で BAN すれば、IP を変えても組まれない。**
+/// 他の人（別の ID）は同じ IP からでもふつうに数えられる。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_banned_discord_id_is_shadow_banned_from_any_ip(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let admin = AdminRepository::new(db.pool.clone());
+    // reference fixture: player(1) の Discord ID は 1001
+    let culprit = player(1);
+    let bystander = player(2);
+    register(&db, culprit, Rank::Legend).await;
+    register(&db, bystander, Rank::Legend).await;
+
+    admin
+        .change_shadow_ban(&NewShadowBan {
+            subject: BanSubject::DiscordUser(1001),
+            kind: ShadowBanKind::Banned,
+            reason: "サブ垢".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: Utc::now(),
+            idempotency_key: "ban-user-1001".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    // どの IP から入っても組まれない行になる
+    for ip in ["198.51.100.7", "203.0.113.200"] {
+        let (status, joined) = post_queue_from(
+            &app,
+            culprit,
+            Some(ip),
+            json!({ "roles": [wish("jungle", 1)] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{joined}");
+        assert_eq!(joined["queued"], true);
+        let shadow: bool =
+            sqlx::query_scalar("select shadow_banned from queue_entries where player_id = $1")
+                .bind(culprit.0)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(shadow, "{ip} からでも組まれない");
+    }
+    // 同じ IP の別の人はふつう
+    let (_, other) = post_queue_from(
+        &app,
+        bystander,
+        Some("198.51.100.7"),
+        json!({ "roles": [wish("jungle", 1)] }),
+    )
+    .await;
+    assert_eq!(other["in_range"], 0, "BAN 中の人は数えない: {other}");
+    let shadow: bool =
+        sqlx::query_scalar("select shadow_banned from queue_entries where player_id = $1")
+            .bind(bystander.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(!shadow, "ID の BAN は同じ IP の他人に及ばない");
+    // 運営操作ログには対象が payload で残る
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "select payload from admin_actions where kind = 'shadow_banned' order by id desc limit 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(payload["subject_kind"], "discord_user");
+    assert_eq!(payload["subject"], "1001");
+    println!("Discord ID の BAN: どの IP からでも組まれない、同じ IP の他人は無関係");
     db.done().await;
 }
 

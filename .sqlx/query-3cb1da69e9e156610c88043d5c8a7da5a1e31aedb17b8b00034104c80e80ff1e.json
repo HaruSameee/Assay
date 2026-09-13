@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, ip, kind, reason, created_by, created_at from ip_ban_changes order by id desc limit 50",
+  "query": "select id, subject_kind, subject, kind, reason, created_by, created_at from shadow_ban_changes order by id desc limit 50",
   "describe": {
     "columns": [
       {
@@ -9,62 +9,73 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
+            "table": "shadow_ban_changes",
             "name": "id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "ip",
+        "name": "subject_kind",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
-            "name": "ip"
+            "table": "shadow_ban_changes",
+            "name": "subject_kind"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "kind",
+        "name": "subject",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
-            "name": "kind"
+            "table": "shadow_ban_changes",
+            "name": "subject"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "reason",
+        "name": "kind",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
-            "name": "reason"
+            "table": "shadow_ban_changes",
+            "name": "kind"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "created_by",
+        "name": "reason",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
-            "name": "created_by"
+            "table": "shadow_ban_changes",
+            "name": "reason"
           }
         }
       },
       {
         "ordinal": 5,
+        "name": "created_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "shadow_ban_changes",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
+            "table": "shadow_ban_changes",
             "name": "created_at"
           }
         }
@@ -79,8 +90,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "f406dfcfeb15d3b3b1b2f86f81d739c085d0b63cfc870f38e17e189b8613d399"
+  "hash": "3cb1da69e9e156610c88043d5c8a7da5a1e31aedb17b8b00034104c80e80ff1e"
 }

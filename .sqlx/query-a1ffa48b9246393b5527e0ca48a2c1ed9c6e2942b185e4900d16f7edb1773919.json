@@ -1,48 +1,59 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select ip as \"ip!\", reason as \"reason!\", created_by as \"created_by!\", banned_at as \"banned_at!\" from current_ip_bans order by banned_at desc, ip",
+  "query": "select subject_kind as \"subject_kind!\", subject as \"subject!\", reason as \"reason!\", created_by as \"created_by!\", banned_at as \"banned_at!\" from current_shadow_bans order by banned_at desc, subject_kind, subject",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "ip!",
+        "name": "subject_kind!",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "current_ip_bans",
-            "name": "ip"
+            "table": "current_shadow_bans",
+            "name": "subject_kind"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "reason!",
+        "name": "subject!",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "current_ip_bans",
-            "name": "reason"
+            "table": "current_shadow_bans",
+            "name": "subject"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "created_by!",
+        "name": "reason!",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "current_ip_bans",
-            "name": "created_by"
+            "table": "current_shadow_bans",
+            "name": "reason"
           }
         }
       },
       {
         "ordinal": 3,
+        "name": "created_by!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_shadow_bans",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "banned_at!",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "current_ip_bans",
+            "table": "current_shadow_bans",
             "name": "banned_at"
           }
         }
@@ -55,8 +66,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "534dcddf13a974704d9cbf0e94224264d5457da47e124c3a69a65728475b86c7"
+  "hash": "a1ffa48b9246393b5527e0ca48a2c1ed9c6e2942b185e4900d16f7edb1773919"
 }

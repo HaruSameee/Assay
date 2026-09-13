@@ -17,7 +17,6 @@ use crate::status::html::{display_time, format_delta};
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
 use super::block_cooldown::BlockCooldownPreview;
 use super::disputes::DisputeDecision;
-use super::ip_bans::IpBanPreview;
 use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::RosterPage;
@@ -27,6 +26,7 @@ use super::repository::{
 };
 use super::schedule::MatchmakerSchedule;
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
+use super::shadow_bans::{BanSubject, ShadowBanPreview};
 use crate::nullified::{NullifiedReportRow, NullifiedTally};
 use crate::quiet::{QuietReportRow, QuietReporterTally};
 
@@ -625,15 +625,15 @@ pub fn block_cooldown_page(view: &BlockCooldownView<'_>) -> String {
     )
 }
 
-pub struct IpBansView<'a> {
-    /// BAN 中の IP・キュー内の該当行数・履歴。すべて導出値。
-    pub preview: &'a IpBanPreview,
+pub struct ShadowBansView<'a> {
+    /// BAN 中の対象・キュー内の該当行数・履歴。すべて導出値。
+    pub preview: &'a ShadowBanPreview,
     /// 冪等キー（フォーム描画時にサーバ発行）。
     pub form_key: &'a str,
     pub notice: Option<Notice>,
 }
 
-fn ip_ban_history(preview: &IpBanPreview) -> String {
+fn shadow_ban_history(preview: &ShadowBanPreview) -> String {
     if preview.history.is_empty() {
         return "<p class=\"muted\">まだ一度も変更していません。</p>\n".to_owned();
     }
@@ -642,11 +642,12 @@ fn ip_ban_history(preview: &IpBanPreview) -> String {
         .iter()
         .map(|change| {
             format!(
-                "<tr><td>{at}</td><td>{kind}</td><td class=\"num\">{ip}</td>\
+                "<tr><td>{at}</td><td>{kind}</td><td>{subject_kind}</td><td class=\"num\">{subject}</td>\
                  <td>{reason}</td><td>{by}</td></tr>\n",
                 at = escape(&display_time(change.created_at)),
                 kind = change.kind.label(),
-                ip = escape(&change.ip),
+                subject_kind = change.subject.kind_label(),
+                subject = escape(&change.subject.value()),
                 reason = escape(&change.reason),
                 by = escape(&change.created_by),
             )
@@ -654,30 +655,39 @@ fn ip_ban_history(preview: &IpBanPreview) -> String {
         .collect::<String>();
     format!(
         "<div class=\"table-wrap\"><table class=\"log\">\n\
-         <thead><tr><th>時刻</th><th>操作</th><th>IP</th><th>理由</th><th>操作者</th></tr></thead>\n\
+         <thead><tr><th>時刻</th><th>操作</th><th>種類</th><th>対象</th><th>理由</th><th>操作者</th></tr></thead>\n\
          <tbody>\n{rows}</tbody>\n</table></div>\n"
     )
 }
 
-pub fn ip_bans_page(view: &IpBansView<'_>) -> String {
+pub fn shadow_bans_page(view: &ShadowBansView<'_>) -> String {
     let current = if view.preview.current.is_empty() {
-        "<p class=\"muted\">BAN 中の IP はありません。</p>\n".to_owned()
+        "<p class=\"muted\">BAN 中の対象はありません。</p>\n".to_owned()
     } else {
         let rows = view
             .preview
             .current
             .iter()
             .map(|ban| {
+                let subject = ban.subject.value();
+                let link = match &ban.subject {
+                    BanSubject::DiscordUser(id) => {
+                        format!(" <a class=\"fine-print\" href=\"/admin?q={id}\">検索</a>")
+                    }
+                    BanSubject::Ip(_) => String::new(),
+                };
                 format!(
-                    "<tr><td class=\"num\">{ip}</td><td>{at}</td><td>{reason}</td><td>{by}</td>\
-                     <td><form method=\"post\" action=\"/admin/ip-bans\">\
-                     <input type=\"hidden\" name=\"key\" value=\"ip-ban:{key}\">\
+                    "<tr><td>{kind}</td><td class=\"num\">{subject}{link}</td><td>{at}</td>\
+                     <td>{reason}</td><td>{by}</td>\
+                     <td><form method=\"post\" action=\"/admin/shadow-bans\">\
+                     <input type=\"hidden\" name=\"key\" value=\"shadow-ban:{key}\">\
                      <input type=\"hidden\" name=\"action\" value=\"unban\">\
-                     <input type=\"hidden\" name=\"ip\" value=\"{ip}\">\
+                     <input type=\"hidden\" name=\"subject\" value=\"{subject}\">\
                      <input type=\"hidden\" name=\"reason\" value=\"解除\">\
                      <button class=\"button button-secondary\" type=\"submit\">解除</button>\
                      </form></td></tr>\n",
-                    ip = escape(&ban.ip),
+                    kind = ban.subject.kind_label(),
+                    subject = escape(&subject),
                     at = escape(&display_time(ban.banned_at)),
                     reason = escape(&ban.reason),
                     by = escape(&ban.created_by),
@@ -687,53 +697,54 @@ pub fn ip_bans_page(view: &IpBansView<'_>) -> String {
             .collect::<String>();
         format!(
             "<div class=\"table-wrap\"><table class=\"log\">\n\
-             <thead><tr><th>IP</th><th>BAN した時刻</th><th>理由</th><th>操作者</th><th></th></tr></thead>\n\
+             <thead><tr><th>種類</th><th>対象</th><th>BAN した時刻</th><th>理由</th><th>操作者</th><th></th></tr></thead>\n\
              <tbody>\n{rows}</tbody>\n</table></div>\n"
         )
     };
     let body = format!(
-        "<p class=\"lead\">BAN 中の IP からキューに入った人は、<strong>断らずに、組まれなく</strong>なります。\
-         本人の画面は「キュー中」のままで何も告げません。他の参加者の「範囲内 N 人」にも数えません。</p>\n\
+        "<p class=\"lead\">BAN 中の <strong>IP</strong> から、または BAN 中の <strong>Discord ユーザー ID</strong> の\
+         アカウントでキューに入った人は、<strong>断らずに、組まれなく</strong>なります。\
+         本人の画面は「キュー中」のままで何も告げません。他の参加者の「同じ試合に入れる人」にも数えません。</p>\n\
          <p class=\"notice\"><strong>効くのは次の投入からです。</strong>いまキューにいる行は変わりません\
-         （投入時点の判定を持っています）。IP は完全一致で突き合わせます。\
+         （投入時点の判定を持っています）。IP は完全一致。Discord ID は IP を変えても効きます。\
          スマホ回線は無関係な人が同じ IP を共有することがあるので、\
          <a href=\"/admin/queue\">キューと運用</a>の「組まれない」印で巻き添えに気付いたら解除してください。</p>\n\
          <p class=\"notice\">IP の調べ方: 環境変数 IP_WATCH_DISCORD_USER_IDS に並べたアカウントの\
          ログインとキュー投入は、係争チャンネルに接続元つきで通知され、プレイヤー画面の\
          「接続元の記録」にも残ります。</p>\n\
-         <h2>BAN 中の IP</h2>\n{current}\
+         <h2>BAN 中</h2>\n{current}\
          <p class=\"fine-print\">いまキューにいて組まれない行: <strong>{in_queue}</strong></p>\n\
          <h2>BAN する</h2>\n\
-         <form method=\"post\" action=\"/admin/ip-bans\">\
-         <input type=\"hidden\" name=\"key\" value=\"ip-ban:{key}\">\
+         <form method=\"post\" action=\"/admin/shadow-bans\">\
+         <input type=\"hidden\" name=\"key\" value=\"shadow-ban:{key}\">\
          <input type=\"hidden\" name=\"action\" value=\"ban\">\
-         <label for=\"ip\">IP（完全一致）</label>\
-         <input id=\"ip\" name=\"ip\" type=\"text\" inputmode=\"numeric\" autocomplete=\"off\" required>\
+         <label for=\"subject\">IP または Discord ユーザー ID（数字だけなら Discord ID として扱います）</label>\
+         <input id=\"subject\" name=\"subject\" type=\"text\" autocomplete=\"off\" required>\
          <label for=\"reason\">理由（記録に残ります）</label>\
          <input id=\"reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
          <div class=\"actions\">\
-         <button class=\"button button-primary\" type=\"submit\">この IP をシャドウバン</button>\
+         <button class=\"button button-primary\" type=\"submit\">シャドウバンする</button>\
          </div></form>\n\
          <h2>変更履歴</h2>\n{history}",
         in_queue = view.preview.shadow_banned_in_queue,
         key = escape(view.form_key),
-        history = ip_ban_history(view.preview),
+        history = shadow_ban_history(view.preview),
     );
 
     // この画面は管理者しか到達しない（非管理者は 404）
     page(
         Viewer::ADMIN,
-        "管理 / IP のシャドウバン",
+        "管理 / シャドウバン",
         &format!(
             "{ADMIN_STYLES}\
-             <section aria-labelledby=\"admin-ip-bans-title\">\n\
+             <section aria-labelledby=\"admin-shadow-bans-title\">\n\
              <p class=\"eyebrow\">Admin</p>\n\
-             <h1 id=\"admin-ip-bans-title\">IP のシャドウバン</h1>\n\
+             <h1 id=\"admin-shadow-bans-title\">シャドウバン</h1>\n\
              {nav}\
              {notice}\
              {body}\
              </section>\n",
-            nav = admin_nav("/admin/ip-bans"),
+            nav = admin_nav("/admin/shadow-bans"),
             notice = notice_html(view.notice.as_ref()),
         ),
     )
@@ -757,7 +768,7 @@ fn admin_nav(current: &str) -> String {
         link("/admin/rating-params", "レート増減幅"),
         link("/admin/matching-range", "マッチング範囲"),
         link("/admin/block-cooldown", "ブロック解除の待機日数"),
-        link("/admin/ip-bans", "IP のシャドウバン"),
+        link("/admin/shadow-bans", "シャドウバン"),
         link("/admin/quiet-reports", "聞き専報告"),
     )
 }

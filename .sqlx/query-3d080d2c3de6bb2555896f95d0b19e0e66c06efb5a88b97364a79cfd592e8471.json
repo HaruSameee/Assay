@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into ip_ban_changes (ip, kind, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5, $6) on conflict (idempotency_key) do nothing returning id",
+  "query": "insert into shadow_ban_changes (subject_kind, subject, kind, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5, $6, $7) on conflict (idempotency_key) do nothing returning id",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "ip_ban_changes",
+            "table": "shadow_ban_changes",
             "name": "id"
           }
         }
@@ -22,6 +22,7 @@
         "Text",
         "Text",
         "Text",
+        "Text",
         "Timestamptz"
       ]
     },
@@ -29,5 +30,5 @@
       false
     ]
   },
-  "hash": "445de3d0ea73c15822efd252583effcdd94ce068667edefb98d63467d66a7a4a"
+  "hash": "3d080d2c3de6bb2555896f95d0b19e0e66c06efb5a88b97364a79cfd592e8471"
 }

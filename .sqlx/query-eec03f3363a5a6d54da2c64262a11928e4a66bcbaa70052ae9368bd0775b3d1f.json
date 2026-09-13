@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select exists(select 1 from current_ip_bans where ip = $1) as \"banned!\"",
+  "query": "select exists(select 1 from current_shadow_bans where subject_kind = $1 and subject = $2) as \"banned!\"",
   "describe": {
     "columns": [
       {
@@ -12,6 +12,7 @@
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Text"
       ]
     },
@@ -19,5 +20,5 @@
       null
     ]
   },
-  "hash": "ea1bb288f6418d4219c1118bba1757a67806aa526a2cd63421847b2858bdc819"
+  "hash": "eec03f3363a5a6d54da2c64262a11928e4a66bcbaa70052ae9368bd0775b3d1f"
 }

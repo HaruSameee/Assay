@@ -288,11 +288,22 @@ impl QueueRepository {
         Ok(crate::admin::repository::matchmaker_stop_on(&mut conn, now).await?)
     }
 
-    /// この接続元がいま BAN 中か（`current_ip_bans`。完全一致）。
-    pub async fn is_ip_banned(&self, ip: &str) -> Result<bool, QueueError> {
+    /// この投入をシャドウバンするか。**接続元の IP か、本人の Discord ユーザー ID の
+    /// どちらか**が `current_shadow_bans` にあれば真（`admin::shadow_bans`）。
+    pub async fn is_shadow_banned(
+        &self,
+        player_id: PlayerId,
+        ip: &str,
+    ) -> Result<bool, QueueError> {
         let banned = sqlx::query_scalar!(
-            "select exists(select 1 from current_ip_bans where ip = $1) as \"banned!\"",
+            "select exists( \
+                 select 1 from current_shadow_bans b \
+                 where (b.subject_kind = 'ip' and b.subject = $1) \
+                    or (b.subject_kind = 'discord_user' \
+                        and b.subject = (select p.discord_user_id::text from players p where p.id = $2)) \
+             ) as \"banned!\"",
             ip,
+            player_id.0,
         )
         .fetch_one(&self.pool)
         .await?;

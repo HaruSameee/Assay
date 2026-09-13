@@ -2889,60 +2889,79 @@ async fn the_block_cooldown_can_be_changed_from_the_panel(owner: PgPool) {
 }
 
 // ----------------------------------------------------------------------
-// IP のシャドウバン
+// シャドウバン（IP / Discord ユーザー ID）
 // ----------------------------------------------------------------------
 
-/// **画面から IP を BAN / 解除できる。**既にその状態なら行を増やさない。理由なしは断る。
+/// **画面から IP でも Discord ID でも BAN / 解除できる。**既にその状態なら行を増やさない。
+/// 理由なし・対象なしは断る。数字だけの入力は Discord ID として扱う。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn an_ip_can_be_shadow_banned_and_released_from_the_panel(owner: PgPool) {
+async fn a_subject_can_be_shadow_banned_and_released_from_the_panel(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
-    seed_cast(&db, 1).await;
+    seed_cast(&db, 2).await;
     let app = db.router();
 
-    let (status, page) = get_html(&app, player(ADMIN), "/admin/ip-bans").await;
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/shadow-bans").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(page.contains("BAN 中の IP はありません"), "{page}");
-    let key = form_key(&page, "/admin/ip-bans");
+    assert!(page.contains("BAN 中の対象はありません"), "{page}");
+    let key = form_key(&page, "/admin/shadow-bans");
 
-    // 理由なし・IP なしは断る
+    // 理由なし・対象なしは断る
     let (_, no_reason) = post_form(
         &app,
         player(ADMIN),
-        "/admin/ip-bans",
-        &format!("action=ban&ip=198.51.100.7&reason=&key={key}"),
+        "/admin/shadow-bans",
+        &format!("action=ban&subject=198.51.100.7&reason=&key={key}"),
     )
     .await;
     assert!(no_reason.contains("理由を入力してください"), "{no_reason}");
-    let (_, no_ip) = post_form(
+    let (_, no_subject) = post_form(
         &app,
         player(ADMIN),
-        "/admin/ip-bans",
-        &format!("action=ban&ip=&reason=x&key={key}"),
+        "/admin/shadow-bans",
+        &format!("action=ban&subject=&reason=x&key={key}"),
     )
     .await;
-    assert!(no_ip.contains("IP を入力してください"), "{no_ip}");
-    assert_eq!(count(&db, "ip_ban_changes").await, 0);
+    assert!(
+        no_subject.contains("IP か Discord ユーザー ID を入力"),
+        "{no_subject}"
+    );
+    assert_eq!(count(&db, "shadow_ban_changes").await, 0);
 
-    // BAN
+    // IP を BAN
     let (status, banned) = post_form(
         &app,
         player(ADMIN),
-        "/admin/ip-bans",
-        &format!("action=ban&ip=+198.51.100.7+&reason=%E8%8D%92%E3%82%89%E3%81%97&key={key}"),
+        "/admin/shadow-bans",
+        &format!("action=ban&subject=+198.51.100.7+&reason=%E8%8D%92%E3%82%89%E3%81%97&key={key}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        banned.contains("198.51.100.7 をシャドウバンしました"),
+        banned.contains("IP 198.51.100.7 をシャドウバンしました"),
         "{banned}"
     );
     assert!(
         banned.contains("<td class=\"num\">198.51.100.7</td>"),
         "{banned}"
     );
-    assert_eq!(count(&db, "ip_ban_changes").await, 1);
+    assert_eq!(count(&db, "shadow_ban_changes").await, 1);
+
+    // Discord ID（数字だけ）を BAN。seed_cast の player(2) は Discord ID 1002
+    let (_, user_banned) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/shadow-bans",
+        &format!("action=ban&subject=1002&reason=%E3%82%B5%E3%83%96%E5%9E%A2&key={key}-u"),
+    )
+    .await;
+    assert!(
+        user_banned.contains("Discord ID 1002 をシャドウバンしました"),
+        "{user_banned}"
+    );
+    assert!(user_banned.contains("<td>Discord ID</td>"), "{user_banned}");
+    assert_eq!(count(&db, "shadow_ban_changes").await, 2);
     let banned_now: bool = sqlx::query_scalar(
-        "select exists(select 1 from current_ip_bans where ip = '198.51.100.7')",
+        "select exists(select 1 from current_shadow_bans where subject_kind = 'discord_user' and subject = '1002')",
     )
     .fetch_one(&db.pool)
     .await
@@ -2953,41 +2972,64 @@ async fn an_ip_can_be_shadow_banned_and_released_from_the_panel(owner: PgPool) {
     let (_, again) = post_form(
         &app,
         player(ADMIN),
-        "/admin/ip-bans",
-        &format!("action=ban&ip=198.51.100.7&reason=x&key={key}-2"),
+        "/admin/shadow-bans",
+        &format!("action=ban&subject=198.51.100.7&reason=x&key={key}-2"),
     )
     .await;
     assert!(again.contains("既に BAN 中です"), "{again}");
-    assert_eq!(count(&db, "ip_ban_changes").await, 1);
+    assert_eq!(count(&db, "shadow_ban_changes").await, 2);
 
     // 解除
     let (_, released) = post_form(
         &app,
         player(ADMIN),
-        "/admin/ip-bans",
-        &format!("action=unban&ip=198.51.100.7&reason=%E8%A7%A3%E9%99%A4&key={key}-3"),
+        "/admin/shadow-bans",
+        &format!("action=unban&subject=198.51.100.7&reason=%E8%A7%A3%E9%99%A4&key={key}-3"),
     )
     .await;
     assert!(
         released.contains("シャドウバンを解除しました"),
         "{released}"
     );
-    assert!(released.contains("BAN 中の IP はありません"), "{released}");
-    assert_eq!(count(&db, "ip_ban_changes").await, 2);
-    // 運営操作ログ
-    let kinds: Vec<(String,)> = sqlx::query_as(
-        "select kind from admin_actions where kind in ('ip_banned', 'ip_unbanned') order by id",
+    // BAN 中の一覧（解除フォームがある行）から IP は消え、ID は残る。履歴には両方残る
+    assert!(
+        !released.contains("name=\"subject\" value=\"198.51.100.7\""),
+        "{released}"
+    );
+    assert!(
+        released.contains("name=\"subject\" value=\"1002\""),
+        "ID の方は残る: {released}"
+    );
+    assert_eq!(count(&db, "shadow_ban_changes").await, 3);
+    // 運営操作ログ（対象は payload に残る）
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "select kind, payload from admin_actions \
+         where kind in ('shadow_banned', 'shadow_ban_lifted') order by id",
     )
     .fetch_all(&db.pool)
     .await
     .unwrap();
+    let logged: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|(kind, payload)| {
+            (
+                kind.as_str(),
+                payload["subject_kind"].as_str().unwrap(),
+                payload["subject"].as_str().unwrap(),
+            )
+        })
+        .collect();
     assert_eq!(
-        kinds.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(),
-        vec!["ip_banned", "ip_unbanned"]
+        logged,
+        vec![
+            ("shadow_banned", "ip", "198.51.100.7"),
+            ("shadow_banned", "discord_user", "1002"),
+            ("shadow_ban_lifted", "ip", "198.51.100.7"),
+        ]
     );
     // 非管理者には無い
-    let (status, _) = get_html(&app, player(2), "/admin/ip-bans").await;
+    let (status, _) = get_html(&app, player(2), "/admin/shadow-bans").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    println!("IP BAN: 追加 → 重複は増えない → 解除、操作ログ 2 行");
+    println!("シャドウバン: IP と Discord ID を BAN → 重複は増えない → IP を解除、操作ログ 3 行");
     db.done().await;
 }

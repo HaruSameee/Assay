@@ -50,16 +50,20 @@ pub enum AdminActionKind {
     MatchReadjudicated,
     /// ブロック解除の待機日数を変えた（既にあるブロックにも効く）。
     BlockCooldownChanged,
-    /// IP をシャドウバンした（その IP からの投入は組まれない）。
+    /// IP をシャドウバンした（旧。いまは shadow_banned）。
     IpBanned,
-    /// IP のシャドウバンを解いた。
+    /// IP のシャドウバンを解いた（旧。いまは shadow_ban_lifted）。
     IpUnbanned,
+    /// シャドウバンした（IP か Discord ユーザー ID。その対象からの投入は組まれない）。
+    ShadowBanned,
+    /// シャドウバンを解いた。
+    ShadowBanLifted,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
@@ -77,6 +81,8 @@ impl AdminActionKind {
         Self::BlockCooldownChanged,
         Self::IpBanned,
         Self::IpUnbanned,
+        Self::ShadowBanned,
+        Self::ShadowBanLifted,
     ];
 
     /// DB に入る文字列。
@@ -96,6 +102,8 @@ impl AdminActionKind {
             Self::BlockCooldownChanged => "block_cooldown_changed",
             Self::IpBanned => "ip_banned",
             Self::IpUnbanned => "ip_unbanned",
+            Self::ShadowBanned => "shadow_banned",
+            Self::ShadowBanLifted => "shadow_ban_lifted",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -119,6 +127,8 @@ impl AdminActionKind {
             "block_cooldown_changed" => Some(Self::BlockCooldownChanged),
             "ip_banned" => Some(Self::IpBanned),
             "ip_unbanned" => Some(Self::IpUnbanned),
+            "shadow_banned" => Some(Self::ShadowBanned),
+            "shadow_ban_lifted" => Some(Self::ShadowBanLifted),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -143,6 +153,8 @@ impl AdminActionKind {
             Self::BlockCooldownChanged => "ブロック解除の待機日数を変更",
             Self::IpBanned => "IP をシャドウバン",
             Self::IpUnbanned => "IP のシャドウバンを解除",
+            Self::ShadowBanned => "シャドウバン",
+            Self::ShadowBanLifted => "シャドウバンを解除",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",
