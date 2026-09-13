@@ -136,7 +136,7 @@ fn first_choice_breakdown(status: &StatusView) -> String {
     }
     format!(
         "<div class=\"first-choice\">\n\
-         <p class=\"first-choice-label\"><strong>第1希望</strong>の内訳（この範囲内）</p>\n\
+         <p class=\"first-choice-label\"><strong>第1希望</strong>の内訳（この人たち）</p>\n\
          <ul class=\"first-choice-list\">\n{items}</ul></div>\n"
     )
 }
@@ -191,8 +191,9 @@ fn unqueued_page(
          <input id=\"streaming\" type=\"checkbox\"> 配信中（YouTube など）</label>\n\
          <p class=\"field-help\">配信は誰でも自由にできます。チェックすると、この試合のマッチ画面で\
          参加者全員に「配信中」と表示されます（相手チームにも見えます）。</p></div>\n\
-         <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上 +{up} / 下 -{down} です。\
-         現在この範囲内でキュー中: <strong id=\"in-range\">{in_range}人</strong></p>\n\
+         <div class=\"notice\" aria-live=\"polite\"><p>マッチング範囲は上 +{up} / 下 -{down} です\
+         （同じ試合に入る 10 人はレート差 {up} 以内に収まります）。\
+         現在あなたと同じ試合に入れる人: <strong id=\"in-range\">{in_range}人</strong></p>\n\
          {breakdown}</div>\n\
          <div id=\"queue-error\" class=\"error-summary\" role=\"alert\" hidden></div>\n\
          <div class=\"actions\"><button type=\"submit\"{submit_disabled}>キューに入る</button></div>\n\
@@ -322,7 +323,7 @@ fn queued_page(
          {stopped}{reported}\
          <div class=\"metrics\">\n<div class=\"metric\"><span class=\"metric-label\">待ち時間</span><strong id=\"wait-time\" class=\"metric-value\">{waiting}</strong></div>\n\
          <div class=\"metric\"><span class=\"metric-label\">全体でキュー中</span><strong id=\"queue-total\" class=\"metric-value\">{queue_total}人</strong></div>\n\
-         <div class=\"metric\"><span class=\"metric-label\">範囲内でキュー中</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
+         <div class=\"metric\"><span class=\"metric-label\">同じ試合に入れる人</span><strong id=\"in-range\" class=\"metric-value\">{in_range}人</strong></div>\n</div>\n\
          {breakdown}\
          <section class=\"section\" aria-labelledby=\"settings-title\"><h2 id=\"settings-title\">現在の設定</h2>\n\
          <dl class=\"details\"><div><dt>ロール希望</dt><dd><ol class=\"role-preferences\">{roles}</ol></dd></div>\n\
@@ -715,7 +716,7 @@ mod tests {
         assert!(!rendered.contains("type=\"range\""), "スライダーを出さない");
         assert!(!rendered.contains("down-range"), "{rendered}");
         assert!(rendered.contains("マッチング範囲は上 +50 / 下 -50 です"));
-        assert!(rendered.contains("現在この範囲内でキュー中"));
+        assert!(rendered.contains("現在あなたと同じ試合に入れる人"));
         assert!(rendered.contains("document.hidden"));
         assert!(rendered.contains("setInterval(preview, 10000)"));
     }
@@ -895,14 +896,14 @@ mod tests {
             rendered.contains("id=\"queue-total\" class=\"metric-value\">9人"),
             "{rendered}"
         );
-        assert!(rendered.contains("範囲内でキュー中"), "{rendered}");
+        assert!(rendered.contains("同じ試合に入れる人"), "{rendered}");
         assert!(
             rendered.contains("id=\"in-range\" class=\"metric-value\">4人"),
             "{rendered}"
         );
         // 全体が先、範囲内が後（狭い方へ絞り込む順に読ませる）
         let total_at = rendered.find("全体でキュー中").expect("全体");
-        let range_at = rendered.find("範囲内でキュー中").expect("範囲内");
+        let range_at = rendered.find("同じ試合に入れる人").expect("範囲内");
         assert!(total_at < range_at, "{rendered}");
         // ポーリングでも両方が更新される
         assert!(rendered.contains("state.queue_total"), "{rendered}");

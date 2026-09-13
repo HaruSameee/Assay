@@ -1,7 +1,8 @@
 //! 「範囲が互いに両立する」の判定（07-マッチング仕様 §3-1）。純粋関数。
 //!
 //! 10人の組が成立する条件は**全ペアが相互に相手を受け入れること**であり、
-//! キュー画面に出す「現在あなたの範囲内でキュー中: N人」も同じ定義で数える。
+//! キュー画面に出す「現在あなたと同じ試合に入れる人: N人」も同じ定義で数える
+//! （自分を含む幅 50 のウィンドウのうち、いちばん人が多いもの。±50 ではない）。
 //! 範囲が上下とも 50 固定になった現在、相互条件は「差が 50 以内」と同値だが、
 //! **片方向の判定を残してある**（範囲がまた非対称になったときに、ここだけで直せる）。
 //!
@@ -56,32 +57,64 @@ pub fn mutually_in_range(a: &QueuedPlayer, b: &QueuedPlayer) -> bool {
     accepts(a, b) && accepts(b, a)
 }
 
-/// `me` の範囲内で、かつ相手からも受け入れられるキュー中プレイヤーの人数。
+/// **`me` と同じ試合に入れる人数。**自分自身は数えない（`queue` に自分が入っていてもよい）。
 ///
-/// 自分自身は数えない（`queue` に自分が入っていてもよい）。
+/// 数えるのは「自分を含む幅 50 のウィンドウ（07 §3-1）のうち、いちばん人が多いもの」に
+/// 入る人。**自分の ±50 に入る人の数ではない。**±50 で数えると、自分の 45 上と 45 下の
+/// 人は両方「範囲内」だが、その 2 人は互いに 90 離れていて同じ試合には入れない。
+/// マッチメイカが見るのは max − min ≤ 50 の集合なので、画面もそれに揃える
+/// （「範囲内 10 人」と出ているのに何度も流れる、という食い違いを作らない）。
 pub fn count_in_range(me: &QueuedPlayer, queue: &[QueuedPlayer]) -> usize {
-    in_range_with(me, queue).count()
+    best_window(me, queue).len()
 }
 
-/// 範囲内の人だけを返す。人数と内訳を**同じ判定**から数えるための共通部分。
-fn in_range_with<'a>(
-    me: &'a QueuedPlayer,
-    queue: &'a [QueuedPlayer],
-) -> impl Iterator<Item = &'a QueuedPlayer> {
-    queue
+/// 自分を含む幅 `up_range` のウィンドウのうち、いちばん人が多いものに入る**他の人**。
+///
+/// ウィンドウの下端は「自分か、自分の下 `up_range` 以内にいる誰か」のレートで、
+/// その下端から `up_range` 上までを 1 つの組み合わせとして数える（マッチメイカの
+/// `find_one` と同じ形）。相互条件（[`mutually_in_range`]）を満たさない人は最初から外す。
+/// 同数のウィンドウが複数あれば下端が低いものを採る（決定的にするため）。
+fn best_window<'a>(me: &'a QueuedPlayer, queue: &'a [QueuedPlayer]) -> Vec<&'a QueuedPlayer> {
+    let candidates: Vec<&QueuedPlayer> = queue
         .iter()
-        .filter(move |other| other.player_id != me.player_id)
-        .filter(move |other| mutually_in_range(me, other))
+        .filter(|other| other.player_id != me.player_id)
+        .filter(|other| mutually_in_range(me, other))
+        .collect();
+    let span = f64::from(me.up_range);
+    // 下端の候補: 自分と、自分の下 span 以内の人のレート
+    let mut floors: Vec<f64> = candidates
+        .iter()
+        .map(|other| other.rating)
+        .filter(|rating| *rating <= me.rating && me.rating - *rating <= span)
+        .chain(std::iter::once(me.rating))
+        .collect();
+    floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    floors.dedup();
+    let mut best: Vec<&QueuedPlayer> = Vec::new();
+    for floor in floors {
+        let window: Vec<&QueuedPlayer> = candidates
+            .iter()
+            .copied()
+            .filter(|other| {
+                let above = other.rating - floor;
+                above >= 0.0 && above <= span && above <= f64::from(other.down_range)
+            })
+            .collect();
+        if window.len() > best.len() {
+            best = window;
+        }
+    }
+    best
 }
 
 /// 範囲内の人を**第1希望のロール別**に数える。
 ///
-/// 絞り込みは [`count_in_range`] と同じ条件（上下 50 の相互条件）。数え方は
+/// 絞り込みは [`count_in_range`] と同じ（自分を含む幅 50 のいちばん多いウィンドウ）。数え方は
 /// 15 分サマリと同じ「第1希望がそのロールの人」で、希望のどこかに含まれる人ではない。
 /// 希望を 1 つも持たない行は、どのロールにも数えない。
 pub fn count_by_first_choice(me: &QueuedPlayer, queue: &[QueuedPlayer]) -> FirstChoiceRoleCounts {
     let mut counts = FirstChoiceRoleCounts::default();
-    for other in in_range_with(me, queue) {
+    for other in best_window(me, queue) {
         if let Some(role) = other.first_choice.as_deref() {
             counts.increment(role);
         }
@@ -140,11 +173,40 @@ mod tests {
         // 1500 と 1600 は差 100 → 組めない
         assert!(!mutually_in_range(&low, &high), "1500 と 1600（差 100）");
 
-        // 中間層から見れば両方が範囲内。上下の群は互いに見えない
+        // 中間層から見ると両方が ±50 に入るが、**同じ試合には片方しか入らない**
+        // （1500 と 1600 は 100 離れている）。数えるのは幅 50 のウィンドウなので 1
         let queue = [low.clone(), middle.clone(), high.clone()];
-        assert_eq!(count_in_range(&middle, &queue), 2);
+        assert_eq!(count_in_range(&middle, &queue), 1);
         assert_eq!(count_in_range(&low, &queue), 1);
         assert_eq!(count_in_range(&high, &queue), 1);
+    }
+
+    /// **±50 に入る人数ではなく、自分を含む幅 50 の組み合わせで数える。**
+    ///
+    /// 「範囲内 10 人」と出ているのに何度も流れる、の原因: 自分の 45 上と 45 下は
+    /// どちらも範囲内だが、互いに 90 離れていて同じ試合には入れない。
+    #[test]
+    fn the_count_is_the_largest_fifty_wide_window_that_contains_me() {
+        let me = player(1, 1600.0);
+        let mut queue = vec![me.clone()];
+        // 上に 4 人（1640〜1643）、下に 5 人（1555〜1560）。±50 なら 9 人だが、
+        // 上の群と下の群は 80 以上離れていて 1 つの試合には入らない
+        for n in 0..4u128 {
+            queue.push(player(10 + n, 1640.0 + n as f64));
+        }
+        for n in 0..5u128 {
+            queue.push(player(20 + n, 1555.0 + n as f64));
+        }
+        // 自分を含む幅 50: [1555, 1605] に下の 5 人、[1600, 1650] に上の 4 人 → 5
+        assert_eq!(count_in_range(&me, &queue), 5);
+        // 上の群にもう 2 人足せば [1600, 1650] が 6 人になり、そちらが採られる
+        queue.push(player(30, 1649.0));
+        queue.push(player(31, 1650.0));
+        assert_eq!(count_in_range(&me, &queue), 6);
+        // 全員が幅 50 に収まっていれば、±50 と同じ数になる
+        let tight: Vec<QueuedPlayer> = (0..10u128).map(|n| player(n, 1600.0 + n as f64)).collect();
+        assert_eq!(count_in_range(&tight[0], &tight), 9);
+        assert_eq!(count_in_range(&tight[9], &tight), 9);
     }
 
     /// 相互条件は対称。範囲が全員同じなので、片方向と結論が一致する。
@@ -174,7 +236,9 @@ mod tests {
             player(6, 1449.9), // -50 を超える
             player(7, 1600.0), // 上の群
         ];
-        assert_eq!(count_in_range(&me, &queue), 3);
+        // ±50 には 3 人（1500 / 1550 / 1450）入るが、1450 と 1550 は同じ試合に入れない。
+        // 幅 50 のウィンドウは [1450, 1500] か [1500, 1550] のどちらかで、どちらも 2 人
+        assert_eq!(count_in_range(&me, &queue), 2);
     }
 
     /// 旧仕様の広い `down_range` が万一残っていても、丸めた値が渡る前提。
@@ -217,7 +281,7 @@ mod tests {
             wanting(2, 1500.0, "jungle"),   // 範囲内
             wanting(3, 1550.0, "jungle"),   // +50 ちょうど。範囲内
             wanting(4, 1550.1, "jungle"),   // 範囲外
-            wanting(5, 1450.0, "bot_tank"), // -50 ちょうど。範囲内
+            wanting(5, 1500.0, "bot_tank"), // 同レート。範囲内
             wanting(6, 1449.9, "bot_tank"), // 範囲外
             player(7, 1500.0),              // 希望なし。どのロールにも入らない
         ];
@@ -229,7 +293,7 @@ mod tests {
         assert_eq!(counts.top_support, 0);
         assert_eq!(counts.bot_carry, 0);
 
-        // 範囲内は 4 人（希望なしの 1 人を含む）。内訳の合計は 3
+        // 幅 50 のウィンドウ [1500, 1550] に 4 人（希望なしの 1 人を含む）。内訳の合計は 3
         assert_eq!(count_in_range(&me, &queue), 4);
         let total: usize = counts.all().into_iter().map(|(_, count)| count).sum();
         assert_eq!(total, 3, "希望を持たない行はどのロールにも入らない");

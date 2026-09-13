@@ -23,80 +23,148 @@ pub const BOOST_PER_UNMATCHED_SCAN: f64 = 14.0;
 
 /// マッチング範囲の判定に使うレート。**純粋関数。**
 ///
-/// `top_rating` はそのスキャンの候補全員の実レートの最大。1486 以下なら上へ、
+/// `bounds` はそのスキャンの候補全員の実レートの最小と最大（[`Bounds`]）。1486 以下なら上へ、
 /// 最大に並ぶなら下へ、それ以外は実レートのまま。**1486 以下が優先**（全員が 1486 以下の
-/// キューで、いちばん上だけ下がると逆に離れる）。上限も下限も設けない: 近い帯に人が
-/// 現れるまで 1 スキャンごとに 14 ずつ寄り、組まれた時点でカウンタごと消える。
-pub fn matching_rating(rating: f64, unmatched_scans: i32, top_rating: f64) -> f64 {
+/// キューで、いちばん上だけ下がると逆に離れる）。
+///
+/// **寄せるのは候補の中まで。**上げる側は候補の最大、下げる側は候補の最小で止める。
+/// 止めないと、組めない理由がロールの都合だったときに端の人が帯を通り過ぎて
+/// 反対側へ抜けてしまい、「範囲内に 10 人いるのに流れる」を自分で作る。
+/// 組まれた時点でカウンタごと消える。
+pub fn matching_rating(rating: f64, unmatched_scans: i32, bounds: Bounds) -> f64 {
     if unmatched_scans <= 0 {
         return rating;
     }
     let shift = BOOST_PER_UNMATCHED_SCAN * f64::from(unmatched_scans);
     if rating <= BOOST_MAX_RATING {
-        rating + shift
-    } else if rating >= top_rating {
-        rating - shift
+        (rating + shift).min(bounds.top.max(rating))
+    } else if rating >= bounds.top {
+        (rating - shift).max(bounds.bottom.min(rating))
     } else {
         rating
     }
 }
 
-/// 判定用のレートが実レートと変わる人か（ログの人数用）。
-pub fn is_shifted(rating: f64, top_rating: f64) -> bool {
-    rating <= BOOST_MAX_RATING || rating >= top_rating
+/// そのスキャンの候補全員の実レートの最小と最大。空なら誰も動かない。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bounds {
+    /// 最小の実レート。上の端はここまで下がる。
+    pub bottom: f64,
+    /// 最大の実レート。「いちばん上」の判定にも、下の端がここまで上がるのにも使う。
+    pub top: f64,
 }
 
-/// 候補全員の実レートの最大。空なら `f64::MIN`（誰も「いちばん上」にならない）。
-pub fn top_rating<'a>(ratings: impl IntoIterator<Item = &'a f64>) -> f64 {
-    ratings.into_iter().copied().fold(f64::MIN, f64::max)
+impl Bounds {
+    /// 候補の実レートから作る。
+    pub fn of<'a>(ratings: impl IntoIterator<Item = &'a f64>) -> Self {
+        let mut bounds = Self {
+            bottom: f64::MAX,
+            top: f64::MIN,
+        };
+        for rating in ratings {
+            bounds.bottom = bounds.bottom.min(*rating);
+            bounds.top = bounds.top.max(*rating);
+        }
+        bounds
+    }
+}
+
+/// 判定用のレートが実レートと変わりうる人か（ログの人数用）。
+pub fn is_shifted(rating: f64, bounds: Bounds) -> bool {
+    rating <= BOOST_MAX_RATING || rating >= bounds.top
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn between(bottom: f64, top: f64) -> Bounds {
+        Bounds { bottom, top }
+    }
+
     /// **1486 以下だけ、取り残された回数 x 14 上がる。**
     #[test]
     fn only_low_ratings_are_lifted_by_fourteen_per_scan() {
-        let top = 1700.0;
-        assert_eq!(matching_rating(1486.0, 0, top), 1486.0);
-        assert_eq!(matching_rating(1486.0, 1, top), 1500.0);
-        assert_eq!(matching_rating(1486.0, 3, top), 1528.0);
-        assert_eq!(matching_rating(1400.0, 2, top), 1428.0);
+        let bounds = between(1400.0, 1700.0);
+        assert_eq!(matching_rating(1486.0, 0, bounds), 1486.0);
+        assert_eq!(matching_rating(1486.0, 1, bounds), 1500.0);
+        assert_eq!(matching_rating(1486.0, 3, bounds), 1528.0);
+        assert_eq!(matching_rating(1400.0, 2, bounds), 1428.0);
         // 境界: 1486 は対象、1487 は対象外（いちばん上でもなければそのまま）
-        assert_eq!(matching_rating(1487.0, 5, top), 1487.0);
-        assert_eq!(matching_rating(1500.0, 5, top), 1500.0);
+        assert_eq!(matching_rating(1487.0, 5, bounds), 1487.0);
+        assert_eq!(matching_rating(1500.0, 5, bounds), 1500.0);
         // 負の回数は来ないが、来ても動かさない
-        assert_eq!(matching_rating(1486.0, -1, top), 1486.0);
+        assert_eq!(matching_rating(1486.0, -1, bounds), 1486.0);
     }
 
     /// **いちばん上は取り残された回数 x 14 下がる。**2 番目以下は動かない。
     #[test]
     fn only_the_top_rating_is_pulled_down_by_fourteen_per_scan() {
-        let top = 1700.0;
-        assert_eq!(matching_rating(1700.0, 0, top), 1700.0);
-        assert_eq!(matching_rating(1700.0, 1, top), 1686.0);
-        assert_eq!(matching_rating(1700.0, 3, top), 1658.0);
+        let bounds = between(1500.0, 1700.0);
+        assert_eq!(matching_rating(1700.0, 0, bounds), 1700.0);
+        assert_eq!(matching_rating(1700.0, 1, bounds), 1686.0);
+        assert_eq!(matching_rating(1700.0, 3, bounds), 1658.0);
         // 2 番目（1699）は何回でも動かない
-        assert_eq!(matching_rating(1699.0, 5, top), 1699.0);
+        assert_eq!(matching_rating(1699.0, 5, bounds), 1699.0);
         // 同率首位はどちらも下がる
-        assert_eq!(matching_rating(1700.0, 2, 1700.0), 1672.0);
+        assert_eq!(matching_rating(1700.0, 2, between(1500.0, 1700.0)), 1672.0);
     }
 
-    /// **全員が 1486 以下のキューでは、いちばん上も上がる**（下げると逆に離れる）。
+    /// **寄せるのは候補の中まで。**上の端は候補の最小で、下の端は候補の最大で止まる。
+    /// 止めないと、ロールの都合で組めない帯を通り過ぎて反対側へ抜けてしまう。
+    #[test]
+    fn the_shift_stops_at_the_far_end_of_the_candidates() {
+        // 1650 が首位、いちばん下は 1600。30 回取り残されても 1600 で止まる
+        let bounds = between(1600.0, 1650.0);
+        assert_eq!(matching_rating(1650.0, 3, bounds), 1608.0);
+        assert_eq!(
+            matching_rating(1650.0, 4, bounds),
+            1600.0,
+            "1594 まで下がらない"
+        );
+        assert_eq!(matching_rating(1650.0, 30, bounds), 1600.0);
+        // 1486 の人は候補の最大（1560）で止まる
+        let bounds = between(1486.0, 1560.0);
+        assert_eq!(matching_rating(1486.0, 5, bounds), 1556.0);
+        assert_eq!(
+            matching_rating(1486.0, 6, bounds),
+            1560.0,
+            "1570 まで上がらない"
+        );
+        // 自分 1 人だけのキューでは動かない
+        let alone = between(1650.0, 1650.0);
+        assert_eq!(matching_rating(1650.0, 9, alone), 1650.0);
+        let alone_low = between(1486.0, 1486.0);
+        assert_eq!(matching_rating(1486.0, 9, alone_low), 1486.0);
+    }
+
+    /// **全員が 1486 以下のキューでは、いちばん上も上がる側**（下げると逆に離れる）。
+    /// ただし候補の最大より上へは行かないので、首位そのものは動かない。
     #[test]
     fn a_low_queue_lifts_its_top_instead_of_dropping_it() {
-        let top = 1486.0;
-        assert_eq!(matching_rating(1486.0, 2, top), 1514.0);
-        assert_eq!(matching_rating(1400.0, 2, top), 1428.0);
+        let bounds = between(1400.0, 1486.0);
+        assert_eq!(
+            matching_rating(1486.0, 2, bounds),
+            1486.0,
+            "首位は最大に張り付く"
+        );
+        assert_eq!(matching_rating(1400.0, 2, bounds), 1428.0);
+        assert_eq!(
+            matching_rating(1400.0, 9, bounds),
+            1486.0,
+            "首位まで上がって止まる"
+        );
     }
 
     #[test]
-    fn the_top_rating_is_the_maximum_and_empty_means_nobody() {
-        assert_eq!(top_rating(&[1500.0, 1650.0, 1480.0]), 1650.0);
-        assert_eq!(top_rating(&[]), f64::MIN);
-        assert!(is_shifted(1650.0, 1650.0));
-        assert!(!is_shifted(1600.0, 1650.0));
-        assert!(is_shifted(1486.0, 1650.0));
+    fn bounds_are_the_extremes_and_empty_means_nobody() {
+        let bounds = Bounds::of(&[1500.0, 1650.0, 1480.0]);
+        assert_eq!(bounds, between(1480.0, 1650.0));
+        let empty = Bounds::of(&[]);
+        assert_eq!(empty.top, f64::MIN);
+        assert_eq!(empty.bottom, f64::MAX);
+        assert!(is_shifted(1650.0, bounds));
+        assert!(!is_shifted(1600.0, bounds));
+        assert!(is_shifted(1486.0, bounds));
     }
 }

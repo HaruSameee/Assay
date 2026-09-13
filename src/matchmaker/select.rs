@@ -157,10 +157,10 @@ pub struct Candidate {
 
 impl Candidate {
     /// **マッチング範囲の判定に使うレート。**端の取り残し対策の寄せ込み
-    /// （[`super::boost`]。`top_rating` はそのスキャンの候補の実レートの最大）。
+    /// （[`super::boost`]。`bounds` はそのスキャンの候補の実レートの最小と最大）。
     /// 実レートは [`Self::rating`] のまま formation に凍結する。
-    pub fn matching_rating(&self, top_rating: f64) -> f64 {
-        super::boost::matching_rating(self.rating, self.unmatched_scans, top_rating)
+    pub fn matching_rating(&self, bounds: super::boost::Bounds) -> f64 {
+        super::boost::matching_rating(self.rating, self.unmatched_scans, bounds)
     }
 }
 
@@ -371,7 +371,7 @@ fn select_matches_inner<O: SelectionObserver>(
 ) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
     // 「いちばん上」は**このスキャンの候補全員**から 1 回だけ決める（`super::boost`）
-    let top = super::boost::top_rating(candidates.iter().map(|candidate| &candidate.rating));
+    let top = super::boost::Bounds::of(candidates.iter().map(|candidate| &candidate.rating));
     // 決定的にするため、レート降順・同点は player_id 昇順で固定する。
     // **判定用のレート**で並べる（端の寄せ込み。`Candidate::matching_rating`）
     pool.sort_by(|a, b| {
@@ -408,7 +408,7 @@ fn select_matches_inner<O: SelectionObserver>(
 /// 下からはその逆で、最低レートの人を基準にした窓から試す。
 fn find_one<O: SelectionObserver>(
     pool: &[&Candidate],
-    top: f64,
+    top: super::boost::Bounds,
     ally_blocks: &AllyBlocks,
     now: Timestamp,
     ranges: MatchingRanges,
@@ -1246,7 +1246,13 @@ mod tests {
 
         // 取り残し 1 回（1500、差 60）でもまだ 50 より遠い
         roster[0].unmatched_scans = 1;
-        assert_eq!(roster[0].matching_rating(1560.0), 1500.0);
+        assert_eq!(
+            roster[0].matching_rating(super::super::boost::Bounds {
+                bottom: 1486.0,
+                top: 1560.0
+            }),
+            1500.0
+        );
         assert!(select_matches(&roster, now()).is_empty());
 
         // 2 回（1514）で差 46 になり組める
@@ -1268,7 +1274,13 @@ mod tests {
         // 1487 の人は何回取り残されても上がらない
         roster[0] = who(1, 1487.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
         roster[0].unmatched_scans = 10;
-        assert_eq!(roster[0].matching_rating(1560.0), 1487.0);
+        assert_eq!(
+            roster[0].matching_rating(super::super::boost::Bounds {
+                bottom: 1487.0,
+                top: 1560.0
+            }),
+            1487.0
+        );
         assert!(select_matches(&roster, now()).is_empty());
     }
 
@@ -1283,7 +1295,13 @@ mod tests {
 
         // 1 回（1660、差 60）でもまだ遠い
         roster[0].unmatched_scans = 1;
-        assert_eq!(roster[0].matching_rating(1674.0), 1660.0);
+        assert_eq!(
+            roster[0].matching_rating(super::super::boost::Bounds {
+                bottom: 1600.0,
+                top: 1674.0
+            }),
+            1660.0
+        );
         assert!(select_matches(&roster, now()).is_empty());
 
         // 2 回（1646、差 46）で組める
@@ -1302,7 +1320,13 @@ mod tests {
         roster[0] = who(1, 1680.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
         roster[1] = who(2, 1673.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[1]]);
         roster[1].unmatched_scans = 10;
-        assert_eq!(roster[1].matching_rating(1680.0), 1673.0);
+        assert_eq!(
+            roster[1].matching_rating(super::super::boost::Bounds {
+                bottom: 1600.0,
+                top: 1680.0
+            }),
+            1673.0
+        );
         assert!(select_matches(&roster, now()).is_empty());
     }
 

@@ -837,10 +837,10 @@ async fn count_unmatched_scans(
     )
     .execute(&mut *conn)
     .await?;
-    let top = super::boost::top_rating(unmatched.iter().map(|candidate| &candidate.rating));
+    let bounds = super::boost::Bounds::of(unmatched.iter().map(|candidate| &candidate.rating));
     Ok(unmatched
         .iter()
-        .filter(|candidate| super::boost::is_shifted(candidate.rating, top))
+        .filter(|candidate| super::boost::is_shifted(candidate.rating, bounds))
         .count())
 }
 

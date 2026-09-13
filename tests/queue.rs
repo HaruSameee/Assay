@@ -584,7 +584,7 @@ async fn browser_queue_page_covers_join_wait_and_voice_destination(owner: PgPool
     assert!(queued.contains("上 +50 / 下 -50"), "{queued}");
     // 全体と範囲内の 2 つが並ぶ（自分ひとりなので全体 0 人）
     assert!(queued.contains("全体でキュー中"), "{queued}");
-    assert!(queued.contains("範囲内でキュー中"), "{queued}");
+    assert!(queued.contains("同じ試合に入れる人"), "{queued}");
 
     let (status, _) = delete_queue(&app, me).await;
     assert_eq!(status, StatusCode::OK);
@@ -1174,9 +1174,10 @@ async fn exactly_fifty_apart_counts_but_one_hundred_does_not(owner: PgPool) {
     // 1500 から見えるのも 1550 だけ
     let (_, from_low) = get_queue(&app, Some(low)).await;
     assert_eq!(from_low["in_range"], 1, "{from_low}");
-    // 1550 からは両方が見える（どちらも差ちょうど 50）
+    // 1550 は両方と組めるが、1500 と 1600 は同じ試合に入れない（差 100）。
+    // 数えるのは「自分を含む幅 50 の組み合わせ」なので、どちらか片方の 1 人
     let (_, from_middle) = get_queue(&app, Some(middle)).await;
-    assert_eq!(from_middle["in_range"], 2, "{from_middle}");
+    assert_eq!(from_middle["in_range"], 1, "{from_middle}");
 
     // **全体の人数はレート帯を問わない。**3 人キューにいて、自分を除く 2 人が
     // どこから見ても全体の数になる（範囲内の数と違って視点で変わらない）
