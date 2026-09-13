@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into player_address_records (player_id, source, cf_connecting_ip, x_forwarded_for, user_agent, seen_at) values ($1, $2, $3, $4, $5, $6)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "417d256822a74d29f204fb44ad99011c90c47ac390c51703599471467d0f5fe1"
+}

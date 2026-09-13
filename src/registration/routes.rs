@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRef, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -71,6 +71,10 @@ pub struct AuthState {
     /// Discord 側の見た目を追記する先。**渡さなければ何も積まない**
     /// （既存のログイン経路をそのまま残せるように任意にしてある）。
     profiles: Option<crate::profiles::ProfileRepository>,
+    /// 接続元を記録する相手（[`super::watch`]）。既定は空 = 誰も記録しない。
+    watch: super::AddressWatch,
+    /// 記録対象のアクセスを知らせる先。渡さなければ記録だけ。
+    alert: Option<std::sync::Arc<dyn super::WatchAlert>>,
 }
 
 impl AuthState {
@@ -88,6 +92,8 @@ impl AuthState {
             key,
             audience: Audience::default(),
             profiles: None,
+            watch: super::AddressWatch::default(),
+            alert: None,
         }
     }
 
@@ -109,6 +115,18 @@ impl AuthState {
     /// （ここで落とすと、スナップショットの不具合だけで全員が入れなくなる）。
     pub fn with_profiles(mut self, profiles: crate::profiles::ProfileRepository) -> Self {
         self.profiles = Some(profiles);
+        self
+    }
+
+    /// 接続元を記録する相手を渡す。**渡さなければ誰も記録しない。**
+    pub fn with_address_watch(mut self, watch: super::AddressWatch) -> Self {
+        self.watch = watch;
+        self
+    }
+
+    /// 記録対象のアクセスを知らせる先を渡す（Discord の係争チャンネルなど）。
+    pub fn with_watch_alert(mut self, alert: std::sync::Arc<dyn super::WatchAlert>) -> Self {
+        self.alert = Some(alert);
         self
     }
 }
@@ -190,6 +208,7 @@ struct CallbackQuery {
 async fn callback(
     State(app): State<AuthState>,
     jar: SignedCookieJar,
+    headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     // 何があってもここで state を捨てる（使い回さない）
@@ -294,6 +313,28 @@ async fn callback(
             .await
     {
         warn!(%error, %player_id, "could not record the discord appearance; sign-in continues");
+    }
+    // 記録対象の人だけ接続元を積み、運営に知らせる。**失敗してもログインは通す**
+    if app.watch.is_watched_str(&user.id) {
+        let access = super::WatchedAccess {
+            discord_user_id: user.id.clone(),
+            player_id,
+            source: super::AddressSource::Login,
+            address: super::ClientAddress::from_headers(&headers),
+            at: Utc::now(),
+        };
+        if let Err(error) = app
+            .repo
+            .record_address(player_id, access.source, &access.address, access.at)
+            .await
+        {
+            warn!(%error, %player_id, "could not record the sign-in address; sign-in continues");
+        }
+        if let Some(alert) = app.alert.as_ref()
+            && let Err(error) = alert.watched_access(&access).await
+        {
+            warn!(%error, %player_id, "could not notify the watched sign-in; sign-in continues");
+        }
     }
     info!(%player_id, "signed in");
     let jar = set_session(jar, &Session::issue(player_id), &app.config);

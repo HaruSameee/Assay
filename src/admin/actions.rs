@@ -50,12 +50,16 @@ pub enum AdminActionKind {
     MatchReadjudicated,
     /// ブロック解除の待機日数を変えた（既にあるブロックにも効く）。
     BlockCooldownChanged,
+    /// IP をシャドウバンした（その IP からの投入は組まれない）。
+    IpBanned,
+    /// IP のシャドウバンを解いた。
+    IpUnbanned,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
@@ -71,6 +75,8 @@ impl AdminActionKind {
         Self::MatchmakerScheduled,
         Self::MatchReadjudicated,
         Self::BlockCooldownChanged,
+        Self::IpBanned,
+        Self::IpUnbanned,
     ];
 
     /// DB に入る文字列。
@@ -88,6 +94,8 @@ impl AdminActionKind {
             Self::MatchmakerScheduled => "matchmaker_scheduled",
             Self::MatchReadjudicated => "match_readjudicated",
             Self::BlockCooldownChanged => "block_cooldown_changed",
+            Self::IpBanned => "ip_banned",
+            Self::IpUnbanned => "ip_unbanned",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -109,6 +117,8 @@ impl AdminActionKind {
             "matchmaker_scheduled" => Some(Self::MatchmakerScheduled),
             "match_readjudicated" => Some(Self::MatchReadjudicated),
             "block_cooldown_changed" => Some(Self::BlockCooldownChanged),
+            "ip_banned" => Some(Self::IpBanned),
+            "ip_unbanned" => Some(Self::IpUnbanned),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -131,6 +141,8 @@ impl AdminActionKind {
             Self::MatchmakerScheduled => "稼働スケジュールを変更",
             Self::MatchReadjudicated => "終わった試合の裁定をやり直し",
             Self::BlockCooldownChanged => "ブロック解除の待機日数を変更",
+            Self::IpBanned => "IP をシャドウバン",
+            Self::IpUnbanned => "IP のシャドウバンを解除",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",

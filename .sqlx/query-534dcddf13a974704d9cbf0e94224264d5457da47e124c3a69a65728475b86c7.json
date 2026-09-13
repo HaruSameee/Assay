@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select ip as \"ip!\", reason as \"reason!\", created_by as \"created_by!\", banned_at as \"banned_at!\" from current_ip_bans order by banned_at desc, ip",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ip!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_ip_bans",
+            "name": "ip"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "reason!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_ip_bans",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "created_by!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_ip_bans",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "banned_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "current_ip_bans",
+            "name": "banned_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "534dcddf13a974704d9cbf0e94224264d5457da47e124c3a69a65728475b86c7"
+}

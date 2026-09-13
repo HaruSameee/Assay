@@ -21,6 +21,7 @@
 //! - ルーム ID はモーダルで受ける。チャットの自由記述は読まない（MESSAGE_CONTENT 不要）。
 
 pub mod adapter;
+pub mod alert;
 pub mod config;
 pub mod custom_id;
 pub mod gateway;
@@ -37,6 +38,7 @@ use serenity::model::id::GuildId;
 use tracing::info;
 
 pub use adapter::{Adapter, AdapterError, IncomingInteraction, IncomingKind};
+pub use alert::DisputeChannelAlert;
 pub use config::{ConfigError, DiscordConfig};
 pub use gateway::{Gateway, GatewayError, SerenityGateway};
 pub use handler::Handler;

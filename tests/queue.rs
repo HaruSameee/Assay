@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
-use unite_matchsystem::admin::parse_admin_ids;
+use unite_matchsystem::admin::{AdminRepository, IpBanKind, NewIpBan, parse_admin_ids};
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
@@ -35,7 +35,10 @@ use unite_matchsystem::persistence::{
 use unite_matchsystem::queue::model::{DEFAULT_DOWN_RANGE, QueueRequest, RolePreference};
 use unite_matchsystem::queue::{QueueError, QueueRepository, QueueState, router};
 use unite_matchsystem::registration::session::{SESSION_COOKIE, Session, set_session};
-use unite_matchsystem::registration::{AuthConfig, NewDeclaration, Rank, RegistrationRepository};
+use unite_matchsystem::registration::{
+    AddressSource, AddressWatch, AuthConfig, NewDeclaration, Rank, RegistrationRepository,
+    WatchAlert, WatchedAccess,
+};
 use uuid::Uuid;
 
 const APP_ROLE: &str = "assay_app";
@@ -108,6 +111,19 @@ impl AppDb {
             formations: FormationRepository::new(pool.clone()),
             pool,
         }
+    }
+
+    /// 監視対象と通知先つきのルーター。
+    fn router_watching(
+        &self,
+        watch: AddressWatch,
+        alert: std::sync::Arc<dyn WatchAlert>,
+    ) -> Router {
+        router(
+            QueueState::new(config(), self.registration.clone(), self.queue.clone())
+                .with_address_watch(watch)
+                .with_watch_alert(alert),
+        )
     }
 
     fn router(&self) -> Router {
@@ -208,12 +224,26 @@ async fn get_queue_html(app: &Router, as_player: PlayerId, path: &str) -> (Statu
 }
 
 async fn post_queue(app: &Router, as_player: PlayerId, body: Value) -> (StatusCode, Value) {
-    let request = Request::post("/queue")
+    post_queue_from(app, as_player, None, body).await
+}
+
+/// Cloudflare 経由を模して `CF-Connecting-IP` を付けて投入する。
+async fn post_queue_from(
+    app: &Router,
+    as_player: PlayerId,
+    ip: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut request = Request::post("/queue")
         .header(header::COOKIE, session_cookie(as_player))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    json_body(send(app, request).await).await
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(ip) = ip {
+        request = request
+            .header("cf-connecting-ip", ip)
+            .header("x-forwarded-for", format!("{ip}, 172.64.0.1"))
+            .header(header::USER_AGENT, "Mozilla/5.0 (test)");
+    }
+    json_body(send(app, request.body(Body::from(body.to_string())).unwrap()).await).await
 }
 
 async fn delete_queue(app: &Router, as_player: PlayerId) -> (StatusCode, Value) {
@@ -1813,6 +1843,185 @@ async fn the_queue_only_accepts_entries_during_its_window(owner: PgPool) {
     assert_eq!(status, StatusCode::OK);
     println!("受付時間外: 403 queue_closed / 受付中（稼働前）: 200 / スケジュールなし: 200");
 
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// IP のシャドウバンと監視対象の記録
+// ----------------------------------------------------------------------
+
+/// 通知を受け取るだけの偽の通知先。
+#[derive(Default)]
+struct RecordingAlert {
+    seen: std::sync::Mutex<Vec<WatchedAccess>>,
+}
+
+#[serenity::async_trait]
+impl WatchAlert for RecordingAlert {
+    async fn watched_access(&self, access: &WatchedAccess) -> Result<(), String> {
+        self.seen.lock().unwrap().push(access.clone());
+        Ok(())
+    }
+}
+
+/// **BAN 中の IP からの投入は、断られずに入り、組まれない行になる。**
+///
+/// 本人の画面は「キュー中」のまま。他の人の「範囲内 N 人」には数えない。
+/// BAN 一覧を変えても、いまキューにいる行は変わらない（次の投入で判定し直す）。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_banned_ip_is_let_in_but_never_counted(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let app = db.router();
+    let admin = AdminRepository::new(db.pool.clone());
+    let culprit = player(1);
+    let bystander = player(2);
+    register(&db, culprit, Rank::Legend).await;
+    register(&db, bystander, Rank::Legend).await;
+
+    admin
+        .change_ip_ban(&NewIpBan {
+            ip: "198.51.100.7".to_owned(),
+            kind: IpBanKind::Banned,
+            reason: "荒らし".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: Utc::now(),
+            idempotency_key: "ban-1".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    // BAN 中の IP から投入 → 200。本人には何も出ない
+    let (status, joined) = post_queue_from(
+        &app,
+        culprit,
+        Some("198.51.100.7"),
+        json!({ "roles": [wish("jungle", 1)] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{joined}");
+    assert_eq!(joined["queued"], true);
+    assert!(
+        joined.get("shadow_banned").is_none(),
+        "本人には見せない: {joined}"
+    );
+    let shadow: bool =
+        sqlx::query_scalar("select shadow_banned from queue_entries where player_id = $1")
+            .bind(culprit.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(shadow, "投入時点の判定が写る");
+
+    // 別の IP の人からは見えない（範囲内にも全体にも数えない）
+    let (_, other) = post_queue_from(
+        &app,
+        bystander,
+        Some("203.0.113.5"),
+        json!({ "roles": [wish("jungle", 1)] }),
+    )
+    .await;
+    assert_eq!(other["in_range"], 0, "{other}");
+    assert_eq!(other["queue_total"], 0, "{other}");
+    // 本人からは相手が見える（ふつうの画面）
+    let (_, mine) = get_queue(&app, Some(culprit)).await;
+    assert_eq!(mine["queued"], true);
+    assert_eq!(mine["in_range"], 1, "{mine}");
+
+    // 解除しても、いまの行は変わらない。入り直せば判定し直される
+    admin
+        .change_ip_ban(&NewIpBan {
+            ip: "198.51.100.7".to_owned(),
+            kind: IpBanKind::Unbanned,
+            reason: "解除".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: Utc::now(),
+            idempotency_key: "unban-1".to_owned(),
+        })
+        .await
+        .unwrap();
+    let still: bool =
+        sqlx::query_scalar("select shadow_banned from queue_entries where player_id = $1")
+            .bind(culprit.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(still, "既存の行は書き換えない");
+    post_queue_from(
+        &app,
+        culprit,
+        Some("198.51.100.7"),
+        json!({ "roles": [wish("jungle", 1)] }),
+    )
+    .await;
+    let cleared: bool =
+        sqlx::query_scalar("select shadow_banned from queue_entries where player_id = $1")
+            .bind(culprit.0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(!cleared, "入り直せば解除が効く");
+    let (_, other) = get_queue(&app, Some(bystander)).await;
+    assert_eq!(other["in_range"], 1, "{other}");
+    println!("BAN 中の IP: 投入 200 / 相手から見えない / 解除後の入り直しで戻る");
+    db.done().await;
+}
+
+/// **記録対象の人のキュー投入だけ、接続元が記録され、運営に通知される。**
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn a_watched_account_has_its_queue_join_recorded_and_reported(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let alert = std::sync::Arc::new(RecordingAlert::default());
+    // reference fixture: player(1) の Discord ID は 1001
+    let app = db.router_watching(AddressWatch::of([1001]), alert.clone());
+    let watched = player(1);
+    let other = player(2);
+    register(&db, watched, Rank::Legend).await;
+    register(&db, other, Rank::Legend).await;
+
+    post_queue_from(
+        &app,
+        other,
+        Some("203.0.113.5"),
+        json!({ "roles": [wish("jungle", 1)] }),
+    )
+    .await;
+    let recorded: i64 = sqlx::query_scalar("select count(*) from player_address_records")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, 0, "対象外は記録しない");
+
+    let (status, _) = post_queue_from(
+        &app,
+        watched,
+        Some("198.51.100.7"),
+        json!({ "roles": [wish("jungle", 1)] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "select source, cf_connecting_ip from player_address_records where player_id = $1",
+    )
+    .bind(watched.0)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![("queue".to_owned(), Some("198.51.100.7".to_owned()))]
+    );
+    let seen = alert.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].discord_user_id, "1001");
+    assert_eq!(seen[0].source, AddressSource::Queue);
+    assert_eq!(seen[0].address.best_guess(), "198.51.100.7");
+    println!("監視対象のキュー投入: 記録 1 行、通知 1 回");
     db.done().await;
 }
 

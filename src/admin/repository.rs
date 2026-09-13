@@ -21,6 +21,7 @@ use super::block_cooldown::{BlockCooldownChange, BlockCooldownOutcome, BlockCool
 use super::disputes::{
     DisputeOutcome, FinalOutcome, NewDisputeResolution, NewReadjudication, ReadjudicationOutcome,
 };
+use super::ip_bans::{IpBan, IpBanChange, IpBanKind, IpBanOutcome, IpBanPreview};
 use super::matching_range::{MatchingRangeChange, MatchingRangeOutcome, MatchingRangePreview};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::persistence::Outcome;
@@ -46,6 +47,20 @@ pub struct FoundPlayer {
     pub player_id: Uuid,
     pub discord_user_id: i64,
     pub trainer_name: Option<String>,
+}
+
+/// プレイヤー画面に出す接続元の記録の上限（新しい順）。
+pub const ADDRESS_RECORD_LIMIT: i64 = 50;
+
+/// 接続元の記録 1 行（`player_address_records`。[`crate::registration::watch`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressRecord {
+    pub id: i64,
+    /// 何の契機で取ったか。
+    pub source: crate::registration::AddressSource,
+    /// ヘッダの生の値。
+    pub address: crate::registration::ClientAddress,
+    pub seen_at: DateTime<Utc>,
 }
 
 /// 調整ログ 1 行。`reverted` は「この行が誰かに打ち消されているか」。
@@ -218,6 +233,37 @@ impl AdminRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|row| adjustment_row!(row)).collect())
+    }
+
+    /// 1 プレイヤーの接続元の記録（新しい順、最大 [`ADDRESS_RECORD_LIMIT`] 件）。
+    /// 記録対象でない人は空。**運営パネルだけがこれを読む。**
+    pub async fn addresses_for(&self, player_id: Uuid) -> Result<Vec<AddressRecord>, sqlx::Error> {
+        let rows = sqlx::query!(
+            "select id, source, cf_connecting_ip, x_forwarded_for, user_agent, seen_at \
+             from player_address_records where player_id = $1 \
+             order by id desc limit $2",
+            player_id,
+            ADDRESS_RECORD_LIMIT,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                // 知らない契機の行は落とす（読む側は止まらない）
+                let source = crate::registration::AddressSource::parse(&row.source)?;
+                Some(AddressRecord {
+                    id: row.id,
+                    source,
+                    address: crate::registration::ClientAddress {
+                        cf_connecting_ip: row.cf_connecting_ip,
+                        x_forwarded_for: row.x_forwarded_for,
+                        user_agent: row.user_agent,
+                    },
+                    seen_at: row.seen_at,
+                })
+            })
+            .collect())
     }
 
     /// 1 プレイヤーの調整一覧（新しい順）。
@@ -407,6 +453,8 @@ pub struct QueuedEntry {
     pub rating: f64,
     /// 希望ロール。`priority` の昇順。
     pub roles: Vec<QueuedRole>,
+    /// IP のシャドウバン中か（投入時点の判定。組まれない）。
+    pub shadow_banned: bool,
 }
 
 /// 希望ロール 1 つ。
@@ -459,7 +507,7 @@ impl AdminRepository {
     /// マッチメイカの候補読み込みと同じ式（初期値 + `rating_adjustments` + 確定した試合の増減）。
     pub async fn queued_entries(&self) -> Result<Vec<QueuedEntry>, sqlx::Error> {
         let rows = sqlx::query!(
-            "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, \
+            "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, q.shadow_banned, \
                     p.discord_user_id, p.trainer_name, \
                     v.rating as \"rating!\" \
              from queue_entries q \
@@ -499,6 +547,7 @@ impl AdminRepository {
                 down_range: ranges.clamp_down(row.down_range),
                 rating: row.rating,
                 roles: by_entry.remove(&row.entry_id).unwrap_or_default(),
+                shadow_banned: row.shadow_banned,
             })
             .collect())
     }
@@ -1098,6 +1147,143 @@ impl AdminRepository {
         .await?;
         tx.commit().await?;
         Ok(BlockCooldownOutcome::Changed { id })
+    }
+}
+
+// ----------------------------------------------------------------------
+// IP のシャドウバン
+// ----------------------------------------------------------------------
+//
+// **現在値のテーブルは作らない。**BAN 中かは `ip_ban_changes` の IP ごとの最新行
+// （`current_ip_bans`）。キューの行に写した `shadow_banned` は投入時点の判定で、
+// ここで書き換えない（`admin::ip_bans`）。
+
+/// 追記する変更 1 件（BAN / 解除）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewIpBan {
+    /// 対象の IP。**整えた値を渡すこと**（`admin::normalize_ip`）。
+    pub ip: String,
+    /// BAN するか解くか。
+    pub kind: IpBanKind,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。**同一キーのみ no-op**。
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// 画面に出す値。**毎回数え直す**（保存しない）。
+    pub async fn ip_ban_preview(&self) -> Result<IpBanPreview, sqlx::Error> {
+        let current = sqlx::query!(
+            "select ip as \"ip!\", reason as \"reason!\", created_by as \"created_by!\", \
+                    banned_at as \"banned_at!\" \
+             from current_ip_bans order by banned_at desc, ip"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let shadow_banned_in_queue = sqlx::query_scalar!(
+            "select count(*) as \"count!\" from queue_entries where shadow_banned"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let history = sqlx::query!(
+            "select id, ip, kind, reason, created_by, created_at \
+             from ip_ban_changes order by id desc limit 50"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(IpBanPreview {
+            current: current
+                .into_iter()
+                .map(|row| IpBan {
+                    ip: row.ip,
+                    reason: row.reason,
+                    created_by: row.created_by,
+                    banned_at: row.banned_at,
+                })
+                .collect(),
+            shadow_banned_in_queue: usize::try_from(shadow_banned_in_queue).unwrap_or(0),
+            history: history
+                .into_iter()
+                .filter_map(|row| {
+                    Some(IpBanChange {
+                        id: row.id,
+                        ip: row.ip,
+                        kind: IpBanKind::parse(&row.kind)?,
+                        reason: row.reason,
+                        created_by: row.created_by,
+                        created_at: row.created_at,
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    /// BAN / 解除を追記する。**既にその状態なら行を積まない**（`Unchanged`）。
+    ///
+    /// キュー投入の判定（`current_ip_bans` の読み取り）と同じ advisory lock は取らない:
+    /// 投入は「投入時点の判定の写し」を持つだけで、直列化しても意味が変わらない。
+    pub async fn change_ip_ban(&self, input: &NewIpBan) -> Result<IpBanOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        // 同じキーの再送は「既にその状態」に落ちる（状態を見てから冪等キーを見る）
+        let currently_banned = sqlx::query_scalar!(
+            "select exists(select 1 from current_ip_bans where ip = $1) as \"banned!\"",
+            input.ip,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let wants_ban = input.kind == IpBanKind::Banned;
+        if currently_banned == wants_ban {
+            tx.commit().await?;
+            return Ok(IpBanOutcome::Unchanged);
+        }
+
+        let inserted = sqlx::query_scalar!(
+            "insert into ip_ban_changes \
+             (ip, kind, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.ip,
+            input.kind.as_str(),
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(IpBanOutcome::Duplicate);
+        };
+
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: if wants_ban {
+                    AdminActionKind::IpBanned
+                } else {
+                    AdminActionKind::IpUnbanned
+                },
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "ip_ban_change_id": id,
+                    "ip": input.ip,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("ip_ban:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(IpBanOutcome::Changed { id })
     }
 }
 

@@ -31,6 +31,7 @@ pub mod repository;
 pub mod routes;
 pub mod session;
 pub mod viewer;
+pub mod watch;
 
 pub use config::{
     AuthConfig, AuthConfigError, Secret, report_gate_disabled_from_env, site_base_url,
@@ -45,3 +46,7 @@ pub use repository::{RegistrationError, RegistrationRepository};
 pub use routes::{AuthState, router};
 pub use session::{CurrentSession, Session, SessionError};
 pub use viewer::{Audience, Viewer};
+pub use watch::{
+    AddressSource, AddressWatch, AddressWatchError, ClientAddress, IP_WATCH_DISCORD_USER_IDS,
+    WatchAlert, WatchedAccess,
+};

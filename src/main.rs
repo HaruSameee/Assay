@@ -18,7 +18,8 @@ use unite_matchsystem::admin::{
 use unite_matchsystem::api::{ApiState, router};
 use unite_matchsystem::blocks::BlockRepository;
 use unite_matchsystem::discord::{
-    Adapter, DiscordConfig, Handler, SerenityGateway, build_client, resolve_vc_pool,
+    Adapter, DiscordConfig, DisputeChannelAlert, Handler, SerenityGateway, build_client,
+    resolve_vc_pool,
 };
 use unite_matchsystem::lifecycle::{DefaultHostSelector, LifecycleConfig};
 use unite_matchsystem::match_screen::{MatchRepository, MatchState, router as match_router};
@@ -36,8 +37,8 @@ use unite_matchsystem::ranking::{
 };
 use unite_matchsystem::rating::{BASE_DELTA, RATING_PARAMS_VERSION, RatingAdjustmentRepository};
 use unite_matchsystem::registration::{
-    AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository, report_gate_disabled_from_env,
-    router as registration_router, site_base_url,
+    AddressWatch, AuthConfig, AuthState, HttpOAuthClient, RegistrationRepository,
+    report_gate_disabled_from_env, router as registration_router, site_base_url,
 };
 use unite_matchsystem::status::{StatusRepository, StatusState, router as status_router};
 
@@ -74,6 +75,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let matchmaker_config = MatchmakerConfig::from_env()?;
     // 管理者 ID 未設定は「パネル無し」で正常起動（fail-closed）。数字でない値は起動で落とす
     let admin_ids = admin_ids_from_env()?;
+    // 接続元の記録対象。未設定なら誰も記録しない。数字でない値は起動で落とす
+    let address_watch = AddressWatch::from_env()?;
+    if !address_watch.is_empty() {
+        info!(
+            watched = address_watch.len(),
+            "address watch enabled for listed players"
+        );
+    }
     let report_gate_disabled = report_gate_disabled_from_env()?;
     if report_gate_disabled {
         warn!(
@@ -213,6 +222,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let site = site_base_url(&auth_config.redirect_uri);
     let room_map = discord_config.room_map.clone();
     let room_checklist = discord_config.room_checklist.clone();
+    // 監視対象のアクセスは係争チャンネルへ（運営だけが見る）
+    let watch_alert: Arc<dyn unite_matchsystem::registration::WatchAlert> =
+        Arc::new(DisputeChannelAlert::new(
+            gateway.clone(),
+            discord_config.dispute_channel_id,
+            site.clone(),
+        ));
     let adapter = Arc::new(Adapter::new(
         repo.clone(),
         gateway,
@@ -243,7 +259,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .with_admins(admin_ids.clone())
     .with_ranking(ranking_public)
-    .with_profiles(profile_repo.clone());
+    .with_profiles(profile_repo.clone())
+    .with_address_watch(address_watch.clone())
+    .with_watch_alert(watch_alert.clone());
     info!(
         redirect_uri = %auth_config.redirect_uri,
         cookie_domain = %auth_config.cookie_domain,
@@ -260,7 +278,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .merge(queue_router(
         QueueState::new(auth_config.clone(), registration_repo.clone(), queue_repo)
             .with_admins(admin_ids.clone())
-            .with_ranking(ranking_public),
+            .with_ranking(ranking_public)
+            .with_address_watch(address_watch)
+            .with_watch_alert(watch_alert),
     ))
     .merge(status_router(
         StatusState::new(auth_config.clone(), ratings_repo, status_repo)

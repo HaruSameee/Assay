@@ -31,8 +31,8 @@ use unite_matchsystem::persistence::{
     FormationRepository, NewEvent, NewFormation, NewFormationPlayer, NewReport, Outcome, Team,
 };
 use unite_matchsystem::registration::{
-    AuthConfig, AuthState, DiscordUser, OAuthClient, OAuthError, PlayerStatus, Rank,
-    RegistrationBlock, RegistrationRepository, router,
+    AddressWatch, AuthConfig, AuthState, DiscordUser, OAuthClient, OAuthError, PlayerStatus, Rank,
+    RegistrationBlock, RegistrationRepository, WatchAlert, WatchedAccess, router,
 };
 use uuid::Uuid;
 
@@ -144,6 +144,8 @@ fn config() -> AuthConfig {
 struct Browser {
     app: Router,
     cookies: HashMap<String, String>,
+    /// 毎回のリクエストに付けるヘッダ（Cloudflare 経由を模した `CF-Connecting-IP` など）。
+    extra_headers: Vec<(&'static str, String)>,
 }
 
 impl Browser {
@@ -151,7 +153,14 @@ impl Browser {
         Self {
             app,
             cookies: HashMap::new(),
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// 以後のリクエストにヘッダを付ける。
+    fn with_header(mut self, name: &'static str, value: &str) -> Self {
+        self.extra_headers.push((name, value.to_owned()));
+        self
     }
 
     fn cookie_header(&self) -> Option<String> {
@@ -197,6 +206,9 @@ impl Browser {
         let mut builder = Request::get(uri);
         if let Some(cookies) = self.cookie_header() {
             builder = builder.header(header::COOKIE, cookies);
+        }
+        for (name, value) in &self.extra_headers {
+            builder = builder.header(*name, value.as_str());
         }
         self.send(builder.body(Body::empty()).unwrap()).await
     }
@@ -547,6 +559,85 @@ async fn signing_in_twice_reuses_the_same_player_row(owner: PgPool) {
     .await
     .unwrap();
     assert_eq!(rows, 1);
+    db.done().await;
+}
+
+/// 通知を受け取るだけの偽の通知先。
+#[derive(Default)]
+struct RecordingAlert {
+    seen: Mutex<Vec<WatchedAccess>>,
+}
+
+#[async_trait]
+impl WatchAlert for RecordingAlert {
+    async fn watched_access(&self, access: &WatchedAccess) -> Result<(), String> {
+        self.seen.lock().unwrap().push(access.clone());
+        Ok(())
+    }
+}
+
+/// **記録対象のログインだけ、接続元が記録され、運営に通知される。**対象外は 1 行も残らない。
+///
+/// Cloudflare 経由を模して `CF-Connecting-IP` と `X-Forwarded-For` を付ける。
+#[sqlx::test(
+    fixtures("reference", "app_role"),
+    fixtures("../ops/app_privileges.sql")
+)]
+async fn only_a_watched_account_has_its_sign_in_address_recorded_and_reported(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    let watched_id = "900000000000000004";
+    let other_id = "900000000000000005";
+    let alert = std::sync::Arc::new(RecordingAlert::default());
+    let build = |discord_id: &str| {
+        router(
+            AuthState::new(
+                config(),
+                std::sync::Arc::new(FakeOAuth::new(discord_id)),
+                db.repo.clone(),
+            )
+            .with_address_watch(AddressWatch::of([900_000_000_000_000_004]))
+            .with_watch_alert(alert.clone()),
+        )
+    };
+
+    // 対象外の人: 何も残らない
+    let mut other = Browser::new(build(other_id))
+        .with_header("cf-connecting-ip", "203.0.113.5")
+        .with_header("x-forwarded-for", "203.0.113.5, 172.64.0.1");
+    sign_in(&mut other, &db, other_id).await;
+    let recorded: i64 = sqlx::query_scalar("select count(*) from player_address_records")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, 0, "対象外は記録しない");
+    assert!(alert.seen.lock().unwrap().is_empty());
+
+    // 対象の人: ログインで 1 行、通知 1 回
+    let mut watched = Browser::new(build(watched_id))
+        .with_header("cf-connecting-ip", "198.51.100.7")
+        .with_header("x-forwarded-for", "198.51.100.7, 172.64.0.1")
+        .with_header("user-agent", "Mozilla/5.0 (test)");
+    let player = sign_in(&mut watched, &db, watched_id).await;
+    type AddressRow = (String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<AddressRow> = sqlx::query_as(
+        "select source, cf_connecting_ip, x_forwarded_for, user_agent \
+         from player_address_records where player_id = $1",
+    )
+    .bind(player.0)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "login");
+    assert_eq!(rows[0].1.as_deref(), Some("198.51.100.7"));
+    assert_eq!(rows[0].2.as_deref(), Some("198.51.100.7, 172.64.0.1"));
+    assert_eq!(rows[0].3.as_deref(), Some("Mozilla/5.0 (test)"));
+    let seen = alert.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].discord_user_id, watched_id);
+    assert_eq!(seen[0].player_id, player);
+    assert_eq!(seen[0].address.best_guess(), "198.51.100.7");
+    println!("監視対象のログイン: 記録 1 行、通知 1 回（接続元 198.51.100.7）");
     db.done().await;
 }
 

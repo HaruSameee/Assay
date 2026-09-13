@@ -648,6 +648,38 @@ async fn the_production_entry_point_draws_the_direction_at_random(owner: PgPool)
 }
 
 // ----------------------------------------------------------------------
+// IP のシャドウバン
+// ----------------------------------------------------------------------
+
+/// **シャドウバン中の行は候補にならない。**10 人いても 1 人が BAN 中なら組めず、
+/// その人はキューに残り続ける（候補にも数えない）。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_shadow_banned_entry_is_never_a_candidate(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    enqueue_full_rosters(&db, 10, at(0)).await;
+    sqlx::query("update queue_entries set shadow_banned = true where player_id = $1")
+        .bind(player(1).0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let outcome = db.matchmaker(1).run_once(at(600)).await.unwrap();
+    assert!(outcome.created.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.candidates, 9, "BAN 中の 1 人は候補に数えない");
+    assert_eq!(count(&db, "queue_entries").await, 10, "行は残る");
+    let scans: i32 =
+        sqlx::query_scalar("select unmatched_scans from queue_entries where player_id = $1")
+            .bind(player(1).0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(scans, 0, "候補でないので取り残しの回数も進まない");
+    println!("10 人中 1 人が BAN 中: 候補 9、成立なし");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
 // 低レート帯の取り残し対策（matchmaker::boost）
 // ----------------------------------------------------------------------
 

@@ -2887,3 +2887,107 @@ async fn the_block_cooldown_can_be_changed_from_the_panel(owner: PgPool) {
     println!("待機日数: 5 → 2 日、範囲外/理由なし/重複キーは拒否");
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// IP のシャドウバン
+// ----------------------------------------------------------------------
+
+/// **画面から IP を BAN / 解除できる。**既にその状態なら行を増やさない。理由なしは断る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn an_ip_can_be_shadow_banned_and_released_from_the_panel(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/ip-bans").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("BAN 中の IP はありません"), "{page}");
+    let key = form_key(&page, "/admin/ip-bans");
+
+    // 理由なし・IP なしは断る
+    let (_, no_reason) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/ip-bans",
+        &format!("action=ban&ip=198.51.100.7&reason=&key={key}"),
+    )
+    .await;
+    assert!(no_reason.contains("理由を入力してください"), "{no_reason}");
+    let (_, no_ip) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/ip-bans",
+        &format!("action=ban&ip=&reason=x&key={key}"),
+    )
+    .await;
+    assert!(no_ip.contains("IP を入力してください"), "{no_ip}");
+    assert_eq!(count(&db, "ip_ban_changes").await, 0);
+
+    // BAN
+    let (status, banned) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/ip-bans",
+        &format!("action=ban&ip=+198.51.100.7+&reason=%E8%8D%92%E3%82%89%E3%81%97&key={key}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        banned.contains("198.51.100.7 をシャドウバンしました"),
+        "{banned}"
+    );
+    assert!(
+        banned.contains("<td class=\"num\">198.51.100.7</td>"),
+        "{banned}"
+    );
+    assert_eq!(count(&db, "ip_ban_changes").await, 1);
+    let banned_now: bool = sqlx::query_scalar(
+        "select exists(select 1 from current_ip_bans where ip = '198.51.100.7')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(banned_now);
+
+    // もう一度 BAN → 既にその状態。行は増えない
+    let (_, again) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/ip-bans",
+        &format!("action=ban&ip=198.51.100.7&reason=x&key={key}-2"),
+    )
+    .await;
+    assert!(again.contains("既に BAN 中です"), "{again}");
+    assert_eq!(count(&db, "ip_ban_changes").await, 1);
+
+    // 解除
+    let (_, released) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/ip-bans",
+        &format!("action=unban&ip=198.51.100.7&reason=%E8%A7%A3%E9%99%A4&key={key}-3"),
+    )
+    .await;
+    assert!(
+        released.contains("シャドウバンを解除しました"),
+        "{released}"
+    );
+    assert!(released.contains("BAN 中の IP はありません"), "{released}");
+    assert_eq!(count(&db, "ip_ban_changes").await, 2);
+    // 運営操作ログ
+    let kinds: Vec<(String,)> = sqlx::query_as(
+        "select kind from admin_actions where kind in ('ip_banned', 'ip_unbanned') order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        kinds.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(),
+        vec!["ip_banned", "ip_unbanned"]
+    );
+    // 非管理者には無い
+    let (status, _) = get_html(&app, player(2), "/admin/ip-bans").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    println!("IP BAN: 追加 → 重複は増えない → 解除、操作ログ 2 行");
+    db.done().await;
+}

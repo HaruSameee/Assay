@@ -182,6 +182,31 @@ impl RegistrationRepository {
         Ok(PlayerId(row.id))
     }
 
+    /// 接続元を 1 行追記する（[`super::watch`]）。**対象かどうかの判定は呼ぶ側**が
+    /// [`super::AddressWatch`] で行う。ここは渡されたら積むだけ。
+    pub async fn record_address(
+        &self,
+        player_id: PlayerId,
+        source: super::AddressSource,
+        address: &super::ClientAddress,
+        seen_at: Timestamp,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "insert into player_address_records \
+             (player_id, source, cf_connecting_ip, x_forwarded_for, user_agent, seen_at) \
+             values ($1, $2, $3, $4, $5, $6)",
+            player_id.0,
+            source.as_str(),
+            address.cf_connecting_ip.as_deref(),
+            address.x_forwarded_for.as_deref(),
+            address.user_agent.as_deref(),
+            seen_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 登録フォームの送信を記録する。
     ///
     /// 1 トランザクションで、`players` をUPDATE し、`player_declarations` に **1 行追記**する。

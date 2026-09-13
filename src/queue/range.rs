@@ -33,6 +33,9 @@ pub struct QueuedPlayer {
     /// **第1希望だけを持つ。**「希望のどこかに含まれる」を数えると、1 人が複数の
     /// ロールに計上されて合計が人数と合わなくなる。
     pub first_choice: Option<String>,
+    /// IP のシャドウバン中か（`queue_entries.shadow_banned`）。他の人の「範囲内 N 人」には
+    /// 数えない（マッチメイカも候補から外す）。本人の画面ではふつうに見せる。
+    pub shadow_banned: bool,
 }
 
 /// `viewer` から見て `other` が範囲内か。**片方向**。
@@ -100,6 +103,7 @@ mod tests {
             up_range: DEFAULT_UP_RANGE,
             down_range: DEFAULT_DOWN_RANGE,
             first_choice: None,
+            shadow_banned: false,
         }
     }
 
@@ -107,6 +111,7 @@ mod tests {
     fn wanting(n: u128, rating: f64, role: &str) -> QueuedPlayer {
         QueuedPlayer {
             first_choice: Some(role.to_owned()),
+            shadow_banned: false,
             ..player(n, rating)
         }
     }
@@ -184,6 +189,7 @@ mod tests {
             rating: 1600.0,
             down_range: 200,
             first_choice: None,
+            shadow_banned: false,
         };
         let below = player(2, 1450.0);
         assert!(accepts(&wide, &below), "片方向では通る");

@@ -44,17 +44,19 @@ use crate::nullified::NullifiedReportRepository;
 
 use super::block_cooldown::{BlockCooldownOutcome, parse_cooldown_days};
 use super::html::{
-    BlockCooldownView, MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView,
-    QueueView, QuietReportsView, RatingParamsView, ReportsView, RosterView, ScheduleView,
-    SearchView, SeasonView, block_cooldown_page, matching_range_page, player_page, queue_page,
-    quiet_reports_page, rating_params_page, reports_page, roster_page, search_page, season_page,
+    BlockCooldownView, IpBansView, MatchingRangeView, MatchmakerView, Notice, NoticeKind,
+    PlayerView, QueueView, QuietReportsView, RatingParamsView, ReportsView, RosterView,
+    ScheduleView, SearchView, SeasonView, block_cooldown_page, ip_bans_page, matching_range_page,
+    player_page, queue_page, quiet_reports_page, rating_params_page, reports_page, roster_page,
+    search_page, season_page,
 };
+use super::ip_bans::{IpBanKind, IpBanOutcome, normalize_ip};
 use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary,
-    NewStaffReport, RemovalOutcome, StaffReportOutcome,
+    NewBlockCooldown, NewIpBan, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams,
+    NewSeasonBoundary, NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::schedule::{MatchmakerSchedule, ScheduleOutcome, parse_days, parse_time};
 use super::season::{
@@ -154,6 +156,8 @@ pub fn router(state: AdminState) -> Router {
             "/admin/block-cooldown",
             get(show_block_cooldown).post(change_block_cooldown),
         )
+        // IP のシャドウバン。1 段階（試合に影響しない。解除で戻せる）
+        .route("/admin/ip-bans", get(show_ip_bans).post(change_ip_ban))
         // 聞き専報告。**閲覧だけ**（運営が代理で入れる経路は作らない）
         .route("/admin/quiet-reports", get(show_quiet_reports))
         .route("/admin/season/confirm", post(confirm_season))
@@ -405,6 +409,13 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
             return internal_error();
         }
     };
+    let addresses = match app.store.addresses_for(player_id).await {
+        Ok(addresses) => addresses,
+        Err(err) => {
+            error!(%err, "could not read the address records");
+            return internal_error();
+        }
+    };
     // 冪等キーはフォーム描画のたびに発行。同じフォームの再送信は同じキーを持つ
     let form_key = form_key();
     Html(player_page(&PlayerView {
@@ -414,6 +425,7 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
         block_allowance,
         outgoing_blocks: &outgoing_blocks,
         incoming_blocks: &incoming_blocks,
+        addresses: &addresses,
         notice,
     }))
     .into_response()
@@ -1825,6 +1837,108 @@ async fn change_block_cooldown(
         }
     };
     render_block_cooldown(&app, Some(notice), None).await
+}
+
+// ----------------------------------------------------------------------
+// IP のシャドウバン
+// ----------------------------------------------------------------------
+//
+// 断らずに組まれないようにする。効くのは次の投入から。解除で戻せる。
+
+async fn render_ip_bans(app: &AdminState, notice: Option<Notice>, key: Option<&str>) -> Response {
+    let preview = match app.store.ip_ban_preview().await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not read the ip ban preview");
+            return internal_error();
+        }
+    };
+    let generated = form_key();
+    Html(ip_bans_page(&IpBansView {
+        preview: &preview,
+        form_key: key.unwrap_or(&generated),
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_ip_bans(State(app): State<AdminState>, session: Option<CurrentSession>) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_ip_bans(&app, None, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct IpBanForm {
+    /// `ban` / `unban`。
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn change_ip_ban(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<IpBanForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let kind = match form.action.as_str() {
+        "ban" => IpBanKind::Banned,
+        "unban" => IpBanKind::Unbanned,
+        _ => {
+            let notice = fail("操作の種類が不正です。".to_owned());
+            return render_ip_bans(&app, Some(notice), Some(&form.key)).await;
+        }
+    };
+    let Some(ip) = normalize_ip(&form.ip) else {
+        let notice = fail("IP を入力してください（空白を含まない 64 文字以内）。".to_owned());
+        return render_ip_bans(&app, Some(notice), Some(&form.key)).await;
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        let notice = fail("理由を入力してください。".to_owned());
+        return render_ip_bans(&app, Some(notice), Some(&form.key)).await;
+    };
+
+    let input = NewIpBan {
+        ip: ip.clone(),
+        kind,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: format!("{}:{}", form.key, ip),
+    };
+    let notice = match app.store.change_ip_ban(&input).await {
+        Ok(IpBanOutcome::Changed { id }) if kind == IpBanKind::Banned => info(format!(
+            "{ip} をシャドウバンしました（#{id}）。この IP からの次の投入以降は組まれません。\
+             いまキューにいる行は変わりません。"
+        )),
+        Ok(IpBanOutcome::Changed { id }) => info(format!(
+            "{ip} のシャドウバンを解除しました（#{id}）。次の投入から組まれます。"
+        )),
+        Ok(IpBanOutcome::Unchanged) if kind == IpBanKind::Banned => {
+            info(format!("{ip} は既に BAN 中です。行は増やしていません。"))
+        }
+        Ok(IpBanOutcome::Unchanged) => {
+            info(format!("{ip} は BAN していません。行は増やしていません。"))
+        }
+        Ok(IpBanOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not change the ip ban");
+            return internal_error();
+        }
+    };
+    render_ip_bans(&app, Some(notice), None).await
 }
 
 // ----------------------------------------------------------------------

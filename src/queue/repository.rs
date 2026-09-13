@@ -88,16 +88,29 @@ impl QueueRepository {
         request: &QueueRequest,
         now: Timestamp,
     ) -> Result<QueueEntry, QueueError> {
+        self.enqueue_from(player_id, request, false, now).await
+    }
+
+    /// 接続元の判定つきで投入する。`shadow_banned` は**ルートが接続元の IP を
+    /// `current_ip_bans` と突き合わせた結果**で、リクエストからは来ない。真なら
+    /// マッチメイカは候補から外す（本人には何も告げない）。再投入では判定し直した値で上書きする。
+    pub async fn enqueue_from(
+        &self,
+        player_id: PlayerId,
+        request: &QueueRequest,
+        shadow_banned: bool,
+        now: Timestamp,
+    ) -> Result<QueueEntry, QueueError> {
         let mut tx = self.pool.begin().await?;
 
         let entry = sqlx::query!(
             "insert into queue_entries \
-                 (id, player_id, enqueued_at, updated_at, down_range, streaming) \
+                 (id, player_id, enqueued_at, updated_at, down_range, streaming, shadow_banned) \
              values ($1, $2, $3, $3, \
-                     (select down_range from current_matching_ranges), $4) \
+                     (select down_range from current_matching_ranges), $4, $5) \
              on conflict (player_id) do update \
                  set down_range = excluded.down_range, updated_at = excluded.updated_at, \
-                     streaming = excluded.streaming \
+                     streaming = excluded.streaming, shadow_banned = excluded.shadow_banned \
              returning id, enqueued_at, updated_at, down_range, \
                        (select up_range from current_matching_ranges) \
                            as \"up_range!\"",
@@ -105,6 +118,7 @@ impl QueueRepository {
             player_id.0,
             now,
             request.streaming,
+            shadow_banned,
         )
         .fetch_one(&mut *tx)
         .await
@@ -274,6 +288,17 @@ impl QueueRepository {
         Ok(crate::admin::repository::matchmaker_stop_on(&mut conn, now).await?)
     }
 
+    /// この接続元がいま BAN 中か（`current_ip_bans`。完全一致）。
+    pub async fn is_ip_banned(&self, ip: &str) -> Result<bool, QueueError> {
+        let banned = sqlx::query_scalar!(
+            "select exists(select 1 from current_ip_bans where ip = $1) as \"banned!\"",
+            ip,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(banned)
+    }
+
     /// 稼働スケジュール（画面に「次はいつ動くか」を書くため）。
     pub async fn schedule(&self) -> Result<crate::admin::MatchmakerSchedule, QueueError> {
         let mut conn = self.pool.acquire().await?;
@@ -299,7 +324,7 @@ impl QueueRepository {
             "select q.player_id, q.down_range, \
                     (select r.role from queue_entry_roles r \
                      where r.entry_id = q.id and r.priority = 1) as first_choice, \
-                    v.rating as \"rating!\", q.unmatched_scans \
+                    v.rating as \"rating!\", q.unmatched_scans, q.shadow_banned \
              from queue_entries q \
              join player_current_ratings v on v.player_id = q.player_id",
         )
@@ -315,6 +340,7 @@ impl QueueRepository {
                 up_range: ranges.up,
                 down_range: ranges.clamp_down(row.down_range),
                 first_choice: row.first_choice,
+                shadow_banned: row.shadow_banned,
             })
             .collect())
     }
@@ -331,6 +357,13 @@ impl QueueRepository {
         let Some(me) = queue.iter().find(|player| player.player_id == player_id) else {
             return Ok(None);
         };
+        // シャドウバン中の人は数えない（組まれないので）。**自分は残す**（本人の画面は
+        // ふつうに見せる。自分は count 側で除かれる）
+        let queue: Vec<QueuedPlayer> = queue
+            .iter()
+            .filter(|player| !player.shadow_banned || player.player_id == player_id)
+            .cloned()
+            .collect();
         Ok(Some(InRangeSummary {
             total: super::range::count_in_range(me, &queue),
             // 自分を除く（`count_in_range` も自分は数えない）
@@ -351,7 +384,12 @@ impl QueueRepository {
         // 幅の読み出しは**この 1 回だけ**。`queued_players_within` にも同じ 1 個を
         // 渡すので、自分の幅と相手の幅が食い違わない
         let ranges = self.ranges().await?;
-        let queue = self.queued_players_within(ranges).await?;
+        let queue: Vec<QueuedPlayer> = self
+            .queued_players_within(ranges)
+            .await?
+            .into_iter()
+            .filter(|player| !player.shadow_banned)
+            .collect();
         let Some(rating) = self.player_rating(player_id).await? else {
             return Err(QueueError::PlayerNotFound(player_id));
         };
@@ -362,6 +400,7 @@ impl QueueRepository {
             down_range: ranges.down,
             // 未投入なので希望はまだ無い。内訳の分母には入らない
             first_choice: None,
+            shadow_banned: false,
         };
         Ok(InRangeSummary {
             total: super::range::count_in_range(&me, &queue),

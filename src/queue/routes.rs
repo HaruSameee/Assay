@@ -30,8 +30,8 @@ use uuid::Uuid;
 use crate::admin::{AdminIds, MatchmakerSchedule};
 use crate::lifecycle::{FormationId, PlayerId};
 use crate::registration::{
-    Audience, AuthConfig, CurrentSession, QueueEligibility, RegistrationBlock,
-    RegistrationRepository, Viewer,
+    AddressSource, AddressWatch, Audience, AuthConfig, ClientAddress, CurrentSession,
+    QueueEligibility, RegistrationBlock, RegistrationRepository, Viewer, WatchAlert, WatchedAccess,
 };
 
 use super::model::{
@@ -55,6 +55,10 @@ pub struct QueueState {
     key: Key,
     /// 共通ヘッダーに管理パネルの導線を出す相手の判定。既定は「管理者なし」。
     audience: Audience,
+    /// 接続元を記録する相手。既定は空 = 誰も記録しない。
+    watch: AddressWatch,
+    /// 記録対象のアクセスを知らせる先。渡さなければ記録だけ。
+    alert: Option<std::sync::Arc<dyn WatchAlert>>,
 }
 
 impl QueueState {
@@ -71,6 +75,8 @@ impl QueueState {
             queue,
             key,
             audience: Audience::default(),
+            watch: AddressWatch::default(),
+            alert: None,
         }
     }
 
@@ -83,6 +89,18 @@ impl QueueState {
     /// ランキングの公開状態を渡す。共通ヘッダーに導線を出すかどうかだけに使う。
     pub fn with_ranking(mut self, public: bool) -> Self {
         self.audience.set_ranking(public);
+        self
+    }
+
+    /// 接続元を記録する相手を渡す（[`crate::registration::watch`]）。**渡さなければ誰も記録しない。**
+    pub fn with_address_watch(mut self, watch: AddressWatch) -> Self {
+        self.watch = watch;
+        self
+    }
+
+    /// 記録対象のアクセスを知らせる先を渡す（Discord の係争チャンネルなど）。
+    pub fn with_watch_alert(mut self, alert: std::sync::Arc<dyn WatchAlert>) -> Self {
+        self.alert = Some(alert);
         self
     }
 }
@@ -406,6 +424,7 @@ async fn viewer(app: &QueueState, player_id: PlayerId) -> Viewer {
 async fn join_queue(
     State(app): State<QueueState>,
     session: Option<CurrentSession>,
+    headers: HeaderMap,
     body: Option<Json<JoinRequest>>,
 ) -> Response {
     let Some(player_id) = player(session) else {
@@ -466,7 +485,22 @@ async fn join_queue(
         Err(error) => error!(%error, "could not read the schedule; letting the player in"),
     }
 
-    match app.queue.enqueue(player_id, &validated, now).await {
+    // 接続元が BAN 中なら、断らずに「組まれない行」として入れる（シャドウバン）。
+    // 判定に失敗したら入れる側に倒す（読み取り失敗で BAN を広げない）
+    let address = ClientAddress::from_headers(&headers);
+    let shadow_banned = match app.queue.is_ip_banned(&address.best_guess()).await {
+        Ok(banned) => banned,
+        Err(error) => {
+            error!(%error, "could not check the ip ban list; letting the player in");
+            false
+        }
+    };
+
+    match app
+        .queue
+        .enqueue_from(player_id, &validated, shadow_banned, now)
+        .await
+    {
         Ok(_) => {}
         Err(QueueError::UnknownRole) => {
             return bad_request("unknown_role", "選べないロールが含まれています。");
@@ -477,6 +511,8 @@ async fn join_queue(
             return internal_error();
         }
     }
+    // 記録対象の人だけ接続元を積む。**失敗しても投入は通す**
+    record_address_if_watched(&app, player_id, &headers, now).await;
 
     match status(&app, player_id).await {
         Some(status) => (StatusCode::OK, Json(status)).into_response(),
@@ -672,6 +708,49 @@ impl QueueScheduleView {
             start = self.matchmaker_start,
             end = self.end_text(),
         )
+    }
+}
+
+/// 記録対象（[`AddressWatch`]）の人なら接続元を 1 行積む。**失敗しても投入は通す。**
+///
+/// 対象でなければ DB に触らない（Discord ID を引くのも対象が 1 人以上いるときだけ）。
+async fn record_address_if_watched(
+    app: &QueueState,
+    player_id: PlayerId,
+    headers: &HeaderMap,
+    now: chrono::DateTime<Utc>,
+) {
+    if app.watch.is_empty() {
+        return;
+    }
+    let discord_user_id = match app.registration.find_by_player_id(player_id).await {
+        Ok(Some(profile)) if app.watch.is_watched_str(&profile.discord_user_id) => {
+            profile.discord_user_id
+        }
+        Ok(_) => return,
+        Err(error) => {
+            error!(%error, %player_id, "could not read the profile for the address watch");
+            return;
+        }
+    };
+    let access = WatchedAccess {
+        discord_user_id,
+        player_id,
+        source: AddressSource::Queue,
+        address: ClientAddress::from_headers(headers),
+        at: now,
+    };
+    if let Err(error) = app
+        .registration
+        .record_address(player_id, access.source, &access.address, access.at)
+        .await
+    {
+        error!(%error, %player_id, "could not record the queue address; the entry stands");
+    }
+    if let Some(alert) = app.alert.as_ref()
+        && let Err(error) = alert.watched_access(&access).await
+    {
+        error!(%error, %player_id, "could not notify the watched queue join; the entry stands");
     }
 }
 

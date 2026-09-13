@@ -738,6 +738,9 @@ async fn streaming_players(
 ///
 /// フレックス補償は `formation_players.role_was_flexed` から導出する
 /// （[`crate::queue::flex`]）。プレイヤーの可変列には持たない。
+///
+/// **IP のシャドウバン中（`queue_entries.shadow_banned`）の行は読まない。**その人は
+/// キューに残り続け、何も告げられず、組まれない（`RunOutcome.candidates` にも数えない）。
 async fn load_candidates(
     conn: &mut PgConnection,
     ranges: MatchingRanges,
@@ -756,6 +759,7 @@ async fn load_candidates(
              where fp.player_id = q.player_id \
              order by f.created_at desc, f.id desc limit 1 \
          ) latest on true \
+         where not q.shadow_banned \
          order by q.enqueued_at, q.id",
     )
     .fetch_all(&mut *conn)

@@ -17,12 +17,13 @@ use crate::status::html::{display_time, format_delta};
 use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
 use super::block_cooldown::BlockCooldownPreview;
 use super::disputes::DisputeDecision;
+use super::ip_bans::IpBanPreview;
 use super::matching_range::MatchingRangePreview;
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::RosterPage;
 use super::repository::{
-    AdjustmentRow, AwaitingReports, DisputedFormation, DisputedVote, FinishedFormation,
-    FoundPlayer, QueuedEntry,
+    ADDRESS_RECORD_LIMIT, AddressRecord, AdjustmentRow, AwaitingReports, DisputedFormation,
+    DisputedVote, FinishedFormation, FoundPlayer, QueuedEntry,
 };
 use super::schedule::MatchmakerSchedule;
 use super::season::{MAX_SEASON_LABEL_LENGTH, SeasonPreview};
@@ -59,6 +60,8 @@ pub struct PlayerView<'a> {
     pub block_allowance: i32,
     pub outgoing_blocks: &'a [CurrentBlock],
     pub incoming_blocks: &'a [IncomingBlock],
+    /// 接続元の記録（新しい順）。記録対象でない人は空。
+    pub addresses: &'a [AddressRecord],
     pub notice: Option<Notice>,
 }
 
@@ -378,6 +381,7 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
              <h2>このプレイヤーの調整履歴</h2>\n\
              {history}\
              {blocks}\
+             {addresses}\
              </section>\n",
             name = escape(view.player.trainer_name.as_deref().unwrap_or("(未設定)")),
             nav = admin_nav("/admin/player"),
@@ -389,7 +393,43 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
             form_key = escape(view.form_key),
             history = adjustments_table(view.adjustments, false),
             blocks = block_section(view),
+            addresses = address_section(view.addresses),
         ),
+    )
+}
+
+/// 接続元の記録（`IP_WATCH_DISCORD_USER_IDS` の対象だけ。他の人は 1 行も無い）。
+/// **運営パネルだけが読む。**記録が無い人には節ごと出さない。
+fn address_section(records: &[AddressRecord]) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+    let rows = records
+        .iter()
+        .map(|record| {
+            format!(
+                "<tr><td>{at}</td><td>{source}</td><td class=\"num\">{ip}</td>\
+                 <td>{cf}</td><td>{xff}</td><td>{ua}</td></tr>\n",
+                at = escape(&display_time(record.seen_at)),
+                source = escape(record.source.label()),
+                ip = escape(&record.address.best_guess()),
+                cf = escape(record.address.cf_connecting_ip.as_deref().unwrap_or("-")),
+                xff = escape(record.address.x_forwarded_for.as_deref().unwrap_or("-")),
+                ua = escape(record.address.user_agent.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class=\"ops\" aria-labelledby=\"address-records-title\">\
+         <h2 id=\"address-records-title\">接続元の記録</h2>\
+         <p class=\"fine-print\">IP_WATCH_DISCORD_USER_IDS に並べたプレイヤーだけ、ログインと\
+         キュー投入の接続元を記録しています（新しい順、最大 {limit} 件）。「接続元」は \
+         CF-Connecting-IP、無ければ X-Forwarded-For の先頭。</p>\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>契機</th><th>接続元</th><th>CF-Connecting-IP</th>\
+         <th>X-Forwarded-For</th><th>User-Agent</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div></section>\n",
+        limit = ADDRESS_RECORD_LIMIT,
     )
 }
 
@@ -585,6 +625,120 @@ pub fn block_cooldown_page(view: &BlockCooldownView<'_>) -> String {
     )
 }
 
+pub struct IpBansView<'a> {
+    /// BAN 中の IP・キュー内の該当行数・履歴。すべて導出値。
+    pub preview: &'a IpBanPreview,
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    pub notice: Option<Notice>,
+}
+
+fn ip_ban_history(preview: &IpBanPreview) -> String {
+    if preview.history.is_empty() {
+        return "<p class=\"muted\">まだ一度も変更していません。</p>\n".to_owned();
+    }
+    let rows = preview
+        .history
+        .iter()
+        .map(|change| {
+            format!(
+                "<tr><td>{at}</td><td>{kind}</td><td class=\"num\">{ip}</td>\
+                 <td>{reason}</td><td>{by}</td></tr>\n",
+                at = escape(&display_time(change.created_at)),
+                kind = change.kind.label(),
+                ip = escape(&change.ip),
+                reason = escape(&change.reason),
+                by = escape(&change.created_by),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>時刻</th><th>操作</th><th>IP</th><th>理由</th><th>操作者</th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+pub fn ip_bans_page(view: &IpBansView<'_>) -> String {
+    let current = if view.preview.current.is_empty() {
+        "<p class=\"muted\">BAN 中の IP はありません。</p>\n".to_owned()
+    } else {
+        let rows = view
+            .preview
+            .current
+            .iter()
+            .map(|ban| {
+                format!(
+                    "<tr><td class=\"num\">{ip}</td><td>{at}</td><td>{reason}</td><td>{by}</td>\
+                     <td><form method=\"post\" action=\"/admin/ip-bans\">\
+                     <input type=\"hidden\" name=\"key\" value=\"ip-ban:{key}\">\
+                     <input type=\"hidden\" name=\"action\" value=\"unban\">\
+                     <input type=\"hidden\" name=\"ip\" value=\"{ip}\">\
+                     <input type=\"hidden\" name=\"reason\" value=\"解除\">\
+                     <button class=\"button button-secondary\" type=\"submit\">解除</button>\
+                     </form></td></tr>\n",
+                    ip = escape(&ban.ip),
+                    at = escape(&display_time(ban.banned_at)),
+                    reason = escape(&ban.reason),
+                    by = escape(&ban.created_by),
+                    key = escape(view.form_key),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<div class=\"table-wrap\"><table class=\"log\">\n\
+             <thead><tr><th>IP</th><th>BAN した時刻</th><th>理由</th><th>操作者</th><th></th></tr></thead>\n\
+             <tbody>\n{rows}</tbody>\n</table></div>\n"
+        )
+    };
+    let body = format!(
+        "<p class=\"lead\">BAN 中の IP からキューに入った人は、<strong>断らずに、組まれなく</strong>なります。\
+         本人の画面は「キュー中」のままで何も告げません。他の参加者の「範囲内 N 人」にも数えません。</p>\n\
+         <p class=\"notice\"><strong>効くのは次の投入からです。</strong>いまキューにいる行は変わりません\
+         （投入時点の判定を持っています）。IP は完全一致で突き合わせます。\
+         スマホ回線は無関係な人が同じ IP を共有することがあるので、\
+         <a href=\"/admin/queue\">キューと運用</a>の「組まれない」印で巻き添えに気付いたら解除してください。</p>\n\
+         <p class=\"notice\">IP の調べ方: 環境変数 IP_WATCH_DISCORD_USER_IDS に並べたアカウントの\
+         ログインとキュー投入は、係争チャンネルに接続元つきで通知され、プレイヤー画面の\
+         「接続元の記録」にも残ります。</p>\n\
+         <h2>BAN 中の IP</h2>\n{current}\
+         <p class=\"fine-print\">いまキューにいて組まれない行: <strong>{in_queue}</strong></p>\n\
+         <h2>BAN する</h2>\n\
+         <form method=\"post\" action=\"/admin/ip-bans\">\
+         <input type=\"hidden\" name=\"key\" value=\"ip-ban:{key}\">\
+         <input type=\"hidden\" name=\"action\" value=\"ban\">\
+         <label for=\"ip\">IP（完全一致）</label>\
+         <input id=\"ip\" name=\"ip\" type=\"text\" inputmode=\"numeric\" autocomplete=\"off\" required>\
+         <label for=\"reason\">理由（記録に残ります）</label>\
+         <input id=\"reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">この IP をシャドウバン</button>\
+         </div></form>\n\
+         <h2>変更履歴</h2>\n{history}",
+        in_queue = view.preview.shadow_banned_in_queue,
+        key = escape(view.form_key),
+        history = ip_ban_history(view.preview),
+    );
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / IP のシャドウバン",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-ip-bans-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-ip-bans-title\">IP のシャドウバン</h1>\n\
+             {nav}\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/ip-bans"),
+            notice = notice_html(view.notice.as_ref()),
+        ),
+    )
+}
+
 fn admin_nav(current: &str) -> String {
     let link = |href: &str, label: &str| {
         if href == current {
@@ -594,7 +748,7 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/players", "登録者一覧"),
         link("/admin/queue", "キューと運用"),
@@ -603,6 +757,7 @@ fn admin_nav(current: &str) -> String {
         link("/admin/rating-params", "レート増減幅"),
         link("/admin/matching-range", "マッチング範囲"),
         link("/admin/block-cooldown", "ブロック解除の待機日数"),
+        link("/admin/ip-bans", "IP のシャドウバン"),
         link("/admin/quiet-reports", "聞き専報告"),
     )
 }
@@ -790,7 +945,7 @@ fn queue_table(view: &QueueView<'_>) -> String {
     for entry in view.entries {
         body.push_str(&format!(
             "<tr><td><a href=\"/admin/player?player={id}\">{name}</a>\
-             <span class=\"fine-print\">{discord}</span></td>\
+             <span class=\"fine-print\">{discord}</span>{banned}</td>\
              <td class=\"num\">{wait}</td><td>{roles}</td>\
              <td class=\"num\">-{down_range}</td><td class=\"num\">{rating}</td>\
              <td><form method=\"post\" action=\"/admin/queue/remove\">\
@@ -803,6 +958,12 @@ fn queue_table(view: &QueueView<'_>) -> String {
             id = escape(&entry.player_id.to_string()),
             name = escape(entry.trainer_name.as_deref().unwrap_or("(未設定)")),
             discord = entry.discord_user_id,
+            // IP のシャドウバン中。本人には出ないので、運営がここで気付けるようにする
+            banned = if entry.shadow_banned {
+                " <strong class=\"fine-print\" data-shadow-banned=\"1\">組まれない（IP BAN）</strong>"
+            } else {
+                ""
+            },
             wait = wait_label(view.now, entry.enqueued_at),
             roles = role_wishes(entry),
             down_range = entry.down_range,
@@ -1811,6 +1972,7 @@ mod tests {
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             outgoing_blocks: &[],
             incoming_blocks: &[],
+            addresses: &[],
             notice: None,
         });
         assert!(rendered.contains("action=\"/admin/adjustments\""));
@@ -1835,6 +1997,7 @@ mod tests {
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             outgoing_blocks: &[],
             incoming_blocks: &[],
+            addresses: &[],
             notice: None,
         });
         assert_eq!(rendered.matches("action=\"/admin/revert\"").count(), 1);
@@ -1854,6 +2017,7 @@ mod tests {
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             outgoing_blocks: &[],
             incoming_blocks: &[],
+            addresses: &[],
             notice: Some(Notice {
                 kind: NoticeKind::Error,
                 message: "<b>not html</b>".to_owned(),
@@ -1906,6 +2070,7 @@ mod tests {
                     priority: 2,
                 },
             ],
+            shadow_banned: false,
         }
     }
 
@@ -2087,6 +2252,7 @@ mod tests {
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             outgoing_blocks: &[],
             incoming_blocks: &[],
+            addresses: &[],
             notice: None,
         });
         assert!(rendered.contains("<dt>ブロック枠</dt><dd>1 枠</dd>"));
@@ -2119,6 +2285,7 @@ mod tests {
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
             outgoing_blocks: &outgoing,
             incoming_blocks: &incoming,
+            addresses: &[],
             notice: None,
         });
         assert!(rendered.contains("Global Outgoing"), "{rendered}");
@@ -2288,6 +2455,7 @@ mod tests {
                     block_allowance: DEFAULT_BLOCK_ALLOWANCE,
                     outgoing_blocks: &[],
                     incoming_blocks: &[],
+                    addresses: &[],
                     notice: None,
                 }),
             ),

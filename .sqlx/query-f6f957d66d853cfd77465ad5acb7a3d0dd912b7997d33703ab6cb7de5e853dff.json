@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select q.player_id, q.down_range, (select r.role from queue_entry_roles r where r.entry_id = q.id and r.priority = 1) as first_choice, v.rating as \"rating!\", q.unmatched_scans from queue_entries q join player_current_ratings v on v.player_id = q.player_id",
+  "query": "select q.player_id, q.down_range, (select r.role from queue_entry_roles r where r.entry_id = q.id and r.priority = 1) as first_choice, v.rating as \"rating!\", q.unmatched_scans, q.shadow_banned from queue_entries q join player_current_ratings v on v.player_id = q.player_id",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,17 @@
             "name": "unmatched_scans"
           }
         }
+      },
+      {
+        "ordinal": 5,
+        "name": "shadow_banned",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "queue_entries",
+            "name": "shadow_banned"
+          }
+        }
       }
     ],
     "parameters": {
@@ -62,8 +73,9 @@
       false,
       null,
       true,
+      false,
       false
     ]
   },
-  "hash": "297dcce3d2c7589f4f37ae58730c199d4e4028755956d14983fad1b1fe050a3d"
+  "hash": "f6f957d66d853cfd77465ad5acb7a3d0dd912b7997d33703ab6cb7de5e853dff"
 }
