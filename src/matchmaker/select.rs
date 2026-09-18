@@ -370,31 +370,43 @@ fn select_matches_inner<O: SelectionObserver>(
     observer: &mut O,
 ) -> Vec<ProposedMatch> {
     let mut pool: Vec<&Candidate> = candidates.iter().collect();
-    // 「いちばん上」は**このスキャンの候補全員**から 1 回だけ決める（`super::boost`）
-    let top = super::boost::Bounds::of(candidates.iter().map(|candidate| &candidate.rating));
-    // 決定的にするため、レート降順・同点は player_id 昇順で固定する。
-    // **判定用のレート**で並べる（端の寄せ込み。`Candidate::matching_rating`）
-    pool.sort_by(|a, b| {
-        b.matching_rating(top)
-            .partial_cmp(&a.matching_rating(top))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.player_id.0.cmp(&b.player_id.0))
-    });
-
+    let bounds = super::boost::Bounds::of(candidates.iter().map(|candidate| &candidate.rating));
     let mut matches = Vec::new();
-    while pool.len() >= MATCH_SIZE {
-        let Some((taken, proposal)) =
-            find_one(&pool, top, ally_blocks, now, ranges, direction, observer)
-        else {
-            break;
-        };
-        // 成立した 10 人を候補から外す（添字の大きい方から消す）
-        let mut taken = taken;
-        taken.sort_unstable();
-        for index in taken.into_iter().rev() {
-            pool.remove(index);
+    // **2 周する。1 周目は実レート、2 周目は寄せ込み後の判定用レート**（`super::boost`）。
+    // 寄せ込みは端の人を中央へ動かすが、動かした先で組めず、動かす前なら組めた、という
+    // 取りこぼしを作ってはいけない（実レートで組めるなら常にそれを優先する）。
+    // 2 周目は 1 周目で組めなかった人だけを、寄せ込んだレートで見直す
+    let passes: [&dyn Fn(&Candidate) -> f64; 2] = [&|candidate| candidate.rating, &|candidate| {
+        candidate.matching_rating(bounds)
+    }];
+    for rating_of in passes {
+        // 決定的にするため、レート降順・同点は player_id 昇順で固定する
+        pool.sort_by(|a, b| {
+            rating_of(b)
+                .partial_cmp(&rating_of(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.player_id.0.cmp(&b.player_id.0))
+        });
+        while pool.len() >= MATCH_SIZE {
+            let Some((taken, proposal)) = find_one(
+                &pool,
+                rating_of,
+                ally_blocks,
+                now,
+                ranges,
+                direction,
+                observer,
+            ) else {
+                break;
+            };
+            // 成立した 10 人を候補から外す（添字の大きい方から消す）
+            let mut taken = taken;
+            taken.sort_unstable();
+            for index in taken.into_iter().rev() {
+                pool.remove(index);
+            }
+            matches.push(proposal);
         }
-        matches.push(proposal);
     }
     matches
 }
@@ -402,13 +414,14 @@ fn select_matches_inner<O: SelectionObserver>(
 /// 幅 50 のウィンドウを `direction` の順に試して、最初に成立した 1 組を返す。
 ///
 /// **比較は両端を含む（`<=`）。**差ちょうど 50 は同じウィンドウに入る。
+/// `rating_of` はウィンドウの判定に使うレート（実レートか、寄せ込み後の判定用レート）。
 ///
 /// 上からなら `anchor` は 0（最高レート）から順に下りるので、上のウィンドウで
 /// 組めなかった候補は**同じ呼び出しの中で下のウィンドウでも評価される**（飛ばさない）。
 /// 下からはその逆で、最低レートの人を基準にした窓から試す。
 fn find_one<O: SelectionObserver>(
     pool: &[&Candidate],
-    top: super::boost::Bounds,
+    rating_of: &dyn Fn(&Candidate) -> f64,
     ally_blocks: &AllyBlocks,
     now: Timestamp,
     ranges: MatchingRanges,
@@ -420,11 +433,11 @@ fn find_one<O: SelectionObserver>(
         observer.record_anchor();
         // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
         // ここで 2 条件を満たしていれば部分集合はどれも満たす
-        let floor = pool[anchor].matching_rating(top);
+        let floor = rating_of(pool[anchor]);
         let window_started = observer.begin_measurement();
         let window: Vec<usize> = (0..pool.len())
             .filter(|&i| {
-                let above = pool[i].matching_rating(top) - floor;
+                let above = rating_of(pool[i]) - floor;
                 above >= 0.0 && above <= span && above <= f64::from(pool[i].down_range)
             })
             .collect();
@@ -1328,6 +1341,44 @@ mod tests {
             1673.0
         );
         assert!(select_matches(&roster, now()).is_empty());
+    }
+
+    /// **寄せ込みで組めなくなっても、実レートで組めるなら組む。**
+    ///
+    /// 1650 の首位が 5 回取り残されて判定用 1585 になっていても、実レートの
+    /// [1600, 1650] に 10 人いれば 1 周目（実レート）で成立する。
+    #[test]
+    fn a_pulled_down_top_player_still_matches_at_the_real_rating() {
+        let mut roster = full_roster(1, 1600.0);
+        roster[0] = who(1, 1650.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 5;
+        let bounds = super::super::boost::Bounds {
+            bottom: 1600.0,
+            top: 1650.0,
+        };
+        assert_eq!(
+            roster[0].matching_rating(bounds),
+            1585.0,
+            "寄せ込み後は帯の外"
+        );
+        let matches = select_matches(&roster, now());
+        assert_eq!(matches.len(), 1, "実レートでは [1600, 1650] に 10 人いる");
+        assert_eq!(matches[0].rating_span(), 50.0);
+    }
+
+    /// **首位の引き下げは 65 まで。**それ以上取り残されても判定用レートは同じ。
+    #[test]
+    fn the_top_drop_is_capped_at_sixty_five() {
+        let mut roster = full_roster(1, 1600.0);
+        // 1720（120 上）は 65 下がっても 1655 で、実レートでも寄せ込み後でも帯に入らない…
+        roster[0] = who(1, 1720.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 20;
+        assert!(select_matches(&roster, now()).is_empty());
+        // …が 1665（65 上）なら 1600 になって組める
+        roster[0] = who(1, 1665.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 20;
+        let matches = select_matches(&roster, now());
+        assert_eq!(matches.len(), 1);
     }
 
     /// **seed の差 100 で 1500 群と 1600 群が分離する。**今回の変更の狙い。

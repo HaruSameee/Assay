@@ -348,6 +348,7 @@ impl QueueRepository {
             .map(|row| QueuedPlayer {
                 player_id: PlayerId(row.player_id),
                 rating: crate::matchmaker::matching_rating(row.rating, row.unmatched_scans, bounds),
+                real_rating: row.rating,
                 up_range: ranges.up,
                 down_range: ranges.clamp_down(row.down_range),
                 first_choice: row.first_choice,
@@ -407,6 +408,7 @@ impl QueueRepository {
         let me = QueuedPlayer {
             player_id,
             rating,
+            real_rating: rating,
             up_range: ranges.up,
             down_range: ranges.down,
             // 未投入なので希望はまだ無い。内訳の分母には入らない

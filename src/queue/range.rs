@@ -20,8 +20,11 @@ use crate::matchmaker::FirstChoiceRoleCounts;
 pub struct QueuedPlayer {
     /// 誰か。自分自身を数えないためだけに使う。
     pub player_id: PlayerId,
-    /// 表示スケールのレート（導出値）。
+    /// 範囲判定に使うレート（表示スケール。端の寄せ込み込み。`matchmaker::boost`）。
     pub rating: f64,
+    /// 実レート（寄せ込み前）。マッチメイカは実レートでも組めるかを先に試すので、
+    /// 画面の人数も両方で数えて多い方を出す。
+    pub real_rating: f64,
     /// 上方向の幅。運営が変えられる（`current_matching_ranges.up_range`）。
     ///
     /// 全員に同じ値が入る。それでも 1 人ずつ持たせているのは、**片方向の判定を
@@ -64,29 +67,57 @@ pub fn mutually_in_range(a: &QueuedPlayer, b: &QueuedPlayer) -> bool {
 /// 人は両方「範囲内」だが、その 2 人は互いに 90 離れていて同じ試合には入れない。
 /// マッチメイカが見るのは max − min ≤ 50 の集合なので、画面もそれに揃える
 /// （「範囲内 10 人」と出ているのに何度も流れる、という食い違いを作らない）。
+///
+/// マッチメイカと同じく**実レートと判定用レート（寄せ込み後）の両方**で数え、多い方を出す。
 pub fn count_in_range(me: &QueuedPlayer, queue: &[QueuedPlayer]) -> usize {
-    best_window(me, queue).len()
+    best_window_either(me, queue).len()
+}
+
+/// 実レートと判定用レートのそれぞれで [`best_window`] を取り、多い方（同数なら実レート）。
+fn best_window_either<'a>(
+    me: &'a QueuedPlayer,
+    queue: &'a [QueuedPlayer],
+) -> Vec<&'a QueuedPlayer> {
+    let real = best_window(me, queue, &|player| player.real_rating);
+    let shifted = best_window(me, queue, &|player| player.rating);
+    if shifted.len() > real.len() {
+        shifted
+    } else {
+        real
+    }
 }
 
 /// 自分を含む幅 `up_range` のウィンドウのうち、いちばん人が多いものに入る**他の人**。
 ///
 /// ウィンドウの下端は「自分か、自分の下 `up_range` 以内にいる誰か」のレートで、
 /// その下端から `up_range` 上までを 1 つの組み合わせとして数える（マッチメイカの
-/// `find_one` と同じ形）。相互条件（[`mutually_in_range`]）を満たさない人は最初から外す。
+/// `find_one` と同じ形）。`rating_of` は判定に使うレート（実か、寄せ込み後か）。
 /// 同数のウィンドウが複数あれば下端が低いものを採る（決定的にするため）。
-fn best_window<'a>(me: &'a QueuedPlayer, queue: &'a [QueuedPlayer]) -> Vec<&'a QueuedPlayer> {
+fn best_window<'a>(
+    me: &'a QueuedPlayer,
+    queue: &'a [QueuedPlayer],
+    rating_of: &dyn Fn(&QueuedPlayer) -> f64,
+) -> Vec<&'a QueuedPlayer> {
+    let my_rating = rating_of(me);
+    let span = f64::from(me.up_range);
     let candidates: Vec<&QueuedPlayer> = queue
         .iter()
         .filter(|other| other.player_id != me.player_id)
-        .filter(|other| mutually_in_range(me, other))
+        // 相互条件（上下の幅を両方向で満たす）
+        .filter(|other| {
+            let rating = rating_of(other);
+            rating <= my_rating + span
+                && rating >= my_rating - f64::from(me.down_range)
+                && my_rating <= rating + f64::from(other.up_range)
+                && my_rating >= rating - f64::from(other.down_range)
+        })
         .collect();
-    let span = f64::from(me.up_range);
     // 下端の候補: 自分と、自分の下 span 以内の人のレート
     let mut floors: Vec<f64> = candidates
         .iter()
-        .map(|other| other.rating)
-        .filter(|rating| *rating <= me.rating && me.rating - *rating <= span)
-        .chain(std::iter::once(me.rating))
+        .map(|other| rating_of(other))
+        .filter(|rating| *rating <= my_rating && my_rating - *rating <= span)
+        .chain(std::iter::once(my_rating))
         .collect();
     floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     floors.dedup();
@@ -96,7 +127,7 @@ fn best_window<'a>(me: &'a QueuedPlayer, queue: &'a [QueuedPlayer]) -> Vec<&'a Q
             .iter()
             .copied()
             .filter(|other| {
-                let above = other.rating - floor;
+                let above = rating_of(other) - floor;
                 above >= 0.0 && above <= span && above <= f64::from(other.down_range)
             })
             .collect();
@@ -114,7 +145,7 @@ fn best_window<'a>(me: &'a QueuedPlayer, queue: &'a [QueuedPlayer]) -> Vec<&'a Q
 /// 希望を 1 つも持たない行は、どのロールにも数えない。
 pub fn count_by_first_choice(me: &QueuedPlayer, queue: &[QueuedPlayer]) -> FirstChoiceRoleCounts {
     let mut counts = FirstChoiceRoleCounts::default();
-    for other in best_window(me, queue) {
+    for other in best_window_either(me, queue) {
         if let Some(role) = other.first_choice.as_deref() {
             counts.increment(role);
         }
@@ -133,6 +164,7 @@ mod tests {
         QueuedPlayer {
             player_id: PlayerId(Uuid::from_u128(n)),
             rating,
+            real_rating: rating,
             up_range: DEFAULT_UP_RANGE,
             down_range: DEFAULT_DOWN_RANGE,
             first_choice: None,
@@ -251,6 +283,7 @@ mod tests {
             player_id: PlayerId(Uuid::from_u128(1)),
             up_range: DEFAULT_UP_RANGE,
             rating: 1600.0,
+            real_rating: 1600.0,
             down_range: 200,
             first_choice: None,
             shadow_banned: false,
