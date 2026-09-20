@@ -1510,6 +1510,162 @@ mod tests {
         );
     }
 
+    /// 決定的な擬似乱数（乱数クレートを持ち込まない。LCG で十分）。
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// **不変条件を、でたらめなキュー 2000 通りで確かめる。**
+    ///
+    /// レート・待ち時間・希望ロール（0〜3 個）・取り残し回数・運営の加算・味方ブロックを
+    /// ランダムに作り、成立した組すべてについて:
+    /// - 10 人が相異なり、複数の組に同じ人がいない
+    /// - 各ロールちょうど 2 人、各チームに 5 ロールが 1 人ずつ、割り当ては本人の希望のどれか
+    /// - 実レートか判定用レートのどちらかで max − min ≤ 50（2 周のどちらかで成立している）
+    /// - 同じチームにブロックの組がいない
+    /// - 同じ入力からは同じ出力（決定的）
+    #[test]
+    fn random_queues_never_violate_the_invariants() {
+        let mut rng = Lcg(20_260_920);
+        let mut formed_total = 0usize;
+        for round in 0..2000u32 {
+            let count = 1 + rng.below(40) as usize;
+            let mut roster: Vec<Candidate> = (0..count)
+                .map(|n| {
+                    let wishes = rng.below(4) as usize;
+                    let mut roles: Vec<&str> = Vec::new();
+                    while roles.len() < wishes {
+                        let role = ROLES[rng.below(5) as usize];
+                        if !roles.contains(&role) {
+                            roles.push(role);
+                        }
+                    }
+                    let mut candidate = who(
+                        n as u128 + 1,
+                        1400.0 + rng.below(300) as f64,
+                        DEFAULT_DOWN_RANGE,
+                        rng.below(3600) as i64,
+                        &roles,
+                    );
+                    candidate.unmatched_scans = rng.below(12) as i32;
+                    candidate.priority_bonus_seconds = if rng.below(8) == 0 {
+                        rng.below(180) as i64 * 60
+                    } else {
+                        0
+                    };
+                    candidate
+                })
+                .collect();
+            // ブロックを何組か
+            let mut blocks = AllyBlocks::new();
+            for _ in 0..rng.below(4) {
+                let a = PlayerId(Uuid::from_u128(rng.below(count as u64) as u128 + 1));
+                let b = PlayerId(Uuid::from_u128(rng.below(count as u64) as u128 + 1));
+                if a != b {
+                    blocks.entry(a).or_default().insert(b);
+                }
+            }
+            let direction = if rng.below(2) == 0 {
+                ScanDirection::TopDown
+            } else {
+                ScanDirection::BottomUp
+            };
+            let bounds = super::super::boost::Bounds::of(roster.iter().map(|c| &c.rating));
+            let run = |roster: &[Candidate]| {
+                select_matches_scanning(
+                    roster,
+                    &blocks,
+                    now(),
+                    MatchingRanges::default(),
+                    direction,
+                )
+            };
+            let matches = run(&roster);
+            assert_eq!(matches, run(&roster), "round {round}: 決定的でない");
+            formed_total += matches.len();
+
+            let mut seen: HashSet<PlayerId> = HashSet::new();
+            for proposal in &matches {
+                assert_eq!(proposal.players.len(), MATCH_SIZE, "round {round}");
+                let mut red_roles: HashSet<&str> = HashSet::new();
+                let mut blue_roles: HashSet<&str> = HashSet::new();
+                let mut ids: Vec<PlayerId> = Vec::new();
+                for player in &proposal.players {
+                    assert!(
+                        seen.insert(player.player_id),
+                        "round {round}: 二重に組まれた"
+                    );
+                    ids.push(player.player_id);
+                    let candidate = roster
+                        .iter()
+                        .find(|c| c.player_id == player.player_id)
+                        .expect("候補にいる人");
+                    assert!(
+                        candidate.roles.iter().any(|w| w.role == player.role),
+                        "round {round}: 希望に無いロール {}",
+                        player.role
+                    );
+                    let set = match player.team {
+                        Team::Red => &mut red_roles,
+                        Team::Blue => &mut blue_roles,
+                    };
+                    assert!(
+                        set.insert(player.role.as_str()),
+                        "round {round}: 同じチームに同じロール"
+                    );
+                }
+                assert_eq!(red_roles.len(), ROLES.len(), "round {round}");
+                assert_eq!(blue_roles.len(), ROLES.len(), "round {round}");
+                // 幅 50: 実レートか判定用レートのどちらかで収まっている
+                let group: Vec<&Candidate> = ids
+                    .iter()
+                    .map(|id| roster.iter().find(|c| c.player_id == *id).unwrap())
+                    .collect();
+                let span_of = |f: &dyn Fn(&Candidate) -> f64| {
+                    let max = group.iter().map(|c| f(c)).fold(f64::MIN, f64::max);
+                    let min = group.iter().map(|c| f(c)).fold(f64::MAX, f64::min);
+                    max - min
+                };
+                let real = span_of(&|c| c.rating);
+                let shifted = span_of(&|c| c.matching_rating(bounds));
+                assert!(
+                    real <= 50.0 + 1e-9 || shifted <= 50.0 + 1e-9,
+                    "round {round}: 幅 50 に収まっていない（実 {real}, 判定 {shifted}）"
+                );
+                // 同じチームにブロックの組がいない
+                for a in &proposal.players {
+                    for b in &proposal.players {
+                        if a.team == b.team
+                            && blocks
+                                .get(&a.player_id)
+                                .is_some_and(|set| set.contains(&b.player_id))
+                        {
+                            panic!("round {round}: ブロックの組が同じチーム");
+                        }
+                    }
+                }
+            }
+            // 使い回しの検査用: roster は変えていない
+            roster.clear();
+        }
+        assert!(
+            formed_total > 200,
+            "成立が少なすぎる（検査が空回り）: {formed_total}"
+        );
+    }
+
     /// **seed の差 100 で 1500 群と 1600 群が分離する。**今回の変更の狙い。
     #[test]
     fn the_fifteen_hundred_and_sixteen_hundred_pools_do_not_mix() {
