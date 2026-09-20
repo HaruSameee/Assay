@@ -235,17 +235,18 @@ impl ProposedMatch {
 }
 
 // ----------------------------------------------------------------------
-// 走査の方向
+// 基準の順と走査の方向
 // ----------------------------------------------------------------------
 //
-// ウィンドウは「基準（最低レート）+ 上方向の幅」で、基準をどの順に試すかだけが
-// 方向で変わる。**上からだけ**だと、上と下の両方のウィンドウに入れる中間の人は
-// 常に上の組に取られ、最下位付近は「あと 1〜2 人足りない」で残り続ける。
-// スキャンごとに方向を変えて、下の帯にも先に組める回を作る。
+// ウィンドウは「基準（最低レート）+ 上方向の幅」。**基準はいちばん長く待っている人から**
+// 順に取り、その人を含むウィンドウを人数の多い順に試す（`find_one`）。レート順に
+// 取っていた頃は、上と下の両方の帯に入れる中間の人が毎回どちらかの帯に先を越され、
+// 1 時間以上取り残されることがあった。
 //
-// **方向は毎回ランダムに引き、参加者には見せない。**交互や時刻で決めると周期が
-// 読めて「下からの回だけキューに入る / 上からの回を避ける」ができてしまう。
-// 見せてよいのはサーバのログだけ（Discord の実行ログには出さない）。
+// `ScanDirection` は**同点の並び**（同じ待ち時間の基準どうし、同じ人数のウィンドウどうし）
+// を決めるだけになった。以前は基準そのものの順（上から / 下から）を決めていて、
+// 中間の人の取り残しを緩和する役だったが、待ち時間順に取れば要らない。
+// **方向は毎回ランダムに引き、参加者には見せない**（周期を読まれないため）。
 
 /// 1 回のスキャンで基準を試す順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -274,14 +275,6 @@ impl ScanDirection {
             Self::TopDown
         } else {
             Self::BottomUp
-        }
-    }
-
-    /// 基準を試す順の添字列。`pool` はレート降順なので、下からは末尾から。
-    fn anchors(self, len: usize) -> Box<dyn Iterator<Item = usize>> {
-        match self {
-            Self::TopDown => Box::new(0..len),
-            Self::BottomUp => Box::new((0..len).rev()),
         }
     }
 }
@@ -411,14 +404,24 @@ fn select_matches_inner<O: SelectionObserver>(
     matches
 }
 
-/// 幅 50 のウィンドウを `direction` の順に試して、最初に成立した 1 組を返す。
+/// **いちばん長く待っている人から順に**、その人を含む幅 50 のウィンドウを試して、
+/// 最初に成立した 1 組を返す。
+///
+/// 以前は基準をレート順（上から / 下から）に取っていた。それだと「上の帯にも下の帯にも
+/// 10 人いて、自分はどちらにも入れる」中間の人が、毎回どちらかの帯に先を越されて
+/// 1 時間以上取り残されることがあった（走査方向をランダムにしても、その人の帯が
+/// 最初に試されるとは限らない）。待ち時間の長い順に基準を取れば、**その人を含む
+/// 組み合わせが 1 つでも成立するなら、その人より長く待っている人がいない限り組まれる。**
+///
+/// 基準の人 1 人につき、その人を含むウィンドウ（下端は本人か、本人の下 50 以内の誰か）を
+/// **人数の多い順**に試す（同数なら `direction` の側から）。ウィンドウの中の 10 人は
+/// 最小費用流が待ち時間の長い順に選ぶ（[`assign_roles`]）ので、基準の人は
+/// ロールの都合が付く限り入る。
 ///
 /// **比較は両端を含む（`<=`）。**差ちょうど 50 は同じウィンドウに入る。
 /// `rating_of` はウィンドウの判定に使うレート（実レートか、寄せ込み後の判定用レート）。
-///
-/// 上からなら `anchor` は 0（最高レート）から順に下りるので、上のウィンドウで
-/// 組めなかった候補は**同じ呼び出しの中で下のウィンドウでも評価される**（飛ばさない）。
-/// 下からはその逆で、最低レートの人を基準にした窓から試す。
+/// `direction` は同点（同じ待ち時間・同じ人数）の並びを決めるだけで、どちらでも
+/// 成立する組み合わせの集合は変わらない。
 fn find_one<O: SelectionObserver>(
     pool: &[&Candidate],
     rating_of: &dyn Fn(&Candidate) -> f64,
@@ -429,41 +432,85 @@ fn find_one<O: SelectionObserver>(
     observer: &mut O,
 ) -> Option<(Vec<usize>, ProposedMatch)> {
     let span = f64::from(ranges.up);
-    for anchor in direction.anchors(pool.len()) {
+    // 基準: 待ち時間の長い順。同点は `direction` の側（上から / 下から）
+    let mut anchors: Vec<usize> = (0..pool.len()).collect();
+    anchors.sort_by(|&a, &b| {
+        pool[a]
+            .enqueued_at
+            .cmp(&pool[b].enqueued_at)
+            .then_with(|| {
+                let by_rating = rating_of(pool[b])
+                    .partial_cmp(&rating_of(pool[a]))
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                match direction {
+                    ScanDirection::TopDown => by_rating,
+                    ScanDirection::BottomUp => by_rating.reverse(),
+                }
+            })
+            .then_with(|| pool[a].player_id.0.cmp(&pool[b].player_id.0))
+    });
+    for anchor in anchors {
         observer.record_anchor();
-        // ウィンドウの基準はその最小レート。実際の最小はこれ以上になるので、
-        // ここで 2 条件を満たしていれば部分集合はどれも満たす
-        let floor = rating_of(pool[anchor]);
-        let window_started = observer.begin_measurement();
-        let window: Vec<usize> = (0..pool.len())
-            .filter(|&i| {
-                let above = rating_of(pool[i]) - floor;
-                above >= 0.0 && above <= span && above <= f64::from(pool[i].down_range)
+        let mine = rating_of(pool[anchor]);
+        // この人を含むウィンドウの下端の候補: 本人と、本人の下 span 以内の人
+        let mut floors: Vec<f64> = pool
+            .iter()
+            .map(|candidate| rating_of(candidate))
+            .filter(|rating| *rating <= mine && mine - *rating <= span)
+            .collect();
+        floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        floors.dedup();
+        let mut windows: Vec<Vec<usize>> = floors
+            .into_iter()
+            .map(|floor| {
+                (0..pool.len())
+                    .filter(|&i| {
+                        let above = rating_of(pool[i]) - floor;
+                        above >= 0.0 && above <= span && above <= f64::from(pool[i].down_range)
+                    })
+                    .collect()
             })
             .collect();
-        observer.record_window(
-            window.len() >= MATCH_SIZE,
-            window_started.map(|started| started.elapsed()),
-        );
-        if window.len() < MATCH_SIZE {
-            continue;
-        }
-        let role_started = observer.begin_measurement();
-        let assignment = assign_roles(pool, &window, now);
-        observer.record_role_assignment(
-            assignment.is_some(),
-            role_started.map(|started| started.elapsed()),
-        );
-        if let Some(assignment) = assignment {
-            let split_started = observer.begin_measurement();
-            let proposal = split_teams(pool, &assignment, ally_blocks, now, observer);
-            observer.record_team_split(
-                proposal.is_some(),
-                split_started.map(|started| started.elapsed()),
+        // 人数の多い順。同数なら direction の側（上から: 下端が高い方、下から: 低い方）
+        windows.sort_by(|a, b| {
+            b.len().cmp(&a.len()).then_with(|| {
+                let floor_a = rating_of(pool[a[0]]);
+                let floor_b = rating_of(pool[b[0]]);
+                let low_first = floor_a
+                    .partial_cmp(&floor_b)
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                match direction {
+                    ScanDirection::TopDown => low_first.reverse(),
+                    ScanDirection::BottomUp => low_first,
+                }
+            })
+        });
+        for window in windows {
+            let window_started = observer.begin_measurement();
+            observer.record_window(
+                window.len() >= MATCH_SIZE,
+                window_started.map(|started| started.elapsed()),
             );
-            if let Some(proposal) = proposal {
-                let taken = assignment.iter().map(|slot| slot.pool_index).collect();
-                return Some((taken, proposal));
+            if window.len() < MATCH_SIZE {
+                continue;
+            }
+            let role_started = observer.begin_measurement();
+            let assignment = assign_roles(pool, &window, now);
+            observer.record_role_assignment(
+                assignment.is_some(),
+                role_started.map(|started| started.elapsed()),
+            );
+            if let Some(assignment) = assignment {
+                let split_started = observer.begin_measurement();
+                let proposal = split_teams(pool, &assignment, ally_blocks, now, observer);
+                observer.record_team_split(
+                    proposal.is_some(),
+                    split_started.map(|started| started.elapsed()),
+                );
+                if let Some(proposal) = proposal {
+                    let taken = assignment.iter().map(|slot| slot.pool_index).collect();
+                    return Some((taken, proposal));
+                }
             }
         }
     }
@@ -1379,6 +1426,49 @@ mod tests {
         roster[0].unmatched_scans = 20;
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1);
+    }
+
+    /// **いちばん長く待っている人が、成立しうる限り最初の組に入る。**
+    ///
+    /// 上の帯（1640〜1649）に 10 人、下の帯（1560〜1569）に 10 人、あいだの 1600 に
+    /// 67 分待っている人が 1 人。1600 はどちらの帯とも組めるが、レート順に基準を取ると
+    /// 上から / 下からのどちらでも先に純粋な帯が成立し、1600 は取り残され続ける。
+    /// 待ち時間順に基準を取れば、1600 を含む組が最初に成立する。
+    #[test]
+    fn the_longest_waiting_player_is_matched_first_even_between_two_bands() {
+        let mut roster = Vec::new();
+        for n in 0..10u128 {
+            roster.push(who(
+                100 + n,
+                1640.0 + n as f64,
+                DEFAULT_DOWN_RANGE,
+                600,
+                &[ROLES[n as usize % ROLES.len()]],
+            ));
+            roster.push(who(
+                200 + n,
+                1560.0 + n as f64,
+                DEFAULT_DOWN_RANGE,
+                600,
+                &[ROLES[n as usize % ROLES.len()]],
+            ));
+        }
+        roster.push(who(1, 1600.0, DEFAULT_DOWN_RANGE, 67 * 60, &[ROLES[1]]));
+        for direction in [ScanDirection::TopDown, ScanDirection::BottomUp] {
+            let matches = select_matches_scanning(
+                &roster,
+                &AllyBlocks::default(),
+                now(),
+                MatchingRanges::default(),
+                direction,
+            );
+            assert_eq!(matches.len(), 2, "{direction:?}");
+            let first: Vec<PlayerId> = matches[0].players.iter().map(|p| p.player_id).collect();
+            assert!(
+                first.contains(&PlayerId(Uuid::from_u128(1))),
+                "{direction:?}: 67 分待った 1600 が最初の組に入る: {first:?}"
+            );
+        }
     }
 
     /// **seed の差 100 で 1500 群と 1600 群が分離する。**今回の変更の狙い。
