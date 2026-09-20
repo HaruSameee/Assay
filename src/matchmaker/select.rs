@@ -146,6 +146,9 @@ pub struct Candidate {
     pub down_range: i32,
     /// キューに入った時刻。待ち時間の算出に使う。
     pub enqueued_at: Timestamp,
+    /// 運営が付与した優先度（待ち時間に加算する秒数。`queue_priority_grants` の
+    /// まだ効いている分の合算）。基準の順と費用にだけ効き、画面の待ち時間は変えない。
+    pub priority_bonus_seconds: i64,
     /// 希望ロール。`priority` の昇順（1 が第 1 希望）。
     pub roles: Vec<RoleWish>,
     /// フレックス補償の対象か（07 §5。`formation_players` から導出済み）。
@@ -161,6 +164,12 @@ impl Candidate {
     /// 実レートは [`Self::rating`] のまま formation に凍結する。
     pub fn matching_rating(&self, bounds: super::boost::Bounds) -> f64 {
         super::boost::matching_rating(self.rating, self.unmatched_scans, bounds)
+    }
+
+    /// **優先度の判定に使う投入時刻。**運営の付与ぶんだけ早めた時刻で、基準の順
+    /// （長く待っている人から）と最小費用流の費用がこれを見る。
+    pub fn effective_enqueued_at(&self) -> Timestamp {
+        self.enqueued_at - chrono::Duration::seconds(self.priority_bonus_seconds.max(0))
     }
 }
 
@@ -436,8 +445,8 @@ fn find_one<O: SelectionObserver>(
     let mut anchors: Vec<usize> = (0..pool.len()).collect();
     anchors.sort_by(|&a, &b| {
         pool[a]
-            .enqueued_at
-            .cmp(&pool[b].enqueued_at)
+            .effective_enqueued_at()
+            .cmp(&pool[b].effective_enqueued_at())
             .then_with(|| {
                 let by_rating = rating_of(pool[b])
                     .partial_cmp(&rating_of(pool[a]))
@@ -536,7 +545,7 @@ struct Slot {
 fn assign_roles(pool: &[&Candidate], window: &[usize], now: Timestamp) -> Option<Vec<Slot>> {
     let waits: Vec<i64> = window
         .iter()
-        .map(|&i| (now - pool[i].enqueued_at).num_seconds().max(0))
+        .map(|&i| (now - pool[i].effective_enqueued_at()).num_seconds().max(0))
         .collect();
     let longest = waits.iter().copied().max().unwrap_or(0);
 
@@ -799,6 +808,7 @@ mod tests {
             sigma: 500.0,
             down_range,
             enqueued_at: now() - TimeDelta::seconds(waited),
+            priority_bonus_seconds: 0,
             roles: roles
                 .iter()
                 .enumerate()
@@ -1469,6 +1479,35 @@ mod tests {
                 "{direction:?}: 67 分待った 1600 が最初の組に入る: {first:?}"
             );
         }
+    }
+
+    /// **運営の優先度は待ち時間への加算として効く。**5 分しか待っていない人でも、
+    /// 70 分の加算があれば 10 分待ちの人より先に基準になり、費用でも先に選ばれる。
+    #[test]
+    fn a_priority_grant_counts_as_extra_waiting_time() {
+        let mut roster = full_roster(1, 1600.0);
+        for candidate in roster.iter_mut() {
+            candidate.enqueued_at = now() - TimeDelta::seconds(600);
+        }
+        // 11 人目: 5 分待ち + 70 分の加算。ロールは 1 番と同じ第 1 希望だけ
+        let mut granted = who(99, 1600.0, DEFAULT_DOWN_RANGE, 300, &[ROLES[0]]);
+        granted.priority_bonus_seconds = 70 * 60;
+        roster.push(granted);
+        let matches = select_matches(&roster, now());
+        assert_eq!(matches.len(), 1);
+        let chosen: Vec<PlayerId> = matches[0].players.iter().map(|p| p.player_id).collect();
+        assert!(
+            chosen.contains(&PlayerId(Uuid::from_u128(99))),
+            "加算込みで最長の待ちなので入る: {chosen:?}"
+        );
+        // 加算が無ければ、後から来た人は 10 人の外に残る
+        roster[10].priority_bonus_seconds = 0;
+        let matches = select_matches(&roster, now());
+        let chosen: Vec<PlayerId> = matches[0].players.iter().map(|p| p.player_id).collect();
+        assert!(
+            !chosen.contains(&PlayerId(Uuid::from_u128(99))),
+            "{chosen:?}"
+        );
     }
 
     /// **seed の差 100 で 1500 群と 1600 群が分離する。**今回の変更の狙い。

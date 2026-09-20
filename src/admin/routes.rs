@@ -34,7 +34,8 @@ use crate::registration::html::error_page;
 use crate::registration::{AuthConfig, CurrentSession, Viewer};
 
 use super::actions::{
-    AdminActionKind, MAX_BLOCK_ALLOWANCE, normalize_reason, parse_block_allowance,
+    AdminActionKind, MAX_BLOCK_ALLOWANCE, MAX_PRIORITY_MINUTES, normalize_reason,
+    parse_block_allowance, parse_priority_minutes,
 };
 use super::config::AdminIds;
 use super::disputes::{
@@ -54,8 +55,8 @@ use super::matching_range::{MatchingRangeOutcome, parse_ranges};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewRatingParams, NewSeasonBoundary,
-    NewShadowBan, NewStaffReport, RemovalOutcome, StaffReportOutcome,
+    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewPriorityGrant, NewRatingParams,
+    NewSeasonBoundary, NewShadowBan, NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::schedule::{MatchmakerSchedule, ScheduleOutcome, parse_days, parse_time};
 use super::season::{
@@ -131,6 +132,8 @@ pub fn router(state: AdminState) -> Router {
         // 稼働スケジュール。**手動の停止には触らない**（枠を書くだけ）
         .route("/admin/matchmaker/schedule", post(set_matchmaker_schedule))
         .route("/admin/queue/remove", post(remove_from_queue))
+        // マッチング優先度の付与（待ち時間への加算。次の成立まで効く）
+        .route("/admin/queue/priority", post(raise_queue_priority))
         .route("/admin/blocks", post(set_block_allowance))
         .route("/admin/blocks/override", post(override_block))
         // シーズン境界（導出の起点）。2 段階の確認。実行は POST /admin/season
@@ -412,6 +415,13 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
             return internal_error();
         }
     };
+    let priority_bonus_seconds = match app.store.pending_priority_bonus(player_id).await {
+        Ok(bonus) => bonus,
+        Err(err) => {
+            error!(%err, "could not read the pending priority bonus");
+            return internal_error();
+        }
+    };
     let addresses = match app.store.addresses_for(player_id).await {
         Ok(addresses) => addresses,
         Err(err) => {
@@ -426,6 +436,7 @@ async fn render_player(app: &AdminState, player_id: Uuid, notice: Option<Notice>
         adjustments: &adjustments,
         form_key: &form_key,
         block_allowance,
+        priority_bonus_seconds,
         outgoing_blocks: &outgoing_blocks,
         incoming_blocks: &incoming_blocks,
         addresses: &addresses,
@@ -1001,6 +1012,88 @@ async fn remove_from_queue(
         }
     };
     render_queue(&app, Some(notice)).await
+}
+
+#[derive(Debug, Deserialize)]
+struct PriorityForm {
+    #[serde(default)]
+    player: String,
+    #[serde(default)]
+    key: String,
+    /// 待ち時間に加算する分。
+    #[serde(default)]
+    minutes: String,
+    #[serde(default)]
+    reason: String,
+    /// `player` ならプレイヤー画面へ戻す（既定はキュー画面）。
+    #[serde(default)]
+    back: String,
+}
+
+/// マッチング優先度の付与。**待ち時間に加算する**だけで、画面の待ち時間は変えない。
+///
+/// キュー中でなくてもよい（次にキューへ入ったときから効く）。効くのは付与より後に
+/// その人の試合が成立するまで（1 回ぶん）。
+async fn raise_queue_priority(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<PriorityForm>,
+) -> Response {
+    let Ok(player_id) = Uuid::parse_str(form.player.trim()) else {
+        return not_found();
+    };
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let back_to_player = form.back == "player";
+    let Some(bonus_seconds) = parse_priority_minutes(&form.minutes) else {
+        let notice = fail(format!(
+            "加算する分は 1〜{MAX_PRIORITY_MINUTES} の整数で入力してください。"
+        ));
+        return respond_priority(&app, player_id, back_to_player, notice).await;
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        let notice = fail("理由を入力してください。".to_owned());
+        return respond_priority(&app, player_id, back_to_player, notice).await;
+    };
+    let input = NewPriorityGrant {
+        player_id,
+        bonus_seconds,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.raise_queue_priority(&input).await {
+        Ok(ActionOutcome::Recorded { .. }) => info(format!(
+            "マッチング優先度を上げました（待ち時間に +{} 分）。次にこの人の試合が成立するまで効きます。\
+             本人の画面の待ち時間は変わりません。",
+            bonus_seconds / 60
+        )),
+        Ok(ActionOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not raise the queue priority");
+            return internal_error();
+        }
+    };
+    respond_priority(&app, player_id, back_to_player, notice).await
+}
+
+/// 優先度のフォームの戻り先。プレイヤー画面から来たならそこへ、それ以外はキュー画面へ。
+async fn respond_priority(
+    app: &AdminState,
+    player_id: Uuid,
+    back_to_player: bool,
+    notice: Notice,
+) -> Response {
+    if back_to_player {
+        render_player(app, player_id, Some(notice)).await
+    } else {
+        render_queue(app, Some(notice)).await
+    }
 }
 
 #[derive(Debug, Deserialize)]

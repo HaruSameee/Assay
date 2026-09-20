@@ -453,10 +453,42 @@ pub struct QueuedEntry {
     pub down_range: i32,
     /// 表示スケールの現在レート（追記ログからの導出値）。
     pub rating: f64,
+    /// マッチング範囲の判定に使うレート（端の寄せ込み込み。`matchmaker::boost`）。
+    pub matching_rating: f64,
+    /// マッチメイカが走って、この人を見て、組まなかった回数。
+    pub unmatched_scans: i32,
+    /// 運営が付与した優先度（待ち時間への加算秒。まだ効いている分の合算）。
+    pub priority_bonus_seconds: i64,
+    /// マッチメイカが基準を取る順（1 が最初）。シャドウバン中は `None`（候補にならない）。
+    pub priority_rank: Option<usize>,
     /// 希望ロール。`priority` の昇順。
     pub roles: Vec<QueuedRole>,
     /// IP のシャドウバン中か（投入時点の判定。組まれない）。
     pub shadow_banned: bool,
+}
+
+impl QueuedEntry {
+    /// 優先度の判定に使う投入時刻（加算ぶんだけ早めた時刻）。`Candidate` と同じ定義。
+    pub fn effective_enqueued_at(&self) -> DateTime<Utc> {
+        self.enqueued_at - chrono::Duration::seconds(self.priority_bonus_seconds.max(0))
+    }
+}
+
+/// 追記する優先度の付与 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPriorityGrant {
+    /// 対象プレイヤー。
+    pub player_id: Uuid,
+    /// 待ち時間に加算する秒数。**検証済みの値を渡すこと**（`admin::parse_priority_minutes`）。
+    pub bonus_seconds: i32,
+    /// 運営が書いた理由。
+    pub reason: String,
+    /// 操作した運営。
+    pub actor_discord_user_id: i64,
+    /// 追記時刻。
+    pub created_at: DateTime<Utc>,
+    /// 冪等キー。
+    pub idempotency_key: String,
 }
 
 /// 希望ロール 1 つ。
@@ -508,10 +540,21 @@ impl AdminRepository {
     /// レートは導出値なので現在値のテーブルを持たない。`queue::repository::queued_players` や
     /// マッチメイカの候補読み込みと同じ式（初期値 + `rating_adjustments` + 確定した試合の増減）。
     pub async fn queued_entries(&self) -> Result<Vec<QueuedEntry>, sqlx::Error> {
+        // マッチメイカの `load_candidates` と同じ材料を読む（優先順・判定用レート・
+        // 優先度の加算）。定義を 2 か所に持たないよう、加算の導出も同じ式にする
         let rows = sqlx::query!(
             "select q.id as entry_id, q.player_id, q.enqueued_at, q.down_range, q.shadow_banned, \
-                    p.discord_user_id, p.trainer_name, \
-                    v.rating as \"rating!\" \
+                    q.unmatched_scans, p.discord_user_id, p.trainer_name, \
+                    v.rating as \"rating!\", \
+                    coalesce(( \
+                        select sum(g.bonus_seconds)::bigint from queue_priority_grants g \
+                        where g.player_id = q.player_id \
+                          and g.created_at > coalesce(( \
+                              select max(f.created_at) from formation_players fp \
+                              join formations f on f.id = fp.formation_id \
+                              where fp.player_id = q.player_id \
+                          ), '-infinity'::timestamptz) \
+                    ), 0) as \"priority_bonus_seconds!\" \
              from queue_entries q \
              join players p on p.id = q.player_id \
              join player_current_ratings v on v.player_id = q.player_id \
@@ -538,8 +581,15 @@ impl AdminRepository {
                 priority: wish.priority,
             });
         }
+        // 判定用レートの「いちばん上」は、マッチメイカと同じく候補（シャドウバン中を除く）
+        // の実レートから決める
+        let bounds = crate::matchmaker::Bounds::of(
+            rows.iter()
+                .filter(|row| !row.shadow_banned)
+                .map(|row| &row.rating),
+        );
 
-        Ok(rows
+        let mut entries: Vec<QueuedEntry> = rows
             .into_iter()
             .map(|row| QueuedEntry {
                 player_id: row.player_id,
@@ -548,10 +598,94 @@ impl AdminRepository {
                 enqueued_at: row.enqueued_at,
                 down_range: ranges.clamp_down(row.down_range),
                 rating: row.rating,
+                matching_rating: crate::matchmaker::matching_rating(
+                    row.rating,
+                    row.unmatched_scans,
+                    bounds,
+                ),
+                unmatched_scans: row.unmatched_scans,
+                priority_bonus_seconds: row.priority_bonus_seconds,
+                priority_rank: None,
                 roles: by_entry.remove(&row.entry_id).unwrap_or_default(),
                 shadow_banned: row.shadow_banned,
             })
-            .collect())
+            .collect();
+        // 優先順: マッチメイカが基準を取る順（加算込みの投入時刻が早い人から）。
+        // シャドウバン中は候補にならないので順位を付けない
+        let mut order: Vec<usize> = (0..entries.len())
+            .filter(|&i| !entries[i].shadow_banned)
+            .collect();
+        order.sort_by_key(|&i| (entries[i].effective_enqueued_at(), entries[i].player_id));
+        for (rank, i) in order.into_iter().enumerate() {
+            entries[i].priority_rank = Some(rank + 1);
+        }
+        Ok(entries)
+    }
+
+    /// マッチング優先度を付与する（`queue_priority_grants` に追記し、操作を記録する）。
+    ///
+    /// キュー中でなくてもよい（付与は players 単位。次にキューへ入ったときから効く）。
+    /// 同一 `idempotency_key` は no-op。
+    pub async fn raise_queue_priority(
+        &self,
+        input: &NewPriorityGrant,
+    ) -> Result<ActionOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar!(
+            "insert into queue_priority_grants \
+             (player_id, bonus_seconds, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.player_id,
+            input.bonus_seconds,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(ActionOutcome::Duplicate);
+        };
+        let outcome = append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::QueuePriorityRaised,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: Some(input.player_id),
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "queue_priority_grant_id": id,
+                    "bonus_seconds": input.bonus_seconds,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("queue_priority:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// その人にいま効いている優先度の加算（秒）。付与より後に成立した試合が無い分の合算。
+    pub async fn pending_priority_bonus(&self, player_id: Uuid) -> Result<i64, sqlx::Error> {
+        let bonus = sqlx::query_scalar!(
+            "select coalesce(sum(g.bonus_seconds)::bigint, 0) as \"bonus!\" \
+             from queue_priority_grants g \
+             where g.player_id = $1 \
+               and g.created_at > coalesce(( \
+                   select max(f.created_at) from formation_players fp \
+                   join formations f on f.id = fp.formation_id \
+                   where fp.player_id = $1 \
+               ), '-infinity'::timestamptz)",
+            player_id,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(bonus)
     }
 
     /// キューから外し、同じトランザクションで操作を記録する。

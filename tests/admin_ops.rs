@@ -534,7 +534,11 @@ async fn the_queue_screen_lists_the_players_with_their_settings(owner: PgPool) {
     assert!(page.contains("キュー中（1人）"), "{page}");
     assert!(page.contains("トレーナー2"));
     assert!(page.contains("1. 中央"), "ロール希望を表示名で出す");
-    assert!(page.contains(">-50</td>"), "下方向の範囲（50 固定）");
+    assert!(page.contains("<th>優先順</th>"), "優先順の列: {page}");
+    assert!(
+        page.contains("<td class=\"num\">1</td>"),
+        "1 人なので優先順 1: {page}"
+    );
     assert!(page.contains(">1600</td>"), "調整が乗ったレート");
     assert!(page.contains("action=\"/admin/queue/remove\""));
     db.done().await;
@@ -3031,5 +3035,127 @@ async fn a_subject_can_be_shadow_banned_and_released_from_the_panel(owner: PgPoo
     let (status, _) = get_html(&app, player(2), "/admin/shadow-bans").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     println!("シャドウバン: IP と Discord ID を BAN → 重複は増えない → IP を解除、操作ログ 3 行");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// マッチング優先度
+// ----------------------------------------------------------------------
+
+/// **キュー一覧は優先順・取り残し回数・加算を出し、行のフォームから優先度を上げられる。**
+/// プレイヤー画面にもいま効いている加算が出る。範囲外の分と理由なしは断る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn the_queue_page_shows_priority_and_lets_staff_raise_it(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 3).await;
+    // 2 が 10 分、3 が 5 分、4 が 1 分待ち
+    enqueue(&db, player(2), "jungle", at(-600)).await;
+    enqueue(&db, player(3), "bot_tank", at(-300)).await;
+    enqueue(&db, player(4), "top_carry", at(-60)).await;
+    let app = db.router();
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/queue").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("<th>優先順</th>"), "{page}");
+    assert!(page.contains("<th>取り残し</th>"), "{page}");
+    // 優先順は待ち時間の長い順: 2, 3, 4
+    let pos = |id: PlayerId| page.find(&id.0.to_string()).expect("row");
+    assert!(pos(player(2)) < pos(player(3)) && pos(player(3)) < pos(player(4)));
+    let key = form_key(&page, "/admin/queue/priority");
+
+    // 範囲外・理由なし
+    let (_, refused) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/queue/priority",
+        &format!("player={}&minutes=999&reason=x&key={key}", player(4).0),
+    )
+    .await;
+    assert!(refused.contains("1〜180 の整数"), "{refused}");
+    let (_, no_reason) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/queue/priority",
+        &format!("player={}&minutes=30&reason=&key={key}", player(4).0),
+    )
+    .await;
+    assert!(no_reason.contains("理由を入力してください"), "{no_reason}");
+    assert_eq!(count(&db, "queue_priority_grants").await, 0);
+
+    // 4 に +30 分 → 優先順が 2 より前になる（1 分 + 30 分 > 10 分）
+    let (status, raised) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/queue/priority",
+        &format!(
+            "player={}&minutes=30&reason=%E5%8F%96%E3%82%8A%E6%AE%8B%E3%81%97&key={key}",
+            player(4).0
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        raised.contains("マッチング優先度を上げました（待ち時間に +30 分）"),
+        "{raised}"
+    );
+    assert!(raised.contains("data-priority-bonus=\"1800\""), "{raised}");
+    let pos = |id: PlayerId| raised.find(&id.0.to_string()).expect("row");
+    assert!(
+        pos(player(4)) < pos(player(2)),
+        "加算込みで 4 が最初になる: {raised}"
+    );
+    assert_eq!(count(&db, "queue_priority_grants").await, 1);
+    // 同じキーの再送は増えない
+    let (_, again) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/queue/priority",
+        &format!("player={}&minutes=30&reason=x&key={key}", player(4).0),
+    )
+    .await;
+    assert!(again.contains("既に記録されています"), "{again}");
+    assert_eq!(count(&db, "queue_priority_grants").await, 1);
+
+    // プレイヤー画面にも出て、そこからも付与できる（戻り先はプレイヤー画面）
+    let (_, player_page) = get_html(
+        &app,
+        player(ADMIN),
+        &format!("/admin/player?player={}", player(4).0),
+    )
+    .await;
+    assert!(
+        player_page
+            .contains("いま効いている加算: <strong data-priority-bonus=\"1800\">+30 分</strong>"),
+        "{player_page}"
+    );
+    let player_key = form_key(&player_page, "/admin/queue/priority");
+    let (_, from_player) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/queue/priority",
+        &format!(
+            "player={}&minutes=15&reason=x&back=player&key={player_key}",
+            player(4).0
+        ),
+    )
+    .await;
+    assert!(
+        from_player.contains("data-priority-bonus=\"2700\""),
+        "合算 45 分: {from_player}"
+    );
+    assert!(
+        from_player.contains("admin-player-title"),
+        "プレイヤー画面に戻る: {from_player}"
+    );
+    // 非管理者には無い
+    let (status, _) = post_form(
+        &app,
+        player(2),
+        "/admin/queue/priority",
+        &format!("player={}&minutes=30&reason=x&key=zzz", player(4).0),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    println!("優先度: 一覧に順位、+30 分で順位が上がる、プレイヤー画面でも付与できる");
     db.done().await;
 }

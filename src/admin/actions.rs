@@ -58,12 +58,14 @@ pub enum AdminActionKind {
     ShadowBanned,
     /// シャドウバンを解いた。
     ShadowBanLifted,
+    /// マッチング優先度を付与した（待ち時間への加算。次の成立まで効く）。
+    QueuePriorityRaised,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
@@ -83,6 +85,7 @@ impl AdminActionKind {
         Self::IpUnbanned,
         Self::ShadowBanned,
         Self::ShadowBanLifted,
+        Self::QueuePriorityRaised,
     ];
 
     /// DB に入る文字列。
@@ -104,6 +107,7 @@ impl AdminActionKind {
             Self::IpUnbanned => "ip_unbanned",
             Self::ShadowBanned => "shadow_banned",
             Self::ShadowBanLifted => "shadow_ban_lifted",
+            Self::QueuePriorityRaised => "queue_priority_raised",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -129,6 +133,7 @@ impl AdminActionKind {
             "ip_unbanned" => Some(Self::IpUnbanned),
             "shadow_banned" => Some(Self::ShadowBanned),
             "shadow_ban_lifted" => Some(Self::ShadowBanLifted),
+            "queue_priority_raised" => Some(Self::QueuePriorityRaised),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -155,6 +160,7 @@ impl AdminActionKind {
             Self::IpUnbanned => "IP のシャドウバンを解除",
             Self::ShadowBanned => "シャドウバン",
             Self::ShadowBanLifted => "シャドウバンを解除",
+            Self::QueuePriorityRaised => "マッチング優先度を付与",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",
@@ -221,6 +227,19 @@ pub fn normalize_reason(raw: &str) -> Option<String> {
 pub fn parse_block_allowance(raw: &str) -> Option<i32> {
     let value: i32 = raw.trim().parse().ok()?;
     (0..=MAX_BLOCK_ALLOWANCE).contains(&value).then_some(value)
+}
+
+/// 優先度の加算の上限（分）。SQL の CHECK（10800 秒）と同じ。
+pub const MAX_PRIORITY_MINUTES: i32 = 180;
+
+/// 優先度の加算（分）の入力を読み、**秒**にして返す。1〜[`MAX_PRIORITY_MINUTES`] の整数だけ。
+///
+/// 加算は「待ち時間に足す」ものなので、運営は分で考える。DB には秒で入れる。
+pub fn parse_priority_minutes(raw: &str) -> Option<i32> {
+    let minutes: i32 = raw.trim().parse().ok()?;
+    (1..=MAX_PRIORITY_MINUTES)
+        .contains(&minutes)
+        .then_some(minutes * 60)
 }
 
 #[cfg(test)]

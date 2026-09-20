@@ -218,6 +218,7 @@ fn bench_candidates(count: usize, spread: f64, roles_each: usize) -> Vec<Candida
                 roles,
                 flex_compensation: false,
                 unmatched_scans: 0,
+                priority_bonus_seconds: 0,
             }
         })
         .collect()

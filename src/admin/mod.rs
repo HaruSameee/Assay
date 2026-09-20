@@ -30,8 +30,9 @@ pub mod season;
 pub mod shadow_bans;
 
 pub use actions::{
-    AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, MAX_BLOCK_ALLOWANCE, PauseState,
-    QueueRemoval, normalize_reason, parse_block_allowance,
+    AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, MAX_BLOCK_ALLOWANCE,
+    MAX_PRIORITY_MINUTES, PauseState, QueueRemoval, normalize_reason, parse_block_allowance,
+    parse_priority_minutes,
 };
 pub use block_cooldown::{
     BlockCooldownChange, BlockCooldownError, BlockCooldownOutcome, BlockCooldownPreview,
@@ -55,7 +56,8 @@ pub use rating_params::{
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
     NewAdjustment, NewAdminAction, NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule,
-    NewRatingParams, NewSeasonBoundary, NewShadowBan, QueuedEntry, QueuedRole, RemovalOutcome,
+    NewPriorityGrant, NewRatingParams, NewSeasonBoundary, NewShadowBan, QueuedEntry, QueuedRole,
+    RemovalOutcome,
 };
 pub use routes::{AdminState, router};
 pub use schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome, parse_days, parse_time};

@@ -648,6 +648,80 @@ async fn the_production_entry_point_draws_the_direction_at_random(owner: PgPool)
 }
 
 // ----------------------------------------------------------------------
+// マッチング優先度（運営の付与）
+// ----------------------------------------------------------------------
+
+/// **運営が付与した優先度は待ち時間に加算され、次の成立で消費される。**
+///
+/// 11 人（同レート、同じロール構成）で、いちばん後から来た人に 60 分を付与すると、
+/// その人が組まれて、先にいた誰かが残る。成立後は付与が効かなくなる（付与より後の試合がある）。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_priority_grant_is_extra_waiting_time_until_the_next_match(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 11).await;
+    // 1〜10 は 10 分前から、11 は 1 分前から。11 のロールは 1 と同じ
+    enqueue_full_rosters(&db, 10, at(-600)).await;
+    db.queue
+        .enqueue(
+            player(11),
+            &QueueRequest {
+                roles: vec![RolePreference {
+                    role: ROLES[0].to_owned(),
+                    priority: 1,
+                }],
+                streaming: false,
+            },
+            at(-60),
+        )
+        .await
+        .unwrap();
+    let admin = unite_matchsystem::admin::AdminRepository::new(db.pool.clone());
+    admin
+        .raise_queue_priority(&unite_matchsystem::admin::NewPriorityGrant {
+            player_id: player(11).0,
+            bonus_seconds: 60 * 60,
+            reason: "取り残された".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: at(-30),
+            idempotency_key: "grant-11".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        admin.pending_priority_bonus(player(11).0).await.unwrap(),
+        3600
+    );
+
+    let outcome = db.matchmaker(1).run_once(at(0)).await.unwrap();
+    assert_eq!(outcome.created.len(), 1, "{outcome:?}");
+    let matched: bool =
+        sqlx::query_scalar("select exists(select 1 from formation_players where player_id = $1)")
+            .bind(player(11).0)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(matched, "60 分の加算で最長待ちになり、組まれる");
+    assert_eq!(
+        count(&db, "queue_entries").await,
+        1,
+        "先にいた誰かが 1 人残る"
+    );
+    // 成立したので付与は消費された
+    assert_eq!(admin.pending_priority_bonus(player(11).0).await.unwrap(), 0);
+    // 運営操作ログは本人に結ばれる
+    let logged: i64 = sqlx::query_scalar(
+        "select count(*) from admin_actions where kind = 'queue_priority_raised' and target_player_id = $1",
+    )
+    .bind(player(11).0)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged, 1);
+    println!("優先度 +60 分: 1 分待ちの人が先に組まれ、成立後は加算 0");
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
 // IP のシャドウバン
 // ----------------------------------------------------------------------
 

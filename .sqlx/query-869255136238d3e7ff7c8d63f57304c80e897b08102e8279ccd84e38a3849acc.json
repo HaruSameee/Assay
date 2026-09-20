@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select coalesce(sum(g.bonus_seconds)::bigint, 0) as \"bonus!\" from queue_priority_grants g where g.player_id = $1 and g.created_at > coalesce(( select max(f.created_at) from formation_players fp join formations f on f.id = fp.formation_id where fp.player_id = $1 ), '-infinity'::timestamptz)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bonus!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "869255136238d3e7ff7c8d63f57304c80e897b08102e8279ccd84e38a3849acc"
+}

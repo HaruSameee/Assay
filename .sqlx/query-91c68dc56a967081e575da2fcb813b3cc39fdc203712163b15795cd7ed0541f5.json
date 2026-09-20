@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into queue_priority_grants (player_id, bonus_seconds, reason, created_by, idempotency_key, created_at) values ($1, $2, $3, $4, $5, $6) on conflict (idempotency_key) do nothing returning id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "queue_priority_grants",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "91c68dc56a967081e575da2fcb813b3cc39fdc203712163b15795cd7ed0541f5"
+}

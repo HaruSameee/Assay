@@ -14,7 +14,7 @@ use crate::registration::Viewer;
 use crate::registration::html::{escape, page};
 use crate::status::html::{display_time, format_delta};
 
-use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, PauseState};
+use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, MAX_PRIORITY_MINUTES, PauseState};
 use super::block_cooldown::BlockCooldownPreview;
 use super::disputes::DisputeDecision;
 use super::matching_range::MatchingRangePreview;
@@ -58,6 +58,8 @@ pub struct PlayerView<'a> {
     pub form_key: &'a str,
     /// 現在のブロック枠（`admin_actions` の最新行からの導出値。既定は 1）。
     pub block_allowance: i32,
+    /// いま効いているマッチング優先度の加算（秒）。付与より後に成立した試合が無い分。
+    pub priority_bonus_seconds: i64,
     pub outgoing_blocks: &'a [CurrentBlock],
     pub incoming_blocks: &'a [IncomingBlock],
     /// 接続元の記録（新しい順）。記録対象でない人は空。
@@ -361,6 +363,21 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
              <input id=\"allowance_reason\" name=\"reason\" type=\"text\" maxlength=\"200\">\
              <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">ブロック枠を変更</button></div>\
              </form>\n\
+             <h2>マッチング優先度</h2>\n\
+             <p class=\"fine-print\">マッチメイカは待ち時間の長い人から組みます。ここで加算した分は\
+             待ち時間に足され、<strong>次にこの人の試合が成立するまで</strong>効きます（キューに\
+             入っていなくても付与でき、次に入ったときから効きます）。本人の画面の待ち時間は\
+             変わりません。いま効いている加算: <strong data-priority-bonus=\"{bonus_seconds}\">+{bonus_minutes} 分</strong></p>\n\
+             <form method=\"post\" action=\"/admin/queue/priority\">\
+             <input type=\"hidden\" name=\"player\" value=\"{player_id}\">\
+             <input type=\"hidden\" name=\"key\" value=\"queue_priority:{form_key}\">\
+             <input type=\"hidden\" name=\"back\" value=\"player\">\
+             <label for=\"priority_minutes\">加算する分（1〜{max_minutes}）</label>\
+             <input id=\"priority_minutes\" name=\"minutes\" type=\"number\" min=\"1\" max=\"{max_minutes}\" step=\"1\" value=\"30\" required>\
+             <label for=\"priority_reason\">理由（記録に残ります）</label>\
+             <input id=\"priority_reason\" name=\"reason\" type=\"text\" maxlength=\"200\" required>\
+             <div class=\"actions\"><button class=\"button button-primary\" type=\"submit\">優先度を上げる</button></div>\
+             </form>\n\
              <h2>調整の追記</h2>\n\
              <p class=\"fine-print\">入力は表示スケール（レートの表示と同じ単位）です。\
              内部的な μ / σ への変換は既存の経路で行われます。理由は必須です。</p>\n\
@@ -388,6 +405,9 @@ pub fn player_page(view: &PlayerView<'_>) -> String {
             discord = view.player.discord_user_id,
             player_id = escape(&view.player.player_id.to_string()),
             allowance = view.block_allowance,
+            bonus_seconds = view.priority_bonus_seconds,
+            bonus_minutes = view.priority_bonus_seconds / 60,
+            max_minutes = MAX_PRIORITY_MINUTES,
             max = MAX_BLOCK_ALLOWANCE,
             notice = notice_html(view.notice.as_ref()),
             form_key = escape(view.form_key),
@@ -952,20 +972,53 @@ fn queue_table(view: &QueueView<'_>) -> String {
     if view.entries.is_empty() {
         return String::from("<p class=\"muted\">キュー中のプレイヤーはいません。</p>\n");
     }
+    // マッチメイカが基準を取る順（優先順）に並べる。順位の無い行（シャドウバン中）は末尾
+    let mut entries: Vec<&QueuedEntry> = view.entries.iter().collect();
+    entries.sort_by_key(|entry| (entry.priority_rank.is_none(), entry.priority_rank));
     let mut body = String::new();
-    for entry in view.entries {
+    for entry in entries {
+        let bonus = if entry.priority_bonus_seconds > 0 {
+            format!(
+                " <span class=\"fine-print\" data-priority-bonus=\"{seconds}\">+{minutes} 分</span>",
+                seconds = entry.priority_bonus_seconds,
+                minutes = entry.priority_bonus_seconds / 60,
+            )
+        } else {
+            String::new()
+        };
+        let matching = if (entry.matching_rating - entry.rating).abs() >= 0.5 {
+            format!(
+                " <span class=\"fine-print\" data-matching-rating=\"1\">判定 {}</span>",
+                format_rating(entry.matching_rating)
+            )
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
-            "<tr><td><a href=\"/admin/player?player={id}\">{name}</a>\
+            "<tr><td class=\"num\">{rank}</td>\
+             <td><a href=\"/admin/player?player={id}\">{name}</a>\
              <span class=\"fine-print\">{discord}</span>{banned}</td>\
-             <td class=\"num\">{wait}</td><td>{roles}</td>\
-             <td class=\"num\">-{down_range}</td><td class=\"num\">{rating}</td>\
-             <td><form method=\"post\" action=\"/admin/queue/remove\">\
+             <td class=\"num\">{wait}{bonus}</td><td class=\"num\">{scans}</td><td>{roles}</td>\
+             <td class=\"num\">{rating}{matching}</td>\
+             <td><form method=\"post\" action=\"/admin/queue/priority\">\
+             <input type=\"hidden\" name=\"player\" value=\"{id}\">\
+             <input type=\"hidden\" name=\"key\" value=\"queue_priority:{id}:{key}\">\
+             <label class=\"sr-only\" for=\"minutes-{id}\">加算する分</label>\
+             <input id=\"minutes-{id}\" name=\"minutes\" type=\"number\" min=\"1\" max=\"{max_minutes}\" step=\"1\" value=\"30\" required>\
+             <label class=\"sr-only\" for=\"priority-reason-{id}\">理由</label>\
+             <input id=\"priority-reason-{id}\" name=\"reason\" type=\"text\" maxlength=\"200\" placeholder=\"理由（記録に残る）\" required>\
+             <button class=\"button button-secondary\" type=\"submit\">優先度を上げる</button>\
+             </form>\
+             <form method=\"post\" action=\"/admin/queue/remove\">\
              <input type=\"hidden\" name=\"player\" value=\"{id}\">\
              <input type=\"hidden\" name=\"key\" value=\"queue_removed:{id}:{key}\">\
              <label class=\"sr-only\" for=\"reason-{id}\">理由</label>\
              <input id=\"reason-{id}\" name=\"reason\" type=\"text\" maxlength=\"200\" placeholder=\"理由（任意・本人に表示）\">\
              <button class=\"revert\" type=\"submit\">キューから外す</button>\
              </form></td></tr>\n",
+            rank = entry
+                .priority_rank
+                .map_or_else(|| "-".to_owned(), |rank| rank.to_string()),
             id = escape(&entry.player_id.to_string()),
             name = escape(entry.trainer_name.as_deref().unwrap_or("(未設定)")),
             discord = entry.discord_user_id,
@@ -976,16 +1029,21 @@ fn queue_table(view: &QueueView<'_>) -> String {
                 ""
             },
             wait = wait_label(view.now, entry.enqueued_at),
+            scans = entry.unmatched_scans,
             roles = role_wishes(entry),
-            down_range = entry.down_range,
             rating = format_rating(entry.rating),
+            max_minutes = MAX_PRIORITY_MINUTES,
             key = escape(view.form_key),
         ));
     }
     format!(
-        "<div class=\"table-wrap\"><table class=\"log\">\n\
-         <thead><tr><th>トレーナー名</th><th>待ち時間</th><th>ロール希望</th>\
-         <th>下方向</th><th>レート</th><th>操作</th></tr></thead>\n\
+        "<p class=\"fine-print\">優先順はマッチメイカが基準を取る順（待ち時間 + 運営の加算が長い人から）。\
+         「判定」は端の寄せ込み後のレートで、実レートと違うときだけ出ます。取り残しは組まれずに\
+         流れたスキャンの回数。優先度を上げると、次にその人の試合が成立するまで待ち時間に加算されます\
+         （本人の画面の待ち時間は変わりません）。</p>\n\
+         <div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>優先順</th><th>トレーナー名</th><th>待ち時間</th><th>取り残し</th>\
+         <th>ロール希望</th><th>レート</th><th>操作</th></tr></thead>\n\
          <tbody>\n{body}</tbody>\n</table></div>\n"
     )
 }
@@ -1981,6 +2039,7 @@ mod tests {
             adjustments: &[],
             form_key: "0f6f0b7a-6e31-7a2c-9b93-0a3c6f9d2a11",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            priority_bonus_seconds: 0,
             outgoing_blocks: &[],
             incoming_blocks: &[],
             addresses: &[],
@@ -2006,6 +2065,7 @@ mod tests {
             adjustments: &rows,
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            priority_bonus_seconds: 0,
             outgoing_blocks: &[],
             incoming_blocks: &[],
             addresses: &[],
@@ -2026,6 +2086,7 @@ mod tests {
             adjustments: &[],
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            priority_bonus_seconds: 0,
             outgoing_blocks: &[],
             incoming_blocks: &[],
             addresses: &[],
@@ -2071,6 +2132,10 @@ mod tests {
                 - TimeDelta::minutes(minutes_ago),
             down_range: 95,
             rating: 1511.0,
+            matching_rating: 1511.0,
+            unmatched_scans: 0,
+            priority_bonus_seconds: 0,
+            priority_rank: Some(n as usize),
             roles: vec![
                 QueuedRole {
                     role: "jungle".to_owned(),
@@ -2210,7 +2275,13 @@ mod tests {
         assert!(rendered.contains("4分"));
         assert!(rendered.contains("1. 中央 / 2. タンク"), "表示名で出す");
         assert!(!rendered.contains("jungle"), "内部識別子を画面に出さない");
-        assert!(rendered.contains(">-95</td>"));
+        // 下方向の列はやめた（幅は運営が全体で変えるもの）。代わりに優先順と取り残しが出る
+        assert!(rendered.contains("<th>優先順</th>"), "{rendered}");
+        assert!(rendered.contains("<th>取り残し</th>"), "{rendered}");
+        assert!(
+            rendered.contains("action=\"/admin/queue/priority\""),
+            "{rendered}"
+        );
         assert!(rendered.contains(">1511</td>"));
         assert_eq!(
             rendered.matches("action=\"/admin/queue/remove\"").count(),
@@ -2261,6 +2332,7 @@ mod tests {
             adjustments: &[],
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            priority_bonus_seconds: 0,
             outgoing_blocks: &[],
             incoming_blocks: &[],
             addresses: &[],
@@ -2294,6 +2366,7 @@ mod tests {
             adjustments: &[],
             form_key: "k",
             block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+            priority_bonus_seconds: 0,
             outgoing_blocks: &outgoing,
             incoming_blocks: &incoming,
             addresses: &[],
@@ -2464,6 +2537,7 @@ mod tests {
                     adjustments: &[],
                     form_key: "k",
                     block_allowance: DEFAULT_BLOCK_ALLOWANCE,
+                    priority_bonus_seconds: 0,
                     outgoing_blocks: &[],
                     incoming_blocks: &[],
                     addresses: &[],

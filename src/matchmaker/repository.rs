@@ -750,7 +750,12 @@ async fn load_candidates(
                 v.rating as \"rating!\", v.sigma as \"sigma!\", \
                 latest.formation_id as \"latest_formation?\", \
                 latest.created_at as \"latest_matched_at?\", \
-                latest.role_was_flexed as \"latest_role_was_flexed?\" \
+                latest.role_was_flexed as \"latest_role_was_flexed?\", \
+                coalesce(( \
+                    select sum(g.bonus_seconds)::bigint from queue_priority_grants g \
+                    where g.player_id = q.player_id \
+                      and g.created_at > coalesce(latest.created_at, '-infinity'::timestamptz) \
+                ), 0) as \"priority_bonus_seconds!\" \
          from queue_entries q \
          join player_current_ratings v on v.player_id = q.player_id \
          left join lateral ( \
@@ -808,6 +813,7 @@ async fn load_candidates(
                 roles: by_entry.remove(&row.id).unwrap_or_default(),
                 flex_compensation: flex_compensation_owed(&history),
                 unmatched_scans: row.unmatched_scans,
+                priority_bonus_seconds: row.priority_bonus_seconds,
             }
         })
         .collect())
@@ -928,6 +934,7 @@ mod tests {
                     }],
                     flex_compensation: false,
                     unmatched_scans: 0,
+                    priority_bonus_seconds: 0,
                 }
             })
             .collect()
