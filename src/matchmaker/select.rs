@@ -1402,40 +1402,78 @@ mod tests {
 
     /// **寄せ込みで組めなくなっても、実レートで組めるなら組む。**
     ///
-    /// 1650 の首位が 5 回取り残されて判定用 1585 になっていても、実レートの
+    /// 1650 の首位が 8 回取り残されて判定用 1550 になっていても、実レートの
     /// [1600, 1650] に 10 人いれば 1 周目（実レート）で成立する。
     #[test]
     fn a_pulled_down_top_player_still_matches_at_the_real_rating() {
         let mut roster = full_roster(1, 1600.0);
         roster[0] = who(1, 1650.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
-        roster[0].unmatched_scans = 5;
+        roster[0].unmatched_scans = 8;
         let bounds = super::super::boost::Bounds {
             bottom: 1600.0,
             top: 1650.0,
         };
         assert_eq!(
             roster[0].matching_rating(bounds),
-            1585.0,
-            "寄せ込み後は帯の外"
+            1550.0,
+            "寄せ込み後は 1550（帯の外）"
         );
         let matches = select_matches(&roster, now());
         assert_eq!(matches.len(), 1, "実レートでは [1600, 1650] に 10 人いる");
         assert_eq!(matches[0].rating_span(), 50.0);
     }
 
-    /// **首位の引き下げは 65 まで。**それ以上取り残されても判定用レートは同じ。
+    /// **1600 以上の首位は 1550 まで、1600 未満の首位は 65 まで**下がる。
     #[test]
-    fn the_top_drop_is_capped_at_sixty_five() {
-        let mut roster = full_roster(1, 1600.0);
-        // 1720（120 上）は 65 下がっても 1655 で、実レートでも寄せ込み後でも帯に入らない…
+    fn the_top_drop_stops_at_1550_or_sixty_five() {
+        // 1720 の首位は 1550 まで下がり、1500〜1550 の帯と組める
+        let mut roster = full_roster(1, 1500.0);
         roster[0] = who(1, 1720.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
         roster[0].unmatched_scans = 20;
-        assert!(select_matches(&roster, now()).is_empty());
-        // …が 1665（65 上）なら 1600 になって組める
-        roster[0] = who(1, 1665.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
-        roster[0].unmatched_scans = 20;
         let matches = select_matches(&roster, now());
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.len(), 1, "1720 → 1550 で 1500 の帯に入る");
+        // 1549 の帯とは組めない（1550 より下へは行かない。差 51 以上なら帯の外）
+        let mut roster = full_roster(1, 1499.0);
+        roster[0] = who(1, 1720.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 50;
+        assert!(select_matches(&roster, now()).is_empty(), "1550 で止まる");
+        // 1590 の首位は 65 まで（1525）。1470〜1475 の帯（差 50〜55）には届かない…
+        let mut roster = full_roster(1, 1470.0);
+        roster[0] = who(1, 1590.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 20;
+        assert!(
+            select_matches(&roster, now()).is_empty(),
+            "1525 と 1470 は差 55"
+        );
+        // …1475 なら差 50 で組める
+        let mut roster = full_roster(1, 1475.0);
+        roster[0] = who(1, 1590.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        roster[0].unmatched_scans = 20;
+        assert_eq!(select_matches(&roster, now()).len(), 1);
+    }
+
+    /// **1430 以下は、取り残されていなくても 1430 として帯に入る。**
+    #[test]
+    fn a_player_below_1430_joins_the_1430_band_from_the_start() {
+        // 1350 の人 1 人 + 1470 の 9 人。実レートでは差 120 で組めないが、1430 として見れば差 40
+        let mut roster = full_roster(1, 1470.0);
+        roster[0] = who(1, 1350.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        assert_eq!(roster[0].unmatched_scans, 0);
+        let matches = select_matches(&roster, now());
+        assert_eq!(matches.len(), 1, "取り残し 0 回でも 1430 から");
+        let lifted = matches[0]
+            .players
+            .iter()
+            .find(|player| player.player_id == PlayerId(Uuid::from_u128(1)))
+            .unwrap();
+        assert_eq!(lifted.rating, 1350.0, "凍結するのは実レート");
+        // 1481 の帯（差 51）には、取り残し 0 回では届かない
+        let mut roster = full_roster(1, 1481.0);
+        roster[0] = who(1, 1350.0, DEFAULT_DOWN_RANGE, 600, &[ROLES[0]]);
+        assert!(select_matches(&roster, now()).is_empty());
+        // 1 回取り残されれば 1444 で届く
+        roster[0].unmatched_scans = 1;
+        assert_eq!(select_matches(&roster, now()).len(), 1);
     }
 
     /// **いちばん長く待っている人が、成立しうる限り最初の組に入る。**

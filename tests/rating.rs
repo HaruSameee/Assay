@@ -975,7 +975,8 @@ async fn rating_paths(db: &AppDb, who: PlayerId) -> RatingPaths {
         .unwrap()
         .into_iter()
         .find(|queued| queued.player_id == who)
-        .map(|queued| queued.rating);
+        // `rating` は判定用レート（1430 以下は 1430 から）。実レートは `real_rating`
+        .map(|queued| queued.real_rating);
 
     let by_preview: Option<f64> = sqlx::query_scalar(
         "select $2::double precision \
