@@ -30,6 +30,9 @@ use crate::persistence::Outcome;
 use crate::queue::MatchingRanges;
 
 use super::actions::{AdminActionKind, AdminActionRow, DEFAULT_BLOCK_ALLOWANCE, PauseState};
+use super::rating_corrections::{
+    CorrectionInput, RatingCorrection, RatingCorrectionOutcome, RatingCorrectionsPreview,
+};
 use super::rating_params::{
     RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
 };
@@ -1434,6 +1437,183 @@ impl AdminRepository {
         .await?;
         tx.commit().await?;
         Ok(ShadowBanOutcome::Changed { id })
+    }
+}
+
+// ----------------------------------------------------------------------
+// レート増減の補正（期間を区切った上乗せ / 差し引き）
+// ----------------------------------------------------------------------
+//
+// **現在値のテーブルは作らない。**効いている補正は `active_rating_delta_corrections`
+// （取り消しの行が無いもの）。増減への適用は `player_match_rating_deltas` 1 か所。
+
+/// 追記する補正 1 件。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRatingCorrection {
+    /// 検証済みの値（`admin::parse_correction`）。
+    pub input: CorrectionInput,
+    pub reason: String,
+    pub actor_discord_user_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub idempotency_key: String,
+}
+
+/// 追記する取り消し 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRatingCorrectionRevocation {
+    pub correction_id: i64,
+    pub reason: String,
+    pub actor_discord_user_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub idempotency_key: String,
+}
+
+impl AdminRepository {
+    /// 画面に出す値。**毎回数え直す**（保存しない）。
+    pub async fn rating_corrections_preview(
+        &self,
+    ) -> Result<RatingCorrectionsPreview, sqlx::Error> {
+        let base_delta =
+            sqlx::query_scalar!("select base_delta as \"base_delta!\" from current_rating_params")
+                .fetch_one(&self.pool)
+                .await?;
+        let rows = sqlx::query!(
+            "select c.id, c.amount, c.starts_at, c.ends_at, c.reason, c.created_by, c.created_at, \
+                    r.created_at as \"revoked_at?\", \
+                    ( \
+                        select count(*) from formation_final_outcomes o \
+                        join formations f on f.id = o.formation_id \
+                        cross join current_season s \
+                        where o.kind = 'confirmed' \
+                          and f.created_at >= s.started_at \
+                          and f.created_at >= c.starts_at \
+                          and (c.ends_at is null or f.created_at < c.ends_at) \
+                    ) as \"matches_in_period!\" \
+             from rating_delta_corrections c \
+             left join rating_delta_correction_revocations r on r.correction_id = c.id \
+             order by c.id desc limit 50"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(RatingCorrectionsPreview {
+            base_delta,
+            corrections: rows
+                .into_iter()
+                .map(|row| RatingCorrection {
+                    id: row.id,
+                    amount: row.amount,
+                    starts_at: row.starts_at,
+                    ends_at: row.ends_at,
+                    reason: row.reason,
+                    created_by: row.created_by,
+                    created_at: row.created_at,
+                    revoked_at: row.revoked_at,
+                    matches_in_period: usize::try_from(row.matches_in_period).unwrap_or(0),
+                })
+                .collect(),
+        })
+    }
+
+    /// 補正を追記する。期間に入る試合は（過去の試合も）次の読み取りから引き直される。
+    pub async fn add_rating_correction(
+        &self,
+        input: &NewRatingCorrection,
+    ) -> Result<RatingCorrectionOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar!(
+            "insert into rating_delta_corrections \
+             (amount, starts_at, ends_at, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7) \
+             on conflict (idempotency_key) do nothing \
+             returning id",
+            input.input.amount,
+            input.input.starts_at,
+            input.input.ends_at,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(RatingCorrectionOutcome::Duplicate);
+        };
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::RatingCorrectionAdded,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "rating_delta_correction_id": id,
+                    "amount": input.input.amount,
+                    "starts_at": input.input.starts_at.to_rfc3339(),
+                    "ends_at": input.input.ends_at.map(|at| at.to_rfc3339()),
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("rating_correction:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RatingCorrectionOutcome::Changed { id })
+    }
+
+    /// 補正を取り消す。**無い・既に取り消し済みなら行を積まない**（`NotActive`）。
+    pub async fn revoke_rating_correction(
+        &self,
+        input: &NewRatingCorrectionRevocation,
+    ) -> Result<RatingCorrectionOutcome, AdminStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let active = sqlx::query_scalar!(
+            "select exists(select 1 from active_rating_delta_corrections where id = $1) as \"active!\"",
+            input.correction_id,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !active {
+            tx.commit().await?;
+            return Ok(RatingCorrectionOutcome::NotActive);
+        }
+        let inserted = sqlx::query_scalar!(
+            "insert into rating_delta_correction_revocations \
+             (correction_id, reason, created_by, idempotency_key, created_at) \
+             values ($1, $2, $3, $4, $5) \
+             on conflict do nothing \
+             returning id",
+            input.correction_id,
+            input.reason,
+            format!("discord:{}", input.actor_discord_user_id),
+            input.idempotency_key,
+            input.created_at,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = inserted else {
+            tx.commit().await?;
+            return Ok(RatingCorrectionOutcome::Duplicate);
+        };
+        append_action_on(
+            &mut tx,
+            &NewAdminAction {
+                kind: AdminActionKind::RatingCorrectionRevoked,
+                actor_discord_user_id: input.actor_discord_user_id,
+                target_player_id: None,
+                reason: Some(input.reason.clone()),
+                payload: serde_json::json!({
+                    "rating_delta_correction_id": input.correction_id,
+                    "revocation_id": id,
+                }),
+                occurred_at: input.created_at,
+                idempotency_key: format!("rating_correction_revoke:{}", input.idempotency_key),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RatingCorrectionOutcome::Changed { id })
     }
 }
 

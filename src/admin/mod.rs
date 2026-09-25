@@ -22,6 +22,7 @@ pub mod config;
 pub mod disputes;
 pub mod html;
 pub mod matching_range;
+pub mod rating_corrections;
 pub mod rating_params;
 pub mod repository;
 pub mod routes;
@@ -49,6 +50,10 @@ pub use matching_range::{
     MatchingRangeChange, MatchingRangeError, MatchingRangeOutcome, MatchingRangePreview,
     parse_ranges,
 };
+pub use rating_corrections::{
+    CorrectionInput, MAX_CORRECTION, RatingCorrection, RatingCorrectionError,
+    RatingCorrectionOutcome, RatingCorrectionsPreview, parse_correction,
+};
 pub use rating_params::{
     MAX_BASE_DELTA, RatingParamChange, RatingParams, RatingParamsOutcome, RatingParamsPreview,
     normalize_base_delta,
@@ -56,8 +61,8 @@ pub use rating_params::{
 pub use repository::{
     ActionOutcome, AdjustmentRow, AdminRepository, AdminStoreError, FoundPlayer, InsertOutcome,
     NewAdjustment, NewAdminAction, NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule,
-    NewPriorityGrant, NewRatingParams, NewSeasonBoundary, NewShadowBan, QueuedEntry, QueuedRole,
-    RemovalOutcome,
+    NewPriorityGrant, NewRatingCorrection, NewRatingCorrectionRevocation, NewRatingParams,
+    NewSeasonBoundary, NewShadowBan, QueuedEntry, QueuedRole, RemovalOutcome,
 };
 pub use routes::{AdminState, router};
 pub use schedule::{MatchmakerSchedule, MatchmakerStop, ScheduleOutcome, parse_days, parse_time};

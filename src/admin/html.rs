@@ -18,6 +18,9 @@ use super::actions::{AdminActionRow, MAX_BLOCK_ALLOWANCE, MAX_PRIORITY_MINUTES, 
 use super::block_cooldown::BlockCooldownPreview;
 use super::disputes::DisputeDecision;
 use super::matching_range::MatchingRangePreview;
+use super::rating_corrections::{
+    MAX_CORRECTION, RatingCorrectionsPreview, corrected_delta, jst_input_value,
+};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsPreview};
 use super::repository::RosterPage;
 use super::repository::{
@@ -559,6 +562,123 @@ pub struct QueueView<'a> {
 }
 
 /// 管理パネル内の行き来。画面を跨いでも当日の導線を見失わないようにする。
+pub struct RatingCorrectionsView<'a> {
+    /// 基本の増減幅と補正の一覧。すべて導出値。
+    pub preview: &'a RatingCorrectionsPreview,
+    /// 冪等キー（フォーム描画時にサーバ発行）。
+    pub form_key: &'a str,
+    /// フォームの既定値（開始 = いま）に使う。
+    pub now: DateTime<Utc>,
+    pub notice: Option<Notice>,
+}
+
+fn rating_correction_rows(view: &RatingCorrectionsView<'_>) -> String {
+    if view.preview.corrections.is_empty() {
+        return "<p class=\"muted\">補正はまだありません。</p>\n".to_owned();
+    }
+    let base = view.preview.base_delta;
+    let rows = view
+        .preview
+        .corrections
+        .iter()
+        .map(|correction| {
+            let period = format!(
+                "{} 〜 {}",
+                display_time(correction.starts_at),
+                correction
+                    .ends_at
+                    .map_or_else(|| "終わりなし".to_owned(), display_time),
+            );
+            let state = match correction.revoked_at {
+                Some(at) => format!("取り消し済み（{}）", escape(&display_time(at))),
+                None => format!(
+                    "<form method=\"post\" action=\"/admin/rating-corrections/revoke\">\
+                     <input type=\"hidden\" name=\"correction\" value=\"{id}\">\
+                     <input type=\"hidden\" name=\"key\" value=\"rating-correction-revoke:{id}:{key}\">\
+                     <input type=\"hidden\" name=\"reason\" value=\"取り消し\">\
+                     <button class=\"button button-secondary\" type=\"submit\">取り消す</button>\
+                     </form>",
+                    id = correction.id,
+                    key = escape(view.form_key),
+                ),
+            };
+            format!(
+                "<tr data-correction=\"{id}\"><td class=\"num\">#{id}</td>\
+                 <td class=\"num\">{amount:+}</td>\
+                 <td class=\"num\">±{effective}</td>\
+                 <td>{period}</td><td class=\"num\">{matches}</td>\
+                 <td>{reason}</td><td>{by}</td><td>{state}</td></tr>\n",
+                id = correction.id,
+                amount = correction.amount,
+                effective = corrected_delta(base, correction.amount),
+                period = escape(&period),
+                matches = correction.matches_in_period,
+                reason = escape(&correction.reason),
+                by = escape(&correction.created_by),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"log\">\n\
+         <thead><tr><th>#</th><th>補正</th><th>期間中の増減</th><th>期間（JST）</th>\
+         <th>期間内の確定試合</th><th>理由</th><th>操作者</th><th></th></tr></thead>\n\
+         <tbody>\n{rows}</tbody>\n</table></div>\n"
+    )
+}
+
+pub fn rating_corrections_page(view: &RatingCorrectionsView<'_>) -> String {
+    let base = view.preview.base_delta;
+    let body = format!(
+        "<p class=\"lead\">期間を区切って、レートの増減の<strong>大きさ</strong>に上乗せ / 差し引きします。\
+         成立時刻が期間に入る試合で、勝ち <strong>+(基本 + 補正)</strong>・負け \
+         <strong>−(基本 + 補正)</strong>。いまの基本は <strong>±{base}</strong> です\
+         （基本そのものを変えるなら<a href=\"/admin/rating-params\">レート増減幅</a>。\
+         そちらは全試合が引き直されます）。</p>\n\
+         <p class=\"notice\">例: シーズン終盤の 3 日間だけ ±{late} にしたい → 補正 <strong>+3</strong>、\
+         期間をその 3 日間に。期間が重なる補正は合算し、増減の大きさは 0 を下回りません。\
+         <strong>期間に入っていれば過去の試合にも効きます</strong>（取り消せば元に戻ります）。</p>\n\
+         <h2>補正を追加する</h2>\n\
+         <form method=\"post\" action=\"/admin/rating-corrections\">\
+         <input type=\"hidden\" name=\"key\" value=\"rating-correction:{key}\">\
+         <label for=\"amount\">補正（例: +3 / -2 / 1.5。絶対値 {max} 以下）</label>\
+         <input id=\"amount\" name=\"amount\" type=\"text\" inputmode=\"decimal\" autocomplete=\"off\" required>\
+         <label for=\"starts_at\">開始（JST）</label>\
+         <input id=\"starts_at\" name=\"starts_at\" type=\"datetime-local\" value=\"{now}\" required>\
+         <label for=\"ends_at\">終了（JST。空なら終わりなし）</label>\
+         <input id=\"ends_at\" name=\"ends_at\" type=\"datetime-local\">\
+         <label for=\"reason\">理由（記録に残ります）</label>\
+         <input id=\"reason\" name=\"reason\" type=\"text\" autocomplete=\"off\" required>\
+         <div class=\"actions\">\
+         <button class=\"button button-primary\" type=\"submit\">補正を追加する</button>\
+         </div></form>\n\
+         <h2>補正の一覧</h2>\n{rows}",
+        base = base,
+        late = base + 3.0,
+        key = escape(view.form_key),
+        max = MAX_CORRECTION,
+        now = escape(&jst_input_value(view.now)),
+        rows = rating_correction_rows(view),
+    );
+
+    // この画面は管理者しか到達しない（非管理者は 404）
+    page(
+        Viewer::ADMIN,
+        "管理 / レート増減の補正",
+        &format!(
+            "{ADMIN_STYLES}\
+             <section aria-labelledby=\"admin-rating-corrections-title\">\n\
+             <p class=\"eyebrow\">Admin</p>\n\
+             <h1 id=\"admin-rating-corrections-title\">レート増減の補正</h1>\n\
+             {nav}\
+             {notice}\
+             {body}\
+             </section>\n",
+            nav = admin_nav("/admin/rating-corrections"),
+            notice = notice_html(view.notice.as_ref()),
+        ),
+    )
+}
+
 pub struct BlockCooldownView<'a> {
     /// 現在値・有効なブロック数・履歴。すべて導出値。
     pub preview: &'a BlockCooldownPreview,
@@ -779,13 +899,14 @@ fn admin_nav(current: &str) -> String {
         }
     };
     format!(
-        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
+        "<nav class=\"admin-nav\" aria-label=\"管理メニュー\">{} / {} / {} / {} / {} / {} / {} / {} / {} / {} / {}</nav>\n",
         link("/admin", "レート調整"),
         link("/admin/players", "登録者一覧"),
         link("/admin/queue", "キューと運用"),
         link("/admin/reports", "報告の入力"),
         link("/admin/season", "シーズン"),
         link("/admin/rating-params", "レート増減幅"),
+        link("/admin/rating-corrections", "レート補正"),
         link("/admin/matching-range", "マッチング範囲"),
         link("/admin/block-cooldown", "ブロック解除の待機日数"),
         link("/admin/shadow-bans", "シャドウバン"),

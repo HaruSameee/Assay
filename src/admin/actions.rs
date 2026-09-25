@@ -60,12 +60,16 @@ pub enum AdminActionKind {
     ShadowBanLifted,
     /// マッチング優先度を付与した（待ち時間への加算。次の成立まで効く）。
     QueuePriorityRaised,
+    /// 期間を区切ったレート増減の補正を追加した（期間内の試合が引き直される）。
+    RatingCorrectionAdded,
+    /// レート増減の補正を取り消した。
+    RatingCorrectionRevoked,
 }
 
 impl AdminActionKind {
     /// 全種別。マイグレーションの `kind` CHECK と一致していることを `tests/schema.rs` が検査する
     /// （片方だけ変わる事故を防ぐ。`FormationEventKind::ALL` と同じ役割）。
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::MatchmakerPaused,
         Self::MatchmakerResumed,
         Self::QueueRemoved,
@@ -86,6 +90,8 @@ impl AdminActionKind {
         Self::ShadowBanned,
         Self::ShadowBanLifted,
         Self::QueuePriorityRaised,
+        Self::RatingCorrectionAdded,
+        Self::RatingCorrectionRevoked,
     ];
 
     /// DB に入る文字列。
@@ -108,6 +114,8 @@ impl AdminActionKind {
             Self::ShadowBanned => "shadow_banned",
             Self::ShadowBanLifted => "shadow_ban_lifted",
             Self::QueuePriorityRaised => "queue_priority_raised",
+            Self::RatingCorrectionAdded => "rating_correction_added",
+            Self::RatingCorrectionRevoked => "rating_correction_revoked",
             Self::BlockOverrideRemoved => "block_override_removed",
             Self::ReportEntered => "report_entered",
             Self::ReportRejected => "report_rejected",
@@ -134,6 +142,8 @@ impl AdminActionKind {
             "shadow_banned" => Some(Self::ShadowBanned),
             "shadow_ban_lifted" => Some(Self::ShadowBanLifted),
             "queue_priority_raised" => Some(Self::QueuePriorityRaised),
+            "rating_correction_added" => Some(Self::RatingCorrectionAdded),
+            "rating_correction_revoked" => Some(Self::RatingCorrectionRevoked),
             "block_override_removed" => Some(Self::BlockOverrideRemoved),
             "report_entered" => Some(Self::ReportEntered),
             "report_rejected" => Some(Self::ReportRejected),
@@ -161,6 +171,8 @@ impl AdminActionKind {
             Self::ShadowBanned => "シャドウバン",
             Self::ShadowBanLifted => "シャドウバンを解除",
             Self::QueuePriorityRaised => "マッチング優先度を付与",
+            Self::RatingCorrectionAdded => "レート増減の補正を追加",
+            Self::RatingCorrectionRevoked => "レート増減の補正を取り消し",
             Self::BlockOverrideRemoved => "ブロックの管理解除",
             Self::ReportEntered => "運営による報告の入力",
             Self::ReportRejected => "運営による報告の入力を拒否",

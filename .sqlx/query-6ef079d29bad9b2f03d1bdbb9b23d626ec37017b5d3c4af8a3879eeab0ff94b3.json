@@ -1,0 +1,117 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select c.id, c.amount, c.starts_at, c.ends_at, c.reason, c.created_by, c.created_at, r.created_at as \"revoked_at?\", ( select count(*) from formation_final_outcomes o join formations f on f.id = o.formation_id cross join current_season s where o.kind = 'confirmed' and f.created_at >= s.started_at and f.created_at >= c.starts_at and (c.ends_at is null or f.created_at < c.ends_at) ) as \"matches_in_period!\" from rating_delta_corrections c left join rating_delta_correction_revocations r on r.correction_id = c.id order by c.id desc limit 50",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "amount",
+        "type_info": "Float8",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "amount"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_corrections",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "revoked_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "rating_delta_correction_revocations",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "matches_in_period!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "6ef079d29bad9b2f03d1bdbb9b23d626ec37017b5d3c4af8a3879eeab0ff94b3"
+}

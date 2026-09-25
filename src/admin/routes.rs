@@ -46,17 +46,19 @@ use crate::nullified::NullifiedReportRepository;
 use super::block_cooldown::{BlockCooldownOutcome, parse_cooldown_days};
 use super::html::{
     BlockCooldownView, MatchingRangeView, MatchmakerView, Notice, NoticeKind, PlayerView,
-    QueueView, QuietReportsView, RatingParamsView, ReportsView, RosterView, ScheduleView,
-    SearchView, SeasonView, ShadowBansView, block_cooldown_page, matching_range_page, player_page,
-    queue_page, quiet_reports_page, rating_params_page, reports_page, roster_page, search_page,
-    season_page, shadow_bans_page,
+    QueueView, QuietReportsView, RatingCorrectionsView, RatingParamsView, ReportsView, RosterView,
+    ScheduleView, SearchView, SeasonView, ShadowBansView, block_cooldown_page, matching_range_page,
+    player_page, queue_page, quiet_reports_page, rating_corrections_page, rating_params_page,
+    reports_page, roster_page, search_page, season_page, shadow_bans_page,
 };
 use super::matching_range::{MatchingRangeOutcome, parse_ranges};
+use super::rating_corrections::{RatingCorrectionOutcome, parse_correction};
 use super::rating_params::{MAX_BASE_DELTA, RatingParamsOutcome, normalize_base_delta};
 use super::repository::{
     ActionOutcome, AdminRepository, AdminStoreError, InsertOutcome, NewAdjustment, NewAdminAction,
-    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewPriorityGrant, NewRatingParams,
-    NewSeasonBoundary, NewShadowBan, NewStaffReport, RemovalOutcome, StaffReportOutcome,
+    NewBlockCooldown, NewMatchingRange, NewMatchmakerSchedule, NewPriorityGrant,
+    NewRatingCorrection, NewRatingCorrectionRevocation, NewRatingParams, NewSeasonBoundary,
+    NewShadowBan, NewStaffReport, RemovalOutcome, StaffReportOutcome,
 };
 use super::schedule::{MatchmakerSchedule, ScheduleOutcome, parse_days, parse_time};
 use super::season::{
@@ -149,6 +151,15 @@ pub fn router(state: AdminState) -> Router {
             get(show_rating_params).post(change_rating_params),
         )
         .route("/admin/rating-params/confirm", post(confirm_rating_params))
+        // レート増減の補正（期間を区切った上乗せ / 差し引き）。1 段階、取り消しで戻せる
+        .route(
+            "/admin/rating-corrections",
+            get(show_rating_corrections).post(add_rating_correction),
+        )
+        .route(
+            "/admin/rating-corrections/revoke",
+            post(revoke_rating_correction),
+        )
         // マッチング範囲。**1 段階**（過去を変えない・追記で戻せる操作なので）
         .route(
             "/admin/matching-range",
@@ -1841,6 +1852,150 @@ async fn change_matching_range(
         }
     };
     render_matching_range(&app, Some(notice), None).await
+}
+
+// ----------------------------------------------------------------------
+// レート増減の補正（期間を区切った上乗せ / 差し引き）
+// ----------------------------------------------------------------------
+//
+// 1 段階。取り消しで戻せる。期間に入る試合は過去の試合も引き直される。
+
+async fn render_rating_corrections(
+    app: &AdminState,
+    notice: Option<Notice>,
+    key: Option<&str>,
+) -> Response {
+    let preview = match app.store.rating_corrections_preview().await {
+        Ok(preview) => preview,
+        Err(err) => {
+            error!(%err, "could not read the rating corrections");
+            return internal_error();
+        }
+    };
+    let generated = form_key();
+    Html(rating_corrections_page(&RatingCorrectionsView {
+        preview: &preview,
+        form_key: key.unwrap_or(&generated),
+        now: Utc::now(),
+        notice,
+    }))
+    .into_response()
+}
+
+async fn show_rating_corrections(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+) -> Response {
+    if let Err(error) = actor(&app, session).await {
+        return error.into();
+    }
+    render_rating_corrections(&app, None, None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct RatingCorrectionForm {
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    starts_at: String,
+    #[serde(default)]
+    ends_at: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn add_rating_correction(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<RatingCorrectionForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let input = match parse_correction(&form.amount, &form.starts_at, &form.ends_at) {
+        Ok(input) => input,
+        Err(error) => {
+            let notice = fail(error.to_string());
+            return render_rating_corrections(&app, Some(notice), Some(&form.key)).await;
+        }
+    };
+    let Some(reason) = normalize_reason(&form.reason) else {
+        let notice = fail("理由を入力してください。".to_owned());
+        return render_rating_corrections(&app, Some(notice), Some(&form.key)).await;
+    };
+    let new = NewRatingCorrection {
+        input,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.add_rating_correction(&new).await {
+        Ok(RatingCorrectionOutcome::Changed { id }) => info(format!(
+            "補正 {amount:+} を追加しました（#{id}）。期間に入る試合は、過去の試合も含めて\
+             引き直されます。",
+            amount = input.amount,
+        )),
+        Ok(RatingCorrectionOutcome::Duplicate | RatingCorrectionOutcome::NotActive) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not add a rating correction");
+            return internal_error();
+        }
+    };
+    render_rating_corrections(&app, Some(notice), None).await
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeCorrectionForm {
+    #[serde(default)]
+    correction: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    key: String,
+}
+
+async fn revoke_rating_correction(
+    State(app): State<AdminState>,
+    session: Option<CurrentSession>,
+    Form(form): Form<RevokeCorrectionForm>,
+) -> Response {
+    let actor = match actor(&app, session).await {
+        Ok(actor) => actor,
+        Err(error) => return error.into(),
+    };
+    let Ok(correction_id) = form.correction.trim().parse::<i64>() else {
+        return not_found();
+    };
+    let reason = normalize_reason(&form.reason).unwrap_or_else(|| "取り消し".to_owned());
+    let input = NewRatingCorrectionRevocation {
+        correction_id,
+        reason,
+        actor_discord_user_id: actor.discord_user_id,
+        created_at: Utc::now(),
+        idempotency_key: form.key.clone(),
+    };
+    let notice = match app.store.revoke_rating_correction(&input).await {
+        Ok(RatingCorrectionOutcome::Changed { .. }) => info(format!(
+            "補正 #{correction_id} を取り消しました。期間内の試合は補正なしで引き直されます。"
+        )),
+        Ok(RatingCorrectionOutcome::NotActive) => fail(format!(
+            "補正 #{correction_id} は無いか、既に取り消されています。"
+        )),
+        Ok(RatingCorrectionOutcome::Duplicate) => {
+            info("この操作は既に記録されています。行は増やしていません。".to_owned())
+        }
+        Err(err) => {
+            error!(%err, "could not revoke a rating correction");
+            return internal_error();
+        }
+    };
+    render_rating_corrections(&app, Some(notice), None).await
 }
 
 // ----------------------------------------------------------------------

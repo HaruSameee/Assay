@@ -3159,3 +3159,118 @@ async fn the_queue_page_shows_priority_and_lets_staff_raise_it(owner: PgPool) {
     println!("優先度: 一覧に順位、+30 分で順位が上がる、プレイヤー画面でも付与できる");
     db.done().await;
 }
+
+// ----------------------------------------------------------------------
+// レート増減の補正
+// ----------------------------------------------------------------------
+
+/// **画面から補正を追加・取り消しできる。**不正な値と理由なしは断る。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_rating_correction_can_be_added_and_revoked_from_the_panel(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_cast(&db, 1).await;
+    let app = db.router();
+
+    let (status, page) = get_html(&app, player(ADMIN), "/admin/rating-corrections").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("補正はまだありません"), "{page}");
+    assert!(page.contains("いまの基本は <strong>±7</strong>"), "{page}");
+    let key = form_key(&page, "/admin/rating-corrections");
+
+    // 不正な値・理由なし
+    let (_, bad) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/rating-corrections",
+        &format!("amount=0&starts_at=2026-09-27T21%3A00&ends_at=&reason=x&key={key}"),
+    )
+    .await;
+    assert!(bad.contains("0 以外"), "{bad}");
+    let (_, backwards) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/rating-corrections",
+        &format!(
+            "amount=3&starts_at=2026-09-27T21%3A00&ends_at=2026-09-27T20%3A00&reason=x&key={key}"
+        ),
+    )
+    .await;
+    assert!(
+        backwards.contains("終了日時は開始日時より後"),
+        "{backwards}"
+    );
+    let (_, no_reason) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/rating-corrections",
+        &format!("amount=3&starts_at=2026-09-27T21%3A00&ends_at=&reason=&key={key}"),
+    )
+    .await;
+    assert!(no_reason.contains("理由を入力してください"), "{no_reason}");
+    assert_eq!(count(&db, "rating_delta_corrections").await, 0);
+
+    // +3、9/27 21:00〜9/30 2:00（JST）
+    let (status, added) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/rating-corrections",
+        &format!(
+            "amount=%2B3&starts_at=2026-09-27T21%3A00&ends_at=2026-09-30T02%3A00\
+             &reason=%E7%B5%82%E7%9B%A4&key={key}"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(added.contains("補正 +3 を追加しました"), "{added}");
+    assert!(
+        added.contains("<td class=\"num\">±10</td>"),
+        "期間中は ±10: {added}"
+    );
+    assert!(
+        added.contains("action=\"/admin/rating-corrections/revoke\""),
+        "{added}"
+    );
+    assert_eq!(count(&db, "rating_delta_corrections").await, 1);
+    let starts_at: chrono::DateTime<Utc> =
+        sqlx::query_scalar("select starts_at from rating_delta_corrections")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        starts_at,
+        Utc.with_ymd_and_hms(2026, 9, 27, 12, 0, 0).unwrap(),
+        "JST 21:00 = UTC 12:00"
+    );
+
+    // 取り消し
+    let revoke_key = form_key(&added, "/admin/rating-corrections/revoke");
+    let id: i64 = sqlx::query_scalar("select id from rating_delta_corrections")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let (_, revoked) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/rating-corrections/revoke",
+        &format!("correction={id}&reason=x&key={revoke_key}"),
+    )
+    .await;
+    assert!(
+        revoked.contains(&format!("補正 #{id} を取り消しました")),
+        "{revoked}"
+    );
+    assert!(revoked.contains("取り消し済み"), "{revoked}");
+    let (_, twice) = post_form(
+        &app,
+        player(ADMIN),
+        "/admin/rating-corrections/revoke",
+        &format!("correction={id}&reason=x&key={revoke_key}-2"),
+    )
+    .await;
+    assert!(twice.contains("既に取り消されています"), "{twice}");
+    // 非管理者には無い
+    let (status, _) = get_html(&app, player(2), "/admin/rating-corrections").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    println!("補正: 追加 → ±10 表示 → 取り消し、不正値・逆順・理由なしは拒否");
+    db.done().await;
+}

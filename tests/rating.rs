@@ -16,7 +16,8 @@ use chrono::{TimeDelta, TimeZone, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use unite_matchsystem::admin::{
-    AdminRepository, NewRatingParams, NewSeasonBoundary, RatingParamsOutcome,
+    AdminRepository, NewRatingCorrection, NewRatingCorrectionRevocation, NewRatingParams,
+    NewSeasonBoundary, RatingCorrectionOutcome, RatingParamsOutcome,
 };
 use unite_matchsystem::lifecycle::{FormationEventKind as K, FormationId, PlayerId, Timestamp};
 use unite_matchsystem::match_screen::MatchRepository;
@@ -638,6 +639,150 @@ async fn five_hundred_matches_stay_within_budget(owner: PgPool) {
         outcome.created.len()
     );
 
+    db.done().await;
+}
+
+// ----------------------------------------------------------------------
+// レート増減の補正（期間を区切った上乗せ / 差し引き）
+// ----------------------------------------------------------------------
+
+/// **補正は期間に入る試合の増減だけを変える。**重なれば合算、大きさは 0 未満にならない、
+/// 取り消せば元に戻る。基本の増減幅（7）は変わらない。
+#[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
+async fn a_correction_changes_only_the_matches_in_its_period(owner: PgPool) {
+    let db = AppDb::connect(&owner).await;
+    seed_players(&db, 10).await;
+    // formation n の成立時刻は at(n)。1・2・3 の 3 試合、すべて赤の勝ち
+    for n in 1..=3 {
+        confirmed_match(&db, n, 1500.0, 1500.0, "red").await;
+    }
+    let admin = AdminRepository::new(db.pool.clone());
+    let deltas = |db: &AppDb| {
+        let db_pool = db.pool.clone();
+        async move {
+            let mut out = Vec::new();
+            for n in 1..=3u128 {
+                let won: f64 = sqlx::query_scalar(
+                    "select delta from player_match_rating_deltas where player_id = $1 and formation_id = $2",
+                )
+                .bind(player(1).0)
+                .bind(fid(n).0)
+                .fetch_one(&db_pool)
+                .await
+                .unwrap();
+                let lost: f64 = sqlx::query_scalar(
+                    "select delta from player_match_rating_deltas where player_id = $1 and formation_id = $2",
+                )
+                .bind(player(6).0)
+                .bind(fid(n).0)
+                .fetch_one(&db_pool)
+                .await
+                .unwrap();
+                out.push((won, lost));
+            }
+            out
+        }
+    };
+    assert_eq!(deltas(&db).await, vec![(7.0, -7.0); 3]);
+
+    let add = |amount: &str, start: i64, end: Option<i64>, key: &str| NewRatingCorrection {
+        input: unite_matchsystem::admin::CorrectionInput {
+            amount: amount.parse().unwrap(),
+            starts_at: at(start),
+            ends_at: end.map(at),
+        },
+        reason: "終盤".to_owned(),
+        actor_discord_user_id: 42,
+        created_at: at(100),
+        idempotency_key: key.to_owned(),
+    };
+    // 試合 2 だけ（[at(2), at(3))）に +3
+    let RatingCorrectionOutcome::Changed { id: plus_three } = admin
+        .add_rating_correction(&add("3", 2, Some(3), "c1"))
+        .await
+        .unwrap()
+    else {
+        panic!("追加できるはず");
+    };
+    assert_eq!(
+        deltas(&db).await,
+        vec![(7.0, -7.0), (10.0, -10.0), (7.0, -7.0)],
+        "期間内の試合 2 だけ ±10"
+    );
+    // 試合 2 以降（終わりなし）に −12 → 試合 2 は 7+3−12 = −2 → 0、試合 3 は 7−12 → 0
+    admin
+        .add_rating_correction(&add("-12", 2, None, "c2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        deltas(&db).await,
+        vec![(7.0, -7.0), (0.0, 0.0), (0.0, 0.0)],
+        "重なれば合算、大きさは 0 未満にならない"
+    );
+    // +3 を取り消す（試合 2 は 7−12 → 0 のまま、変化を見るため −12 も取り消す）
+    admin
+        .revoke_rating_correction(&NewRatingCorrectionRevocation {
+            correction_id: plus_three,
+            reason: "取り消し".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: at(200),
+            idempotency_key: "r1".to_owned(),
+        })
+        .await
+        .unwrap();
+    let preview = admin.rating_corrections_preview().await.unwrap();
+    let minus = preview
+        .corrections
+        .iter()
+        .find(|c| c.is_active())
+        .expect("−12 は効いている");
+    assert_eq!(minus.matches_in_period, 2, "試合 2・3 が期間内");
+    admin
+        .revoke_rating_correction(&NewRatingCorrectionRevocation {
+            correction_id: minus.id,
+            reason: "取り消し".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: at(201),
+            idempotency_key: "r2".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        deltas(&db).await,
+        vec![(7.0, -7.0); 3],
+        "取り消せば元に戻る"
+    );
+    // 二重の取り消しは積まない
+    let again = admin
+        .revoke_rating_correction(&NewRatingCorrectionRevocation {
+            correction_id: plus_three,
+            reason: "取り消し".to_owned(),
+            actor_discord_user_id: 42,
+            created_at: at(202),
+            idempotency_key: "r3".to_owned(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(again, RatingCorrectionOutcome::NotActive);
+    // 基本の増減幅は変わっていない
+    assert_eq!(db.ratings.base_delta().await.unwrap(), 7.0);
+    // 運営操作ログ
+    let logged: Vec<(String,)> = sqlx::query_as(
+        "select kind from admin_actions where kind like 'rating_correction_%' order by id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        logged.iter().map(|k| k.0.as_str()).collect::<Vec<_>>(),
+        vec![
+            "rating_correction_added",
+            "rating_correction_added",
+            "rating_correction_revoked",
+            "rating_correction_revoked"
+        ]
+    );
+    println!("補正: 期間内だけ ±10、重なって 0、取り消しで ±7 に戻る");
     db.done().await;
 }
 
