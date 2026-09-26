@@ -253,9 +253,9 @@ impl ProposedMatch {
 // 1 時間以上取り残されることがあった。
 //
 // `ScanDirection` は**同点の並び**（同じ待ち時間の基準どうし、同じ人数のウィンドウどうし）
-// を決めるだけになった。以前は基準そのものの順（上から / 下から）を決めていて、
-// 中間の人の取り残しを緩和する役だったが、待ち時間順に取れば要らない。
-// **方向は毎回ランダムに引き、参加者には見せない**（周期を読まれないため）。
+// を決めるだけ。以前は基準そのものの順（上から / 下から）を決めていて、中間の人の
+// 取り残しを緩和するためにスキャンごとにランダムに引いていたが、待ち時間順に取れば
+// 要らないので、**本番は常に上から**（2026-09-26）。`BottomUp` はテストのために残す。
 
 /// 1 回のスキャンで基準を試す順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -273,17 +273,6 @@ impl ScanDirection {
         match self {
             Self::TopDown => "top_down",
             Self::BottomUp => "bottom_up",
-        }
-    }
-
-    /// **毎回ランダムに引く。**プロセス内に回数を持たず、時刻にも依らないので、
-    /// 外から周期を推測できない。乱数源は OS（`uuid` v4 と同じ `getrandom`）。
-    pub fn random() -> Self {
-        // v4 の下位ビットはすべて乱数（版と variant のビットは上位側にある）
-        if uuid::Uuid::new_v4().as_u128() & 1 == 0 {
-            Self::TopDown
-        } else {
-            Self::BottomUp
         }
     }
 }
@@ -982,24 +971,6 @@ mod tests {
         let mut expected: Vec<u128> = (100..105).chain(200..205).collect();
         expected.sort_unstable();
         assert_eq!(ids(&bottom_up[0]), expected);
-    }
-
-    /// **方向はランダム。**どちらも出るし、片方に固定されない。
-    /// （400 回引いて片方しか出ない確率は 2^-399。偏りの検定はしない）
-    #[test]
-    fn the_direction_is_drawn_at_random_each_time() {
-        let draws: Vec<ScanDirection> = (0..400).map(|_| ScanDirection::random()).collect();
-        let bottom_up = draws
-            .iter()
-            .filter(|d| **d == ScanDirection::BottomUp)
-            .count();
-        assert!(bottom_up > 0, "下からが 1 回も出ない");
-        assert!(bottom_up < draws.len(), "上からが 1 回も出ない");
-        // 明らかな周期（交互）になっていない: 隣が同じになる箇所がある
-        assert!(
-            draws.windows(2).any(|pair| pair[0] == pair[1]),
-            "交互の周期になっている: {draws:?}"
-        );
     }
 
     // ------------------------------------------------------------------

@@ -623,27 +623,20 @@ async fn a_bottom_up_run_forms_the_lowest_band_first(owner: PgPool) {
     db.done().await;
 }
 
-/// **本番の入口（`run_once`）は方向をランダムに引く。**時刻にも回数にも依らない。
+/// **本番の入口（`run_once`）は常に上から走査する**（2026-09-26 にランダムをやめた）。
 #[sqlx::test(fixtures("app_role"), fixtures("../ops/app_privileges.sql"))]
-async fn the_production_entry_point_draws_the_direction_at_random(owner: PgPool) {
+async fn the_production_entry_point_always_scans_top_down(owner: PgPool) {
     let db = AppDb::connect(&owner).await;
     // 10 人揃わないので何も組まれず、方向だけが返る
     seed_players(&db, 3).await;
     enqueue_full_rosters(&db, 3, at(0)).await;
     let matchmaker = db.matchmaker(1);
-
-    // **同じ時刻**で何度も呼んで、両方の方向が出る（時刻で決まっていない）
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..60 {
+    for _ in 0..30 {
         let outcome = matchmaker.run_once(at(600)).await.unwrap();
         assert!(outcome.created.is_empty());
-        seen.insert(outcome.direction.as_str());
-        if seen.len() == 2 {
-            break;
-        }
+        assert_eq!(outcome.direction, ScanDirection::TopDown);
     }
-    assert_eq!(seen.len(), 2, "同じ時刻でも両方の方向が出るはず: {seen:?}");
-    println!("同じ時刻で 60 回以内に両方の方向が出た: {seen:?}");
+    println!("30 回とも上から");
     db.done().await;
 }
 
